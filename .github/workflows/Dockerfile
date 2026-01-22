@@ -24,7 +24,7 @@ RUN ARTIFACT_ARCH=""; \
 
 FROM base
 
-RUN apk add --no-cache tzdata tini
+RUN apk add --no-cache tzdata tini iptables iperf3
 WORKDIR /app
 COPY --from=builder --chmod=755 /tmp/output/* /usr/local/bin
 
@@ -42,4 +42,13 @@ EXPOSE 11011/tcp
 # wss
 EXPOSE 11012/tcp
 
-ENTRYPOINT ["/sbin/tini", "--", "easytier-core"]
+# Enable IP forwarding and setup masquerade rules
+COPY --chmod=755 <<EOF /usr/local/bin/entrypoint.sh
+#!/bin/sh
+echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -t nat -A POSTROUTING -o easytier -j MASQUERADE 2>/dev/null || true
+iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE 2>/dev/null || true
+exec "\$@"
+EOF
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh", "easytier-core"]
