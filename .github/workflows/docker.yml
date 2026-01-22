@@ -73,18 +73,18 @@ jobs:
         run: |
           # Base tags with version
           DOCKERHUB_TAGS="a315344690/easytier:${{ inputs.image_tag }}"
-          GHCR_TAGS="ghcr.io/easytier/easytier:${{ inputs.image_tag }}"
+          GHCR_TAGS="ghcr.io/a315344690/easytier:${{ inputs.image_tag }}"
 
           # Add latest tags if requested
           if [[ "${{ inputs.mark_latest }}" == "true" ]]; then
             DOCKERHUB_TAGS="${DOCKERHUB_TAGS},a315344690/easytier:latest"
-            GHCR_TAGS="${GHCR_TAGS},ghcr.io/easytier/easytier:latest"
+            GHCR_TAGS="${GHCR_TAGS},ghcr.io/a315344690/easytier:latest"
           fi
 
           # Add unstable tags if requested
           if [[ "${{ inputs.mark_unstable }}" == "true" ]]; then
             DOCKERHUB_TAGS="${DOCKERHUB_TAGS},a315344690/easytier:unstable"
-            GHCR_TAGS="${GHCR_TAGS},ghcr.io/easytier/easytier:unstable"
+            GHCR_TAGS="${GHCR_TAGS},ghcr.io/a315344690/easytier:unstable"
           fi
 
           # Combine all tags
