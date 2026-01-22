@@ -63,7 +63,7 @@ jobs:
         with:
           github_token: ${{secrets.GITHUB_TOKEN}}
           run_id: ${{ inputs.run_id }}
-          repo: EasyTier/EasyTier
+          repo: a315344690/EasyTier
           path: docker_context
       - name: List files
         run: |
