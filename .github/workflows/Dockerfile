@@ -24,7 +24,7 @@ RUN ARTIFACT_ARCH=""; \
 
 FROM base
 
-RUN apk add --no-cache tzdata tini iptables iperf3 ip6tables iproute2
+RUN apk add --no-cache tzdata tini iptables iperf3 ip6tables iproute2 nano bash gawk curl
 WORKDIR /app
 COPY --from=builder --chmod=755 /tmp/output/* /usr/local/bin
 
