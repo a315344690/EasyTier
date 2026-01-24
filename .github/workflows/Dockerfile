@@ -24,7 +24,7 @@ RUN ARTIFACT_ARCH=""; \
 
 FROM base
 
-RUN apk add --no-cache tzdata tini iptables iperf3 ip6tables iproute2 nano bash gawk curl
+RUN apk add --no-cache tzdata tini iptables iperf3 ip6tables iproute2 nano bash gawk curl ethtool
 WORKDIR /app
 COPY --from=builder --chmod=755 /tmp/output/* /usr/local/bin
 
@@ -46,6 +46,7 @@ EXPOSE 11012/tcp
 COPY --chmod=755 <<EOF /usr/local/bin/entrypoint.sh
 #!/bin/sh
 echo 1 > /proc/sys/net/ipv4/ip_forward
+ethtool -K easytier tso off gso off gro off 2>/dev/null
 iptables -t nat -A POSTROUTING -o easytier -j MASQUERADE 2>/dev/null || true
 iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE 2>/dev/null || true
 iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss
