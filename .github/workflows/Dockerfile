@@ -49,7 +49,8 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
 ethtool -K easytier tso off gso off gro off 2>/dev/null
 iptables -t nat -A POSTROUTING -o easytier -j MASQUERADE 2>/dev/null || true
 iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE 2>/dev/null || true
-iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss
+iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 exec "\$@"
 EOF
 
