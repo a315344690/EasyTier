@@ -24,33 +24,24 @@ RUN ARTIFACT_ARCH=""; \
 
 FROM base
 
-RUN apk add --no-cache tzdata tini iptables iperf3 ip6tables iproute2 nano bash gawk curl ethtool
+RUN apk add --no-cache tzdata tini iptables iperf3 ip6tables iproute2 nano bash gawk curl ethtool libnetfilter_queue conntrack-tools
 WORKDIR /app
 COPY --from=builder --chmod=755 /tmp/output/* /usr/local/bin
 
 # users can use "-e TZ=xxx" to adjust it
 ENV TZ=Asia/Shanghai
 
-# tcp
-EXPOSE 11010/tcp
-# udp
-EXPOSE 11010/udp
-# wg
-EXPOSE 11011/udp
-# ws
-EXPOSE 11011/tcp
-# wss
-EXPOSE 11012/tcp
 
 # Enable IP forwarding and setup masquerade rules
 COPY --chmod=755 <<EOF /usr/local/bin/entrypoint.sh
 #!/bin/sh
 echo 1 > /proc/sys/net/ipv4/ip_forward
+iperf3 -s -D
 ethtool -K easytier tso off gso off gro off 2>/dev/null
 iptables -t nat -A POSTROUTING -o easytier -j MASQUERADE 2>/dev/null || true
 iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE 2>/dev/null || true
-iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1320 2>/dev/null || true
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1320 2>/dev/null || true
 exec "\$@"
 EOF
 
