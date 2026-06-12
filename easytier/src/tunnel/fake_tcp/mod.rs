@@ -325,17 +325,21 @@ impl TunnelConnector for FakeTcpTunnelConnector {
         let local_ip = get_local_ip_for_destination(remote_addr.ip())
             .ok_or(TunnelError::InternalError("Failed to get local ip".into()))?;
 
-        let os_socket = tokio::net::TcpSocket::new_v4()?;
-        // SO_MARK applies only to the kernel-visible "decoy" socket below.
-        // The actual FakeTCP payload travels via crafted segments written
-        // straight to the TUN device, which the kernel doesn't tag with
-        // SO_MARK. Operators relying on fwmark for FakeTCP must mark the
-        // TUN device's traffic with a separate nftables/iptables rule.
+        let os_socket = if remote_addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
         crate::tunnel::common::apply_socket_mark(
             &socket2::SockRef::from(&os_socket),
             self.socket_mark,
         )?;
-        os_socket.bind("0.0.0.0:0".parse().unwrap())?;
+        let bind_addr: SocketAddr = if remote_addr.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        };
+        os_socket.bind(bind_addr)?;
         let local_port = os_socket.local_addr()?.port();
         let local_addr = SocketAddr::new(local_ip, local_port);
 
@@ -567,6 +571,21 @@ mod tests {
 
         let listener = FakeTcpTunnelListener::new("faketcp://0.0.0.0:31011".parse().unwrap());
         let connector = FakeTcpTunnelConnector::new("faketcp://127.0.0.1:31011".parse().unwrap());
+
+        _tunnel_pingpong(listener, connector).await
+    }
+
+    #[tokio::test]
+    async fn faketcp_pingpong_ipv6() {
+        #[cfg(target_family = "unix")]
+        {
+            if unsafe { nix::libc::geteuid() } != 0 {
+                return;
+            }
+        }
+
+        let listener = FakeTcpTunnelListener::new("faketcp://[::]:31012".parse().unwrap());
+        let connector = FakeTcpTunnelConnector::new("faketcp://[::1]:31012".parse().unwrap());
 
         _tunnel_pingpong(listener, connector).await
     }
