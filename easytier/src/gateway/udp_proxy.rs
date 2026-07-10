@@ -14,6 +14,7 @@ use pnet::packet::{
     ipv4::Ipv4Packet,
     udp::{self, MutableUdpPacket},
 };
+use quanta::Instant;
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TrySendError};
 use tokio::{
     net::UdpSocket,
@@ -60,8 +61,8 @@ struct UdpNatEntry {
     socket: Option<UdpSocket>,
     forward_task: Mutex<Option<JoinHandle<()>>>,
     stopped: AtomicBool,
-    start_time: std::time::Instant,
-    last_active_time: AtomicCell<std::time::Instant>,
+    start_time: Instant,
+    last_active_time: AtomicCell<Instant>,
     denied: bool,
 }
 
@@ -85,8 +86,8 @@ impl UdpNatEntry {
             socket,
             forward_task: Mutex::new(None),
             stopped: AtomicBool::new(false),
-            start_time: std::time::Instant::now(),
-            last_active_time: AtomicCell::new(std::time::Instant::now()),
+            start_time: Instant::now(),
+            last_active_time: AtomicCell::new(Instant::now()),
             denied,
         })
     }
@@ -255,7 +256,7 @@ impl UdpNatEntry {
     }
 
     fn mark_active(&self) {
-        self.last_active_time.store(std::time::Instant::now());
+        self.last_active_time.store(Instant::now());
     }
 
     fn is_active(&self) -> bool {

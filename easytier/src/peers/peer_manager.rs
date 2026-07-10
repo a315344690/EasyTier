@@ -2,19 +2,18 @@ use anyhow::Context;
 use async_trait::async_trait;
 use cidr::{Ipv4Cidr, Ipv6Cidr};
 use dashmap::DashMap;
+use quanta::Instant;
 use std::collections::BTreeSet;
 use std::{
     fmt::Debug,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{Arc, Weak, atomic::AtomicBool},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
+use tokio::sync::{Mutex, RwLock};
 use tokio::{
-    sync::{
-        Mutex, RwLock,
-        mpsc::{self, UnboundedReceiver, UnboundedSender},
-    },
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::JoinSet,
 };
 
@@ -2197,12 +2196,9 @@ impl PeerManager {
 #[cfg(test)]
 mod tests {
     use base64::Engine;
-    use std::{
-        collections::HashMap,
-        fmt::Debug,
-        sync::Arc,
-        time::{Duration, Instant},
-    };
+    use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
+
+    use quanta::Instant;
 
     use crate::{
         common::{

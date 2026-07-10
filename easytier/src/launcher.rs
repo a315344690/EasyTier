@@ -173,7 +173,12 @@ impl EasyTierLauncher {
         #[cfg(mobile)]
         Self::run_routine_for_mobile(&instance, &data, &mut tasks).await;
 
-        instance.run().await?;
+        if let Err(err) = instance.run().await {
+            tasks.abort_all();
+            drop(tasks);
+            instance.clear_resources().await;
+            return Err(err.into());
+        }
 
         #[cfg(feature = "ffi-dataplane")]
         data.data_plane
@@ -626,6 +631,47 @@ pub type NetworkingMethod = crate::proto::api::manage::NetworkingMethod;
 pub type NetworkConfig = crate::proto::api::manage::NetworkConfig;
 
 impl NetworkConfig {
+    fn parse_peer(peer: &manage::NetworkPeerConfig) -> Result<Option<PeerConfig>, anyhow::Error> {
+        let uri = peer.uri.trim();
+        if uri.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(PeerConfig {
+            uri: uri
+                .parse()
+                .with_context(|| format!("failed to parse peer uri: {}", uri))?,
+            peer_public_key: peer.peer_public_key.clone(),
+        }))
+    }
+
+    fn parse_peers(peers: &[manage::NetworkPeerConfig]) -> Result<Vec<PeerConfig>, anyhow::Error> {
+        let mut ret = Vec::new();
+        for peer in peers {
+            if let Some(peer) = Self::parse_peer(peer)? {
+                ret.push(peer);
+            }
+        }
+        Ok(ret)
+    }
+
+    fn parse_peer_urls(peer_urls: &[String]) -> Result<Vec<PeerConfig>, anyhow::Error> {
+        let mut peers = vec![];
+        for peer_url in peer_urls.iter() {
+            let peer_url = peer_url.trim();
+            if peer_url.is_empty() {
+                continue;
+            }
+            peers.push(PeerConfig {
+                uri: peer_url
+                    .parse()
+                    .with_context(|| format!("failed to parse peer uri: {}", peer_url))?,
+                peer_public_key: None,
+            });
+        }
+        Ok(peers)
+    }
+
     pub fn gen_config(&self) -> Result<TomlConfigLoader, anyhow::Error> {
         let cfg = TomlConfigLoader::default();
         cfg.set_id(
@@ -681,26 +727,23 @@ impl NetworkConfig {
             .unwrap_or_default()
         {
             NetworkingMethod::PublicServer => {
-                let public_server_url = self.public_server_url.clone().unwrap_or_default();
-                cfg.set_peers(vec![PeerConfig {
-                    uri: public_server_url.parse().with_context(|| {
-                        format!("failed to parse public server uri: {}", public_server_url)
-                    })?,
-                    peer_public_key: None,
-                }]);
+                let peers = Self::parse_peers(&self.peers)?;
+                if peers.is_empty() {
+                    let public_server_url = self.public_server_url.clone().unwrap_or_default();
+                    cfg.set_peers(vec![PeerConfig {
+                        uri: public_server_url.parse().with_context(|| {
+                            format!("failed to parse public server uri: {}", public_server_url)
+                        })?,
+                        peer_public_key: None,
+                    }]);
+                } else {
+                    cfg.set_peers(peers);
+                }
             }
             NetworkingMethod::Manual => {
-                let mut peers = vec![];
-                for peer_url in self.peer_urls.iter() {
-                    if peer_url.is_empty() {
-                        continue;
-                    }
-                    peers.push(PeerConfig {
-                        uri: peer_url
-                            .parse()
-                            .with_context(|| format!("failed to parse peer uri: {}", peer_url))?,
-                        peer_public_key: None,
-                    });
+                let mut peers = Self::parse_peers(&self.peers)?;
+                if peers.is_empty() {
+                    peers = Self::parse_peer_urls(&self.peer_urls)?;
                 }
                 if !peers.is_empty() {
                     cfg.set_peers(peers);
@@ -1044,6 +1087,13 @@ impl NetworkConfig {
         result.networking_method = Some(NetworkingMethod::Manual as i32);
         if !peers.is_empty() {
             result.peer_urls = peers.iter().map(|p| p.uri.to_string()).collect();
+            result.peers = peers
+                .iter()
+                .map(|p| manage::NetworkPeerConfig {
+                    uri: p.uri.to_string(),
+                    peer_public_key: p.peer_public_key.clone(),
+                })
+                .collect();
         }
 
         result.listener_urls = config
@@ -1116,6 +1166,7 @@ impl NetworkConfig {
             .get_credential_file()
             .map(|path| path.to_string_lossy().into_owned());
         let flags = config.get_flags();
+        let default_flags = default_config.get_flags();
         result.latency_first = Some(flags.latency_first);
         result.dev_name = Some(flags.dev_name.clone());
         result.use_smoltcp = Some(flags.use_smoltcp);
@@ -1144,6 +1195,11 @@ impl NetworkConfig {
         result.disable_sym_hole_punching = Some(flags.disable_sym_hole_punching);
         result.enable_magic_dns = Some(flags.accept_dns);
         result.mtu = Some(flags.mtu as i32);
+        result.data_compress_algo = (flags.data_compress_algo != default_flags.data_compress_algo)
+            .then_some(flags.data_compress_algo);
+        result.encryption_algorithm = (flags.encryption_algorithm
+            != default_flags.encryption_algorithm)
+            .then_some(flags.encryption_algorithm.clone());
         result.instance_recv_bps_limit =
             (flags.instance_recv_bps_limit != u64::MAX).then_some(flags.instance_recv_bps_limit);
         result.enable_private_mode = Some(flags.private_mode);
@@ -1173,7 +1229,7 @@ impl NetworkConfig {
 mod tests {
     use crate::{
         common::config::{ConfigLoader, process_secure_mode_cfg},
-        proto::common::SecureModeConfig,
+        proto::common::{CompressionAlgoPb, SecureModeConfig},
     };
     use base64::prelude::{BASE64_STANDARD, Engine as _};
     use rand::Rng;
@@ -1207,6 +1263,80 @@ mod tests {
             generated_config_str,
             serde_json::to_string(&network_config).unwrap()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn network_config_dump_preserves_web_flags() -> Result<(), anyhow::Error> {
+        let network_config = super::NetworkConfig {
+            instance_id: Some(uuid::Uuid::new_v4().to_string()),
+            dhcp: Some(true),
+            network_name: Some("demo".to_string()),
+            network_secret: Some("secret".to_string()),
+            networking_method: Some(crate::proto::api::manage::NetworkingMethod::Manual as i32),
+            peer_urls: vec!["tcp://1.2.3.4:11010".to_string()],
+            listener_urls: vec!["tcp://0.0.0.0:11010".to_string()],
+            dev_name: Some("et_test".to_string()),
+            enable_quic_proxy: Some(true),
+            disable_tcp_hole_punching: Some(true),
+            disable_sym_hole_punching: Some(true),
+            ..Default::default()
+        };
+
+        let dumped = network_config.gen_config()?.dump();
+
+        assert!(dumped.contains("dev_name = \"et_test\""));
+        assert!(dumped.contains("enable_quic_proxy = true"));
+        assert!(dumped.contains("disable_tcp_hole_punching = true"));
+        assert!(dumped.contains("disable_sym_hole_punching = true"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_config_conversion_preserves_peer_public_key() -> Result<(), anyhow::Error> {
+        let peer_url = "tcp://1.2.3.4:11010";
+        let peer_public_key = BASE64_STANDARD.encode([9u8; 32]);
+        let config = gen_default_config();
+        config.set_peers(vec![crate::common::config::PeerConfig {
+            uri: peer_url.parse()?,
+            peer_public_key: Some(peer_public_key.clone()),
+        }]);
+
+        let network_config = super::NetworkConfig::new_from_config(&config)?;
+
+        assert_eq!(network_config.peer_urls, vec![peer_url.to_string()]);
+        assert_eq!(network_config.peers.len(), 1);
+        assert_eq!(network_config.peers[0].uri, peer_url);
+        assert_eq!(
+            network_config.peers[0].peer_public_key.as_deref(),
+            Some(peer_public_key.as_str())
+        );
+
+        let generated_config = network_config.gen_config()?;
+        assert_eq!(generated_config.get_peers(), config.get_peers());
+        Ok(())
+    }
+
+    #[test]
+    fn network_config_gen_config_trims_legacy_peer_urls() -> Result<(), anyhow::Error> {
+        let network_config = super::NetworkConfig {
+            instance_id: Some(uuid::Uuid::new_v4().to_string()),
+            dhcp: Some(true),
+            networking_method: Some(crate::proto::api::manage::NetworkingMethod::Manual as i32),
+            peer_urls: vec![
+                " tcp://1.2.3.4:11010 ".to_string(),
+                "  ".to_string(),
+                "\tudp://5.6.7.8:11010\n".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let generated_config = network_config.gen_config()?;
+        let peers = generated_config.get_peers();
+
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].uri.as_str(), "tcp://1.2.3.4:11010");
+        assert_eq!(peers[1].uri.as_str(), "udp://5.6.7.8:11010");
         Ok(())
     }
 
@@ -1504,6 +1634,39 @@ mod tests {
                 .get_secure_mode()
                 .and_then(|mode| mode.local_private_key),
             Some(credential_secret)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_config_conversion_preserves_runtime_algorithm_flags()
+    -> Result<(), anyhow::Error> {
+        let config = gen_default_config();
+        let mut flags = config.get_flags();
+        flags.data_compress_algo = CompressionAlgoPb::Zstd.into();
+        flags.encryption_algorithm = "managed-test-algo".to_string();
+        config.set_flags(flags.clone());
+
+        let network_config = super::NetworkConfig::new_from_config(&config)?;
+
+        assert_eq!(
+            network_config.data_compress_algo,
+            Some(CompressionAlgoPb::Zstd as i32)
+        );
+        assert_eq!(
+            network_config.encryption_algorithm.as_deref(),
+            Some("managed-test-algo")
+        );
+
+        let generated_config = network_config.gen_config()?;
+        assert_eq!(
+            generated_config.get_flags().data_compress_algo,
+            flags.data_compress_algo
+        );
+        assert_eq!(
+            generated_config.get_flags().encryption_algorithm,
+            flags.encryption_algorithm
         );
 
         Ok(())
