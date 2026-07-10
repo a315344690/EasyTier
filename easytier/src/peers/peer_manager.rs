@@ -1587,15 +1587,16 @@ impl PeerManager {
     }
 
     fn is_all_peers_broadcast_ipv4(&self, ipv4_addr: &Ipv4Addr) -> bool {
-        let network_length = self
-            .global_ctx
-            .get_ipv4()
-            .map(|x| x.network_length())
-            .unwrap_or(24);
-        let ipv4_inet = cidr::Ipv4Inet::new(*ipv4_addr, network_length).unwrap();
-        ipv4_addr.is_broadcast()
-            || ipv4_addr.is_multicast()
-            || *ipv4_addr == ipv4_inet.last_address()
+        if ipv4_addr.is_broadcast() || ipv4_addr.is_multicast() {
+            return true;
+        }
+        if let Some(my_ipv4) = self.global_ctx.get_ipv4() {
+            let my_network =
+                cidr::Ipv4Cidr::new(my_ipv4.first_address(), my_ipv4.network_length()).unwrap();
+            my_network.contains(ipv4_addr) && *ipv4_addr == my_ipv4.last_address()
+        } else {
+            false
+        }
     }
 
     fn is_all_peers_broadcast_ipv6(&self, ipv6_addr: &Ipv6Addr) -> bool {
