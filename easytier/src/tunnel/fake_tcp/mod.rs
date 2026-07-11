@@ -1,7 +1,6 @@
 mod netfilter;
 mod packet;
 mod stack;
-pub(crate) mod tls_disguise;
 
 use bytes::BytesMut;
 use futures::{Sink, Stream};
@@ -67,8 +66,8 @@ impl IpToIfNameCache {
     }
 }
 
-fn get_faketcp_tunnel_type_str(driver_type: &str) -> String {
-    format!("faketcp_{}", driver_type)
+fn get_faketcp_tunnel_type_str(_driver_type: &str) -> String {
+    "faketcp".to_owned()
 }
 
 async fn create_tun_off_runtime(
@@ -90,7 +89,6 @@ pub struct FakeTcpTunnelListener {
     // a cache from ip addr to interface name
     ip_to_ifname: IpToIfNameCache,
     socket_mark: Option<u32>,
-    tls_hosts: Option<Vec<String>>,
 }
 
 impl FakeTcpTunnelListener {
@@ -101,20 +99,11 @@ impl FakeTcpTunnelListener {
             stack_map: DashMap::new(),
             ip_to_ifname: IpToIfNameCache::new(),
             socket_mark: None,
-            tls_hosts: None,
         }
     }
 
     pub fn set_socket_mark(&mut self, socket_mark: Option<u32>) {
         self.socket_mark = socket_mark;
-    }
-
-    pub fn set_tls_hosts(&mut self, hosts: Vec<String>) {
-        self.tls_hosts = Some(hosts);
-    }
-
-    fn tls_disguise_enabled(&self) -> bool {
-        self.tls_hosts.is_some()
     }
 
     async fn do_accept(&mut self) -> Result<AcceptResult, TunnelError> {
@@ -304,11 +293,6 @@ impl TunnelListener for FakeTcpTunnelListener {
             "FakeTcpTunnelListener accepted connection"
         );
 
-        if self.tls_disguise_enabled() {
-            tls_disguise::server_tls_handshake(&socket).await?;
-            tracing::info!("FakeTcpTunnelListener TLS disguise handshake complete");
-        }
-
         let info = TunnelInfo {
             tunnel_type: get_faketcp_tunnel_type_str(stack.driver_type()),
             local_addr: Some(self.local_url().into()),
@@ -328,10 +312,9 @@ impl TunnelListener for FakeTcpTunnelListener {
             ),
         };
 
-        let tls_disguise = self.tls_disguise_enabled();
         let socket = Arc::new(socket);
-        let reader = FakeTcpStream::new(socket.clone(), tls_disguise);
-        let writer = FakeTcpSink::new(socket, tls_disguise);
+        let reader = FakeTcpStream::new(socket.clone());
+        let writer = FakeTcpSink::new(socket);
 
         Ok(Box::new(TunnelWrapper::new_with_associate_data(
             reader,
@@ -351,8 +334,6 @@ pub struct FakeTcpTunnelConnector {
     ip_to_if_name: IpToIfNameCache,
     resolved_addr: Option<SocketAddr>,
     socket_mark: Option<u32>,
-    tls_hosts: Option<Vec<String>>,
-    tls_counter: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeTcpTunnelConnector {
@@ -362,28 +343,7 @@ impl FakeTcpTunnelConnector {
             ip_to_if_name: IpToIfNameCache::new(),
             resolved_addr: None,
             socket_mark: None,
-            tls_hosts: None,
-            tls_counter: std::sync::atomic::AtomicUsize::new(0),
         }
-    }
-
-    pub fn set_tls_hosts(&mut self, hosts: Vec<String>) {
-        self.tls_hosts = Some(hosts);
-    }
-
-    fn next_tls_host(&self) -> Option<&str> {
-        self.tls_hosts.as_ref().map(|hosts| {
-            let idx = self.tls_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                % hosts.len();
-            hosts[idx]
-                .strip_prefix("https://")
-                .or_else(|| hosts[idx].strip_prefix("http://"))
-                .unwrap_or(&hosts[idx])
-        })
-    }
-
-    fn tls_disguise_enabled(&self) -> bool {
-        self.tls_hosts.is_some()
     }
 }
 
@@ -467,11 +427,6 @@ impl TunnelConnector for FakeTcpTunnelConnector {
 
         tracing::info!(local_addr = ?socket.local_addr(), "FakeTcpTunnelConnector connected");
 
-        if let Some(host) = self.next_tls_host() {
-            tls_disguise::client_tls_handshake(&socket, host).await?;
-            tracing::info!("FakeTcpTunnelConnector TLS disguise handshake complete");
-        }
-
         let info = TunnelInfo {
             tunnel_type: get_faketcp_tunnel_type_str(driver_type),
             local_addr: Some(
@@ -488,10 +443,9 @@ impl TunnelConnector for FakeTcpTunnelConnector {
             ),
         };
 
-        let tls_disguise = self.tls_disguise_enabled();
         let socket = Arc::new(socket);
-        let reader = FakeTcpStream::new(socket.clone(), tls_disguise);
-        let writer = FakeTcpSink::new(socket, tls_disguise);
+        let reader = FakeTcpStream::new(socket.clone());
+        let writer = FakeTcpSink::new(socket);
 
         Ok(Box::new(TunnelWrapper::new_with_associate_data(
             reader,
@@ -526,11 +480,10 @@ struct FakeTcpStream {
     socket: Arc<stack::Socket>,
     state: FakeTcpStreamState,
     _ack_task: AbortOnDropHandle<()>,
-    tls_disguise: bool,
 }
 
 impl FakeTcpStream {
-    fn new(socket: Arc<stack::Socket>, tls_disguise: bool) -> Self {
+    fn new(socket: Arc<stack::Socket>) -> Self {
         let ack_socket = socket.clone();
         let ack_task = AbortOnDropHandle::new(tokio::spawn(async move {
             let mut interval =
@@ -545,7 +498,6 @@ impl FakeTcpStream {
             socket,
             state: FakeTcpStreamState::ConsumingBuf(BytesMut::new()),
             _ack_task: ack_task,
-            tls_disguise,
         }
     }
 }
@@ -596,17 +548,7 @@ impl Stream for FakeTcpStream {
                     }));
                 }
                 FakeTcpStreamState::PollFuture(mut fut) => match fut.as_mut().poll(cx) {
-                    Poll::Ready(Some((mut buf, _sz))) => {
-                        if s.tls_disguise {
-                            if let Some((hdr_len, _payload_len)) =
-                                tls_disguise::strip_tls_record_header(&buf)
-                            {
-                                let _ = buf.split_to(hdr_len);
-                            } else if !buf.is_empty() && buf[0] != tls_disguise::TLS_APP_DATA_TYPE {
-                                // Non-AppData TLS record (e.g., leftover CCS) — skip it
-                                buf.clear();
-                            }
-                        }
+                    Poll::Ready(Some((buf, _sz))) => {
                         s.state = FakeTcpStreamState::ConsumingBuf(buf);
                     }
                     Poll::Ready(None) => {
@@ -627,12 +569,11 @@ impl Stream for FakeTcpStream {
 
 struct FakeTcpSink {
     socket: Arc<stack::Socket>,
-    tls_disguise: bool,
 }
 
 impl FakeTcpSink {
-    fn new(socket: Arc<stack::Socket>, tls_disguise: bool) -> Self {
-        Self { socket, tls_disguise }
+    fn new(socket: Arc<stack::Socket>) -> Self {
+        Self { socket }
     }
 }
 
@@ -652,24 +593,7 @@ impl Sink<SinkItem> for FakeTcpSink {
         packet.mut_tcp_tunnel_header().unwrap().len.set(len as u32);
         let data = packet.into_bytes();
 
-        if self.tls_disguise {
-            // 5-byte TLS record header prepended to payload.
-            // build_tcp_packet will copy this into the TCP segment payload,
-            // so only one extra memcpy of 5 bytes beyond normal path.
-            let payload_len = data.len();
-            let mut wrapped = Vec::with_capacity(5 + payload_len);
-            wrapped.extend_from_slice(&[
-                tls_disguise::TLS_APP_DATA_TYPE,
-                0x03,
-                0x03,
-                (payload_len >> 8) as u8,
-                payload_len as u8,
-            ]);
-            wrapped.extend_from_slice(&data);
-            self.socket.try_send(&wrapped);
-        } else {
-            self.socket.try_send(&data);
-        }
+        self.socket.try_send(&data);
 
         Ok(())
     }

@@ -66,13 +66,8 @@ pub fn create_listener_by_url(
             }
             #[cfg(feature = "faketcp")]
             IpScheme::FakeTcp => {
-                use crate::common::config::ConfigLoader;
-                let hosts = global_ctx.config.get_flags().fakehttp_hosts;
                 let mut l = tunnel::fake_tcp::FakeTcpTunnelListener::new(l.clone());
                 l.set_socket_mark(socket_mark);
-                if !hosts.is_empty() {
-                    l.set_tls_hosts(hosts);
-                }
                 l.boxed()
             }
             #[cfg(feature = "fakehttp")]
