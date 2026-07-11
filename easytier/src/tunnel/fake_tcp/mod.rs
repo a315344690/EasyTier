@@ -13,12 +13,12 @@ use std::{
     sync::Arc,
     task::{Context as TaskContext, Poll},
 };
-use tokio::{io::AsyncReadExt, net::TcpStream};
+use tokio::{io::AsyncReadExt, net::{TcpListener, TcpSocket, TcpStream}};
 
 use crate::tunnel::{
     FromUrl, IpVersion, SinkError, SinkItem, StreamItem, Tunnel, TunnelConnector, TunnelError,
     TunnelInfo, TunnelListener,
-    common::TunnelWrapper,
+    common::{TunnelWrapper, bind},
     fake_tcp::netfilter::create_tun,
     packet_def::{PEER_MANAGER_HEADER_SIZE, TCP_TUNNEL_HEADER_SIZE, ZCPacket, ZCPacketType},
 };
@@ -84,11 +84,12 @@ async fn create_tun_off_runtime(
 
 pub struct FakeTcpTunnelListener {
     addr: url::Url,
-    os_listener: Option<tokio::net::TcpListener>,
+    os_listener: Option<TcpListener>,
     // interface_name -> fake tcp stack
     stack_map: DashMap<String, Arc<stack::Stack>>,
     // a cache from ip addr to interface name
     ip_to_ifname: IpToIfNameCache,
+    socket_mark: Option<u32>,
     tls_hosts: Option<Vec<String>>,
 }
 
@@ -99,8 +100,13 @@ impl FakeTcpTunnelListener {
             os_listener: None,
             stack_map: DashMap::new(),
             ip_to_ifname: IpToIfNameCache::new(),
+            socket_mark: None,
             tls_hosts: None,
         }
+    }
+
+    pub fn set_socket_mark(&mut self, socket_mark: Option<u32>) {
+        self.socket_mark = socket_mark;
     }
 
     pub fn set_tls_hosts(&mut self, hosts: Vec<String>) {
@@ -257,9 +263,15 @@ struct AcceptResult {
 #[async_trait::async_trait]
 impl TunnelListener for FakeTcpTunnelListener {
     async fn listen(&mut self) -> Result<(), TunnelError> {
-        let port = self.addr.port().unwrap_or(0);
-        let bind_addr = SocketAddr::from_url(self.addr.clone(), IpVersion::Both).await?;
-        let os_listener = tokio::net::TcpListener::bind(bind_addr).await?;
+        self.os_listener = None;
+        let addr = SocketAddr::from_url(self.addr.clone(), IpVersion::Both).await?;
+        let os_listener = bind::<TcpListener>()
+            .addr(addr)
+            .only_v6(true)
+            .maybe_socket_mark(self.socket_mark)
+            .call()?;
+        let port = os_listener.local_addr()?.port();
+        self.addr.set_port(Some(port)).unwrap();
         tracing::info!(port, "FakeTcpTunnelListener listening");
         self.os_listener = Some(os_listener);
         Ok(())
@@ -404,21 +416,16 @@ impl TunnelConnector for FakeTcpTunnelConnector {
         let local_ip = get_local_ip_for_destination(remote_addr.ip())
             .ok_or(TunnelError::InternalError("Failed to get local ip".into()))?;
 
-        let os_socket = if remote_addr.is_ipv4() {
-            tokio::net::TcpSocket::new_v4()?
-        } else {
-            tokio::net::TcpSocket::new_v6()?
-        };
-        crate::tunnel::common::apply_socket_mark(
-            &socket2::SockRef::from(&os_socket),
-            self.socket_mark,
-        )?;
         let bind_addr: SocketAddr = if remote_addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
             "[::]:0".parse().unwrap()
         };
-        os_socket.bind(bind_addr)?;
+        let os_socket = bind::<TcpSocket>()
+            .addr(bind_addr)
+            .only_v6(true)
+            .maybe_socket_mark(self.socket_mark)
+            .call()?;
         let local_port = os_socket.local_addr()?.port();
         let local_addr = SocketAddr::new(local_ip, local_port);
 

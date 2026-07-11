@@ -69,6 +69,7 @@ pub fn create_listener_by_url(
                 use crate::common::config::ConfigLoader;
                 let hosts = global_ctx.config.get_flags().fakehttp_hosts;
                 let mut l = tunnel::fake_tcp::FakeTcpTunnelListener::new(l.clone());
+                l.set_socket_mark(socket_mark);
                 if !hosts.is_empty() {
                     l.set_tls_hosts(hosts);
                 }
@@ -177,7 +178,7 @@ impl<H: TunnelHandlerForListener + Send + Sync + 'static + Debug> ListenerManage
                 && !is_url_host_ipv6(&l)
                 && is_url_host_unspecified(&l)
                 // quic enables dual-stack by default, may conflict with v4 listener
-                && l.scheme() != "quic" && l.scheme() != "faketcp"
+                && l.scheme() != "quic"
             {
                 let mut ipv6_listener = l.clone();
                 ipv6_listener
