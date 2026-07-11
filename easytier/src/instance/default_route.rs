@@ -226,6 +226,7 @@ fn detect_physical_ips(tun_ifname: &str) -> Result<Vec<Ipv4Addr>, Error> {
 }
 
 fn ifindex_to_name(index: u32) -> Option<String> {
+    use nix::libc;
     let mut buf = [0u8; libc::IF_NAMESIZE];
     let ptr = unsafe { libc::if_indextoname(index, buf.as_mut_ptr() as *mut libc::c_char) };
     if ptr.is_null() {
