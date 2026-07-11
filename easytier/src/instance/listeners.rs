@@ -66,6 +66,14 @@ pub fn create_listener_by_url(
             }
             #[cfg(feature = "faketcp")]
             IpScheme::FakeTcp => tunnel::fake_tcp::FakeTcpTunnelListener::new(l.clone()).boxed(),
+            #[cfg(feature = "fakehttp")]
+            IpScheme::FakeHttp => {
+                use crate::common::config::ConfigLoader;
+                let hosts = global_ctx.config.get_flags().fakehttp_hosts;
+                let mut l = tunnel::fakehttp::FakeHttpTunnelListener::new(l.clone(), hosts);
+                l.set_socket_mark(socket_mark);
+                l.boxed()
+            }
         },
         #[cfg(unix)]
         TunnelScheme::Unix => tunnel::unix::UnixSocketTunnelListener::new(l.clone()).boxed(),

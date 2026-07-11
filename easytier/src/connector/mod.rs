@@ -266,6 +266,11 @@ pub async fn create_connector_by_url(
                 }
                 #[cfg(feature = "faketcp")]
                 IpScheme::FakeTcp => tunnel::fake_tcp::FakeTcpTunnelConnector::new(url).boxed(),
+                #[cfg(feature = "fakehttp")]
+                IpScheme::FakeHttp => {
+                    let hosts = global_ctx.config.get_flags().fakehttp_hosts;
+                    tunnel::fakehttp::FakeHttpTunnelConnector::new(url, hosts).boxed()
+                }
             };
             connector.set_resolved_addr(resolved_addr.addr);
             connector.set_socket_mark(global_ctx.config.get_flags().socket_mark);

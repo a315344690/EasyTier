@@ -30,6 +30,9 @@ pub(crate) mod udp_src;
 #[cfg(feature = "faketcp")]
 pub mod fake_tcp;
 
+#[cfg(feature = "fakehttp")]
+pub mod fakehttp;
+
 #[cfg(feature = "wireguard")]
 pub mod wireguard;
 
@@ -305,6 +308,8 @@ pub enum IpScheme {
     Wss,
     #[cfg(feature = "faketcp")]
     FakeTcp,
+    #[cfg(feature = "fakehttp")]
+    FakeHttp,
 }
 
 impl IpScheme {
@@ -322,6 +327,8 @@ impl IpScheme {
             Self::Wss => (Protocol::TCP, 2),
             #[cfg(feature = "faketcp")]
             Self::FakeTcp => (Protocol::TCP, 3),
+            #[cfg(feature = "fakehttp")]
+            Self::FakeHttp => (Protocol::TCP, 4),
         };
         IpSchemeAttributes {
             protocol,

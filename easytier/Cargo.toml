@@ -367,6 +367,7 @@ default = [
     "kcp",
     "quic",
     "faketcp",
+    "fakehttp",
     "magic-dns",
     "zstd",
 ]
@@ -381,6 +382,7 @@ full = [
     "kcp",
     "quic",
     "faketcp",
+    "fakehttp",
     "magic-dns",
     "zstd",
 ]
@@ -413,6 +415,7 @@ jemalloc-prof = [
 tracing = ["tokio/tracing", "dep:console-subscriber"]
 magic-dns = ["dep:hickory-client", "dep:hickory-server"]
 faketcp = ["dep:flume"]
+fakehttp = []
 zstd = ["dep:zstd"]
 # Deprecated: hotpath profiling has been removed. These feature aliases are
 # retained as no-ops so existing build scripts using `--features hotpath*`

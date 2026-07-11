@@ -546,6 +546,14 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_FAKEHTTP_HOSTS",
+        help = t!("core_clap.fakehttp_hosts").to_string(),
+        value_delimiter = ','
+    )]
+    fakehttp_hosts: Option<Vec<String>>,
+
+    #[arg(
+        long,
         env = "ET_ENABLE_KCP_PROXY",
         help = t!("core_clap.enable_kcp_proxy").to_string(),
         num_args = 0..=1,
@@ -1175,6 +1183,9 @@ impl NetworkOptions {
         // Configure tld_dns_zone: use provided value if set
         if let Some(tld_dns_zone) = &self.tld_dns_zone {
             f.tld_dns_zone = tld_dns_zone.clone();
+        }
+        if let Some(fakehttp_hosts) = &self.fakehttp_hosts {
+            f.fakehttp_hosts = fakehttp_hosts.clone();
         }
         cfg.set_flags(f);
 

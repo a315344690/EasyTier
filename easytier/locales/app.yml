@@ -208,6 +208,9 @@ core_clap:
   socket_mark:
     en: "Linux only: set SO_MARK (fwmark) on EasyTier's underlay sockets (TCP, UDP, QUIC, WebSocket, WireGuard, and the FakeTCP decoy socket) so the host can policy-route or filter them with 'ip rule fwmark ...', nftables ('meta mark'), or iptables ('-m mark'). Any value is applied verbatim (0 is a valid mark); omit the flag to leave SO_MARK untouched. Requires CAP_NET_ADMIN. Note: FakeTCP payload travels via raw TUN writes which the kernel does not tag — mark those separately on the TUN device if needed."
     zh-CN: "仅 Linux: 在 EasyTier 的底层套接字 (TCP、UDP、QUIC、WebSocket、WireGuard 以及 FakeTCP 诱饵套接字) 上设置 SO_MARK (fwmark)，使主机能用 'ip rule fwmark ...'、nftables ('meta mark') 或 iptables ('-m mark') 策略路由/过滤这些数据包。任何值都会原样应用 (0 也是合法的 mark)；不传该参数即保持 SO_MARK 不变。需要 CAP_NET_ADMIN 权限。注意：FakeTCP 的实际载荷通过原始 TUN 写入，内核不会为其打标记；如有需要请在 TUN 设备上单独打标记。"
+  fakehttp_hosts:
+    en: "list of fake HTTP/HTTPS hosts or payload files for the fakehttp transport. Entries starting with 'http://' generate HTTP GET requests, 'https://' generate TLS ClientHello with SNI, and file paths load raw payload bytes. Used with fakehttp:// listeners/connectors to disguise TCP traffic as HTTP/HTTPS. Example: http://www.baidu.com,https://www.youtube.com,/opt/easytier/payload.bin"
+    zh-CN: "用于 fakehttp 传输的伪装域名或 payload 文件列表。以 'http://' 开头的条目生成 HTTP GET 请求，以 'https://' 开头的生成 TLS ClientHello（含 SNI），文件路径则加载原始 payload 字节。配合 fakehttp:// 监听器/连接器使用，将 TCP 流量伪装为 HTTP/HTTPS。示例: http://www.baidu.com,https://www.youtube.com,/opt/easytier/payload.bin"
   enable_kcp_proxy:
     en: "proxy tcp streams with kcp, improving the latency and throughput on the network with udp packet loss."
     zh-CN: "使用 KCP 代理 TCP 流，提高在 UDP 丢包网络上的延迟和吞吐量。"
