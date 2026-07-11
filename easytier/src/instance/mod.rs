@@ -1,4 +1,6 @@
 pub mod dns_server;
+#[cfg(target_os = "linux")]
+pub mod default_route;
 #[allow(clippy::module_inception)]
 pub mod instance;
 

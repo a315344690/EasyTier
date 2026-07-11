@@ -77,6 +77,7 @@ pub fn gen_default_flags() -> Flags {
         enable_udp_broadcast_relay: false,
         socket_mark: None,
         fakehttp_hosts: vec![],
+        default_route: false,
     }
 }
 

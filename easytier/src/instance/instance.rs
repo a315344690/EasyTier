@@ -689,6 +689,9 @@ pub struct Instance {
     proxy_cidrs_monitor: Option<AbortOnDropHandle<()>>,
     public_ipv6_provider_task: ArcPublicIpv6ProviderTaskSlot,
 
+    #[cfg(target_os = "linux")]
+    default_route_mgr: Option<super::default_route::DefaultRouteManager>,
+
     global_ctx: ArcGlobalCtx,
 }
 
@@ -776,6 +779,9 @@ impl Instance {
 
             proxy_cidrs_monitor: None,
             public_ipv6_provider_task: Arc::new(PublicIpv6ProviderTaskSlot::new()),
+
+            #[cfg(target_os = "linux")]
+            default_route_mgr: None,
 
             global_ctx,
         }
@@ -1091,6 +1097,24 @@ impl Instance {
                 let (output_tx, output_rx) = oneshot::channel();
                 self.check_for_static_ip(output_tx);
                 output_rx.await.unwrap()?;
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        if self.global_ctx.config.get_flags().default_route {
+            if let Some(tun_name) = self.global_ctx.get_tun_device_name() {
+                let mark = self
+                    .global_ctx
+                    .config
+                    .get_flags()
+                    .socket_mark
+                    .unwrap_or(0x6846);
+                let mut mgr = super::default_route::DefaultRouteManager::new(tun_name, mark);
+                if let Err(e) = mgr.activate().await {
+                    tracing::error!(?e, "failed to activate default route");
+                } else {
+                    self.default_route_mgr = Some(mgr);
+                }
             }
         }
 
@@ -1649,6 +1673,12 @@ impl Instance {
     }
 
     pub async fn clear_resources(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(mut mgr) = self.default_route_mgr.take() {
+            if let Err(e) = mgr.deactivate().await {
+                tracing::error!(?e, "failed to deactivate default route during cleanup");
+            }
+        }
         self.public_ipv6_provider_task.shutdown().await;
         self.peer_manager.clear_resources().await;
         #[cfg(feature = "tun")]

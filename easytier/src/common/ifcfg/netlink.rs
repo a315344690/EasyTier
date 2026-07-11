@@ -373,7 +373,7 @@ impl NetlinkIfConfiger {
         Ok(ret_vec)
     }
 
-    fn list_routes() -> Result<Vec<RouteMessage>, Error> {
+    pub(crate) fn list_routes() -> Result<Vec<RouteMessage>, Error> {
         Self::list_route_messages(AddressFamily::Inet)
     }
 

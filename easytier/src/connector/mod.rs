@@ -265,7 +265,14 @@ pub async fn create_connector_by_url(
                     tunnel::websocket::WsTunnelConnector::new(url).boxed()
                 }
                 #[cfg(feature = "faketcp")]
-                IpScheme::FakeTcp => tunnel::fake_tcp::FakeTcpTunnelConnector::new(url).boxed(),
+                IpScheme::FakeTcp => {
+                    let hosts = global_ctx.config.get_flags().fakehttp_hosts;
+                    let mut c = tunnel::fake_tcp::FakeTcpTunnelConnector::new(url);
+                    if !hosts.is_empty() {
+                        c.set_tls_hosts(hosts);
+                    }
+                    c.boxed()
+                }
                 #[cfg(feature = "fakehttp")]
                 IpScheme::FakeHttp => {
                     let hosts = global_ctx.config.get_flags().fakehttp_hosts;

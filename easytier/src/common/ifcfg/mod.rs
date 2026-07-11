@@ -10,7 +10,7 @@ mod win;
 #[cfg(target_os = "windows")]
 mod windows;
 
-mod route;
+pub(crate) mod route;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -105,7 +105,7 @@ fn cidr_to_subnet_mask(prefix_length: u8) -> Ipv4Addr {
     )
 }
 
-async fn run_shell_cmd(cmd: &str) -> Result<(), Error> {
+pub(crate) async fn run_shell_cmd(cmd: &str) -> Result<(), Error> {
     let cmd_out: std::process::Output;
     let stdout: String;
     let stderr: String;
@@ -171,6 +171,16 @@ pub use windows::RegistryManager;
 pub(crate) fn list_ipv6_route_messages()
 -> Result<Vec<netlink_packet_route::route::RouteMessage>, Error> {
     netlink::NetlinkIfConfiger::list_ipv6_route_messages()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn list_routes() -> Result<Vec<netlink_packet_route::route::RouteMessage>, Error> {
+    netlink::NetlinkIfConfiger::list_routes()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn list_addresses(name: &str) -> Result<Vec<cidr::IpInet>, Error> {
+    netlink::NetlinkIfConfiger::list_addresses(name)
 }
 
 #[cfg(target_os = "linux")]

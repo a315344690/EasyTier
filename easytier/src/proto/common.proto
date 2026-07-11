@@ -86,6 +86,12 @@ message FlagsInConfig {
   optional uint32 socket_mark = 43;
 
   repeated string fakehttp_hosts = 44;
+
+  // Linux-only: capture all traffic through VPN tunnel by setting up policy
+  // routing (ip rules + custom routing table). Requires socket_mark to be set
+  // (auto-set to 0x6846 if omitted). Uses suppress_prefixlength 0 to preserve
+  // LAN routes, and throw routes for private/multicast bypassing.
+  bool default_route = 45;
 }
 
 message RpcDescriptor {

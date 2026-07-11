@@ -1,9 +1,11 @@
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use futures::stream::FuturesUnordered;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::time::{Duration, timeout};
 
@@ -91,10 +93,12 @@ fn build_http_request(host: &str) -> Vec<u8> {
          Accept: */*\r\n\
          Accept-Language: en-US,en;q=0.5\r\n\
          Accept-Encoding: gzip, deflate\r\n\
+         Origin: http://{host}\r\n\
          Connection: Upgrade\r\n\
          Upgrade: websocket\r\n\
          Sec-WebSocket-Version: 13\r\n\
          Sec-WebSocket-Key: {ws_key_b64}\r\n\
+         Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\
          \r\n"
     )
     .into_bytes()
@@ -143,7 +147,7 @@ fn base64_encode(data: &[u8]) -> String {
 /// Wrap a handshake body in TLS record + handshake headers.
 /// `hs_type`: 0x01 = ClientHello, 0x02 = ServerHello
 /// `record_version`: protocol version in the record layer header
-fn wrap_tls_handshake(hs_type: u8, body: &[u8], record_version: [u8; 2]) -> Vec<u8> {
+pub(crate) fn wrap_tls_handshake(hs_type: u8, body: &[u8], record_version: [u8; 2]) -> Vec<u8> {
     let hs_len = body.len();
     // Handshake: type(1) + length(3, uint24) + body
     // Record:    content_type(1) + version(2) + length(2) + handshake
@@ -164,10 +168,9 @@ fn wrap_tls_handshake(hs_type: u8, body: &[u8], record_version: [u8; 2]) -> Vec<
     buf
 }
 
-fn build_tls_client_hello(host: &str) -> Vec<u8> {
+pub(crate) fn build_tls_client_hello(host: &str) -> Vec<u8> {
     let host_bytes = host.as_bytes();
 
-    // Pick a random GREASE value for this connection (Chrome behavior)
     const GREASE_VALUES: &[u16] = &[
         0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a,
         0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa,
@@ -175,43 +178,53 @@ fn build_tls_client_hello(host: &str) -> Vec<u8> {
     let grease_idx: u8 = rand::random::<u8>() % GREASE_VALUES.len() as u8;
     let grease = GREASE_VALUES[grease_idx as usize];
     let grease_bytes = grease.to_be_bytes();
+    // Second GREASE for key_share and trailing extension
+    let grease2_idx: u8 = (grease_idx + 1) % GREASE_VALUES.len() as u8;
+    let grease2 = GREASE_VALUES[grease2_idx as usize];
+    let grease2_bytes = grease2.to_be_bytes();
 
-    // Extensions (ordered like Chrome)
-    let mut extensions = Vec::with_capacity(256);
+    // Extensions ordered to match Chrome 131
+    let mut extensions = Vec::with_capacity(512);
 
-    // GREASE extension (Chrome inserts one at the start)
-    extensions.extend_from_slice(&grease_bytes); // type: GREASE
-    extensions.extend_from_slice(&[0x00, 0x00]); // empty data
+    // 1. GREASE extension
+    extensions.extend_from_slice(&grease_bytes);
+    extensions.extend_from_slice(&[0x00, 0x00]);
 
-    // SNI (RFC 6066)
+    // 2. SNI (0x0000)
     let sni_name_len = host_bytes.len();
     let sni_list_len = 1 + 2 + sni_name_len;
     let sni_ext_data_len = 2 + sni_list_len;
-    extensions.extend_from_slice(&[0x00, 0x00]); // server_name
+    extensions.extend_from_slice(&[0x00, 0x00]);
     extensions.extend_from_slice(&(sni_ext_data_len as u16).to_be_bytes());
     extensions.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
     extensions.push(0x00);
     extensions.extend_from_slice(&(sni_name_len as u16).to_be_bytes());
     extensions.extend_from_slice(host_bytes);
 
-    // extended_master_secret (0x0017)
+    // 3. extended_master_secret (0x0017)
     extensions.extend_from_slice(&[0x00, 0x17, 0x00, 0x00]);
 
-    // renegotiation_info (0xff01)
+    // 4. renegotiation_info (0xff01)
     extensions.extend_from_slice(&[0xff, 0x01, 0x00, 0x01, 0x00]);
 
-    // supported_groups (0x000a) with GREASE
+    // 5. supported_groups (0x000a)
     extensions.extend_from_slice(&[0x00, 0x0a, 0x00, 0x0c, 0x00, 0x0a]);
-    extensions.extend_from_slice(&grease_bytes); // GREASE group
+    extensions.extend_from_slice(&grease_bytes);
     extensions.extend_from_slice(&[0x00, 0x1d]); // x25519
     extensions.extend_from_slice(&[0x00, 0x17]); // secp256r1
     extensions.extend_from_slice(&[0x00, 0x18]); // secp384r1
     extensions.extend_from_slice(&[0x00, 0x19]); // secp521r1
 
-    // ec_point_formats (0x000b)
-    extensions.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]); // uncompressed
+    // 6. ec_point_formats (0x000b)
+    extensions.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
 
-    // signature_algorithms (0x000d) - realistic set
+    // 7. session_ticket (0x0023)
+    extensions.extend_from_slice(&[0x00, 0x23, 0x00, 0x00]);
+
+    // 8. status_request / OCSP (0x0005)
+    extensions.extend_from_slice(&[0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00]);
+
+    // 9. signature_algorithms (0x000d)
     extensions.extend_from_slice(&[0x00, 0x0d, 0x00, 0x12, 0x00, 0x10]);
     extensions.extend_from_slice(&[0x04, 0x03]); // ecdsa_secp256r1_sha256
     extensions.extend_from_slice(&[0x08, 0x04]); // rsa_pss_rsae_sha256
@@ -222,7 +235,10 @@ fn build_tls_client_hello(host: &str) -> Vec<u8> {
     extensions.extend_from_slice(&[0x08, 0x06]); // rsa_pss_rsae_sha512
     extensions.extend_from_slice(&[0x06, 0x01]); // rsa_pkcs1_sha512
 
-    // ALPN (0x0010)
+    // 10. signed_certificate_timestamp (0x0012)
+    extensions.extend_from_slice(&[0x00, 0x12, 0x00, 0x00]);
+
+    // 11. ALPN (0x0010)
     let alpn_protocols: &[&[u8]] = &[b"h2", b"http/1.1"];
     let alpn_list_len: usize = alpn_protocols.iter().map(|p| 1 + p.len()).sum();
     let alpn_ext_data_len = 2 + alpn_list_len;
@@ -234,25 +250,53 @@ fn build_tls_client_hello(host: &str) -> Vec<u8> {
         extensions.extend_from_slice(proto);
     }
 
-    // supported_versions (0x002b) - advertise TLS 1.3 + 1.2
-    extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x05, 0x04]);
-    extensions.extend_from_slice(&grease_bytes); // GREASE version
-    extensions.extend_from_slice(&[0x03, 0x03]); // TLS 1.2 (we don't do 1.3 but advertising it is fine)
+    // 12. compress_certificate (0x001b) - brotli
+    extensions.extend_from_slice(&[0x00, 0x1b, 0x00, 0x03, 0x02, 0x00, 0x02]);
 
-    // psk_key_exchange_modes (0x002d)
-    extensions.extend_from_slice(&[0x00, 0x2d, 0x00, 0x02, 0x01, 0x01]); // psk_dhe_ke
+    // 13. application_settings / ALPS (0x4469) - h2
+    extensions.extend_from_slice(&[0x44, 0x69, 0x00, 0x05, 0x00, 0x03, 0x02, 0x68, 0x32]);
 
-    // ClientHello body
-    let mut body = Vec::with_capacity(256 + extensions.len());
-    body.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+    // 14. supported_versions (0x002b) - TLS 1.3 + 1.2
+    extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x07, 0x06]);
+    extensions.extend_from_slice(&grease_bytes);
+    extensions.extend_from_slice(&[0x03, 0x04]); // TLS 1.3
+    extensions.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+
+    // 15. key_share (0x0033) - GREASE entry + x25519
+    let fake_pubkey: [u8; 32] = rand::random();
+    let grease_ks_data: [u8; 1] = rand::random();
+    // GREASE entry: group(2) + key_len(2) + key(1) = 5 bytes
+    // x25519 entry: group(2) + key_len(2) + key(32) = 36 bytes
+    let key_share_list_len: u16 = 5 + 36;
+    let key_share_ext_len: u16 = 2 + key_share_list_len;
+    extensions.extend_from_slice(&[0x00, 0x33]);
+    extensions.extend_from_slice(&key_share_ext_len.to_be_bytes());
+    extensions.extend_from_slice(&key_share_list_len.to_be_bytes());
+    extensions.extend_from_slice(&grease2_bytes); // GREASE group
+    extensions.extend_from_slice(&(1u16).to_be_bytes());
+    extensions.extend_from_slice(&grease_ks_data);
+    extensions.extend_from_slice(&[0x00, 0x1d]); // x25519
+    extensions.extend_from_slice(&(32u16).to_be_bytes());
+    extensions.extend_from_slice(&fake_pubkey);
+
+    // 16. psk_key_exchange_modes (0x002d)
+    extensions.extend_from_slice(&[0x00, 0x2d, 0x00, 0x02, 0x01, 0x01]);
+
+    // 17. Second GREASE extension (Chrome places one before padding)
+    extensions.extend_from_slice(&grease2_bytes);
+    extensions.extend_from_slice(&[0x00, 0x01, 0x00]);
+
+    // ClientHello body (before padding calculation)
+    let mut body = Vec::with_capacity(512);
+    body.extend_from_slice(&[0x03, 0x03]); // legacy version TLS 1.2
     let random: [u8; 32] = rand::random();
     body.extend_from_slice(&random);
     body.push(0x20); // session_id_len = 32
     let session_id: [u8; 32] = rand::random();
     body.extend_from_slice(&session_id);
-    // Cipher suites with GREASE (Chrome-like ordering)
-    body.extend_from_slice(&[0x00, 0x10]); // 16 bytes = 8 suites (including GREASE)
-    body.extend_from_slice(&grease_bytes); // GREASE cipher
+    // Cipher suites (GREASE + 3 TLS1.3 + 4 TLS1.2 ECDHE = 8 suites = 16 bytes)
+    body.extend_from_slice(&[0x00, 0x10]);
+    body.extend_from_slice(&grease_bytes);
     body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
     body.extend_from_slice(&[0x13, 0x02]); // TLS_AES_256_GCM_SHA384
     body.extend_from_slice(&[0x13, 0x03]); // TLS_CHACHA20_POLY1305_SHA256
@@ -262,49 +306,780 @@ fn build_tls_client_hello(host: &str) -> Vec<u8> {
     body.extend_from_slice(&[0xc0, 0x30]); // TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
     // Compression
     body.extend_from_slice(&[0x01, 0x00]);
-    // Extensions
+
+    // 18. padding (0x0015) - pad to 512-byte boundary
+    let body_without_ext = body.len();
+    let current_total = body_without_ext + 2 + extensions.len();
+    let target_len = 512usize;
+    if current_total < target_len {
+        let pad_data_len = target_len - current_total - 4; // -4 for ext_type(2) + ext_len(2)
+        if pad_data_len > 0 {
+            extensions.extend_from_slice(&[0x00, 0x15]);
+            extensions.extend_from_slice(&(pad_data_len as u16).to_be_bytes());
+            extensions.resize(extensions.len() + pad_data_len, 0x00);
+        }
+    }
+
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
     body.extend_from_slice(&extensions);
 
     wrap_tls_handshake(0x01, &body, [0x03, 0x01])
 }
 
-fn build_tls_server_hello() -> Vec<u8> {
-    let mut body = Vec::with_capacity(70);
-    body.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+pub(crate) fn build_tls_server_hello(client_session_id: Option<&[u8]>) -> Vec<u8> {
+    // TLS 1.3 ServerHello: legacy_version=0x0303, negotiated version in supported_versions ext
+    let mut body = Vec::with_capacity(128);
+    body.extend_from_slice(&[0x03, 0x03]); // legacy_version (always 0x0303 in TLS 1.3)
     let random: [u8; 32] = rand::random();
     body.extend_from_slice(&random);
-    body.push(0x20); // session_id_len = 32
-    let session_id: [u8; 32] = rand::random();
-    body.extend_from_slice(&session_id);
-    body.extend_from_slice(&[0xc0, 0x2b]); // cipher suite
+    // Echo client session_id (TLS 1.3 compatibility mode)
+    if let Some(sid) = client_session_id {
+        body.push(sid.len() as u8);
+        body.extend_from_slice(sid);
+    } else {
+        body.push(0x20);
+        let session_id: [u8; 32] = rand::random();
+        body.extend_from_slice(&session_id);
+    }
+    body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
     body.push(0x00); // compression: null
 
-    // Record layer uses TLS 1.2
+    // TLS 1.3 ServerHello extensions
+    let mut extensions = Vec::new();
+    // supported_versions (0x002b) - negotiated TLS 1.3
+    extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+    // key_share (0x0033) - server's x25519 public key (fake)
+    let server_pubkey: [u8; 32] = rand::random();
+    extensions.extend_from_slice(&[0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]);
+    extensions.extend_from_slice(&server_pubkey);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
     wrap_tls_handshake(0x02, &body, [0x03, 0x03])
+}
+
+// --- TLS Application Data record IO adapters ---
+// Wraps all post-handshake data in TLS Application Data records (0x17 0x03 0x03)
+// so DPI sees continuous TLS traffic after the handshake.
+
+const TLS_RECORD_HEADER_SIZE: usize = 5;
+const TLS_MAX_PLAINTEXT: usize = 16384;
+
+struct TlsRecordWriter<W> {
+    inner: W,
+    send_buf: Vec<u8>,
+    send_pos: usize,
+    payload_len: usize, // how many payload bytes are in current send_buf
+}
+
+impl<W> TlsRecordWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            send_buf: Vec::new(),
+            send_pos: 0,
+            payload_len: 0,
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for TlsRecordWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let me = &mut *self;
+
+        // If we have a pending record, flush it
+        if !me.send_buf.is_empty() {
+            while me.send_pos < me.send_buf.len() {
+                match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_pos..]) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "TLS record write: zero bytes",
+                        )));
+                    }
+                    Poll::Ready(Ok(n)) => me.send_pos += n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            // Fully flushed — report how many payload bytes we consumed
+            let n = me.payload_len;
+            me.send_buf.clear();
+            me.send_pos = 0;
+            me.payload_len = 0;
+            return Poll::Ready(Ok(n));
+        }
+
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // Build a new TLS Application Data record
+        let chunk_len = buf.len().min(TLS_MAX_PLAINTEXT);
+        me.send_buf.reserve(TLS_RECORD_HEADER_SIZE + chunk_len);
+        me.send_buf
+            .extend_from_slice(&[0x17, 0x03, 0x03, (chunk_len >> 8) as u8, chunk_len as u8]);
+        me.send_buf.extend_from_slice(&buf[..chunk_len]);
+        me.send_pos = 0;
+        me.payload_len = chunk_len;
+
+        // Try to write it all out
+        while me.send_pos < me.send_buf.len() {
+            match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_pos..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "TLS record write: zero bytes",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => me.send_pos += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        me.send_buf.clear();
+        me.send_pos = 0;
+        me.payload_len = 0;
+        Poll::Ready(Ok(chunk_len))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let me = &mut *self;
+        while me.send_pos < me.send_buf.len() {
+            match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_pos..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "TLS record flush: zero bytes",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => me.send_pos += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        me.send_buf.clear();
+        me.send_pos = 0;
+        me.payload_len = 0;
+        Pin::new(&mut me.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+struct TlsRecordReader<R> {
+    inner: R,
+    residual: Vec<u8>,
+    residual_pos: usize,
+    remaining_in_record: usize,
+    hdr_buf: [u8; TLS_RECORD_HEADER_SIZE],
+    hdr_len: usize,
+}
+
+impl<R> TlsRecordReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            residual: Vec::new(),
+            residual_pos: 0,
+            remaining_in_record: 0,
+            hdr_buf: [0u8; TLS_RECORD_HEADER_SIZE],
+            hdr_len: 0,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let me = &mut *self;
+
+        // 1. Serve residual data from a previous partial delivery
+        if me.residual_pos < me.residual.len() {
+            let to_copy = (me.residual.len() - me.residual_pos).min(buf.remaining());
+            buf.put_slice(&me.residual[me.residual_pos..me.residual_pos + to_copy]);
+            me.residual_pos += to_copy;
+            if me.residual_pos >= me.residual.len() {
+                me.residual.clear();
+                me.residual_pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // 2. If mid-record, read payload directly into caller's buf (zero-copy path)
+        if me.remaining_in_record > 0 {
+            let to_read = me.remaining_in_record.min(buf.remaining());
+            if to_read == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let before = buf.filled().len();
+            let mut sub = buf.take(to_read);
+            match Pin::new(&mut me.inner).poll_read(cx, &mut sub) {
+                Poll::Ready(Ok(())) => {
+                    let n = buf.filled().len() - before;
+                    if n == 0 {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "TLS record payload truncated",
+                        )));
+                    }
+                    me.remaining_in_record -= n;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        // 3. Read raw data from socket
+        let mut raw = [0u8; 4096];
+        let mut raw_buf = ReadBuf::new(&mut raw);
+        match Pin::new(&mut me.inner).poll_read(cx, &mut raw_buf) {
+            Poll::Ready(Ok(())) => {
+                let n = raw_buf.filled().len();
+                if n == 0 {
+                    return Poll::Ready(Ok(())); // EOF
+                }
+
+                let data = &raw[..n];
+                let mut i = 0;
+
+                // Complete a partial header from the previous read
+                if me.hdr_len > 0 {
+                    let need = TLS_RECORD_HEADER_SIZE - me.hdr_len;
+                    let avail = data.len().min(need);
+                    me.hdr_buf[me.hdr_len..me.hdr_len + avail]
+                        .copy_from_slice(&data[..avail]);
+                    me.hdr_len += avail;
+                    i = avail;
+
+                    if me.hdr_len < TLS_RECORD_HEADER_SIZE {
+                        // Still not enough for a full header
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+
+                    // Header now complete
+                    if me.hdr_buf[0] == 0x17 && me.hdr_buf[1] == 0x03 {
+                        me.remaining_in_record =
+                            u16::from_be_bytes([me.hdr_buf[3], me.hdr_buf[4]]) as usize;
+                    } else {
+                        me.residual
+                            .extend_from_slice(&me.hdr_buf[..TLS_RECORD_HEADER_SIZE]);
+                    }
+                    me.hdr_len = 0;
+                }
+
+                // Process the rest of the buffer
+                while i < data.len() {
+                    if me.remaining_in_record > 0 {
+                        let take = me.remaining_in_record.min(data.len() - i);
+                        me.residual.extend_from_slice(&data[i..i + take]);
+                        me.remaining_in_record -= take;
+                        i += take;
+                    } else if i + TLS_RECORD_HEADER_SIZE <= data.len() {
+                        if data[i] == 0x17 && data[i + 1] == 0x03 {
+                            me.remaining_in_record =
+                                u16::from_be_bytes([data[i + 3], data[i + 4]]) as usize;
+                            i += TLS_RECORD_HEADER_SIZE;
+                        } else {
+                            me.residual.extend_from_slice(&data[i..]);
+                            i = data.len();
+                        }
+                    } else {
+                        // Partial header at buffer boundary — stash it
+                        let partial = data.len() - i;
+                        me.hdr_buf[..partial].copy_from_slice(&data[i..]);
+                        me.hdr_len = partial;
+                        i = data.len();
+                    }
+                }
+
+                // Deliver decoded payload
+                if !me.residual.is_empty() {
+                    let to_copy = me.residual.len().min(buf.remaining());
+                    buf.put_slice(&me.residual[..to_copy]);
+                    me.residual_pos = to_copy;
+                    if me.residual_pos >= me.residual.len() {
+                        me.residual.clear();
+                        me.residual_pos = 0;
+                    }
+                    Poll::Ready(Ok(()))
+                } else if me.remaining_in_record > 0 {
+                    // Header parsed but payload starts in next read — direct path
+                    let to_read = me.remaining_in_record.min(buf.remaining());
+                    if to_read == 0 {
+                        return Poll::Ready(Ok(()));
+                    }
+                    let before = buf.filled().len();
+                    let mut sub = buf.take(to_read);
+                    match Pin::new(&mut me.inner).poll_read(cx, &mut sub) {
+                        Poll::Ready(Ok(())) => {
+                            let rd = buf.filled().len() - before;
+                            me.remaining_in_record -= rd;
+                            Poll::Ready(Ok(()))
+                        }
+                        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                        Poll::Pending => Poll::Pending,
+                    }
+                } else {
+                    // Rare: all data was just headers — retry
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+
+
+// --- WebSocket Frame Writer/Reader ---
+// Wraps data in RFC 6455 binary frames so post-101 traffic passes DPI frame checks.
+
+struct WsFrameWriter<W> {
+    inner: W,
+    is_client: bool,
+    send_buf: Vec<u8>,
+    send_offset: usize,
+    pending_payload_len: usize, // payload len of frame currently in send_buf
+}
+
+impl<W> WsFrameWriter<W> {
+    fn new(inner: W, is_client: bool) -> Self {
+        Self {
+            inner,
+            is_client,
+            send_buf: Vec::with_capacity(TCP_MTU_BYTES + 14),
+            send_offset: 0,
+            pending_payload_len: 0,
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.send_offset < self.send_buf.len() && !self.send_buf.is_empty()
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for WsFrameWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let me = &mut *self;
+
+        // If we have a pending frame, finish sending it first
+        if me.has_pending() {
+            loop {
+                match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_offset..]) {
+                    Poll::Ready(Ok(n)) => {
+                        me.send_offset += n;
+                        if me.send_offset >= me.send_buf.len() {
+                            // Pending frame fully sent — report the original payload len
+                            let len = me.pending_payload_len;
+                            me.send_buf.clear();
+                            me.send_offset = 0;
+                            me.pending_payload_len = 0;
+                            return Poll::Ready(Ok(len));
+                        }
+                        // Continue writing remaining bytes
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // Build WS binary frame into send_buf
+        me.send_buf.clear();
+        me.send_offset = 0;
+
+        let payload_len = buf.len();
+        me.send_buf.push(0x82); // FIN + Binary opcode
+
+        let mask_bit: u8 = if me.is_client { 0x80 } else { 0x00 };
+        if payload_len <= 125 {
+            me.send_buf.push(mask_bit | payload_len as u8);
+        } else if payload_len <= 65535 {
+            me.send_buf.push(mask_bit | 126);
+            me.send_buf
+                .extend_from_slice(&(payload_len as u16).to_be_bytes());
+        } else {
+            me.send_buf.push(mask_bit | 127);
+            me.send_buf
+                .extend_from_slice(&(payload_len as u64).to_be_bytes());
+        }
+
+        if me.is_client {
+            let mask_key: [u8; 4] = rand::random();
+            me.send_buf.extend_from_slice(&mask_key);
+            let mask_u64 = u64::from_ne_bytes([
+                mask_key[0], mask_key[1], mask_key[2], mask_key[3],
+                mask_key[0], mask_key[1], mask_key[2], mask_key[3],
+            ]);
+            me.send_buf.reserve(payload_len);
+            let chunks = buf.chunks_exact(8);
+            let remainder = chunks.remainder();
+            for chunk in chunks {
+                let val = u64::from_ne_bytes(chunk.try_into().unwrap()) ^ mask_u64;
+                me.send_buf.extend_from_slice(&val.to_ne_bytes());
+            }
+            for (i, &b) in remainder.iter().enumerate() {
+                me.send_buf
+                    .push(b ^ mask_key[(payload_len - remainder.len() + i) % 4]);
+            }
+        } else {
+            me.send_buf.extend_from_slice(buf);
+        }
+
+        me.pending_payload_len = payload_len;
+
+        // Try to write the entire frame; loop until fully sent or Pending
+        loop {
+            match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_offset..]) {
+                Poll::Ready(Ok(n)) => {
+                    me.send_offset += n;
+                    if me.send_offset >= me.send_buf.len() {
+                        me.send_buf.clear();
+                        me.send_offset = 0;
+                        me.pending_payload_len = 0;
+                        return Poll::Ready(Ok(payload_len));
+                    }
+                    // Partial write — continue loop
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let me = &mut *self;
+        // Flush any remaining send_buf
+        while me.send_offset < me.send_buf.len() {
+            match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_offset..]) {
+                Poll::Ready(Ok(n)) => me.send_offset += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Pin::new(&mut me.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+enum WsReadState {
+    ReadingHeader,
+    ReadingPayload,
+}
+
+struct WsFrameReader<R> {
+    inner: R,
+    state: WsReadState,
+    hdr_buf: [u8; 14], // max header: 2 + 8 (ext len) + 4 (mask) = 14
+    hdr_len: usize,    // total header bytes needed
+    hdr_read: usize,   // header bytes read so far
+    remaining_payload: usize,
+    mask_key: [u8; 4],
+    has_mask: bool,
+    mask_offset: usize,
+}
+
+impl<R> WsFrameReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            state: WsReadState::ReadingHeader,
+            hdr_buf: [0u8; 14],
+            hdr_len: 2, // start by reading 2 base bytes
+            hdr_read: 0,
+            remaining_payload: 0,
+            mask_key: [0; 4],
+            has_mask: false,
+            mask_offset: 0,
+        }
+    }
+
+    fn reset_for_next_frame(&mut self) {
+        self.state = WsReadState::ReadingHeader;
+        self.hdr_len = 2;
+        self.hdr_read = 0;
+        self.remaining_payload = 0;
+        self.has_mask = false;
+        self.mask_offset = 0;
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let me = &mut *self;
+
+        loop {
+            match me.state {
+                WsReadState::ReadingHeader => {
+                    // Read header bytes incrementally
+                    while me.hdr_read < me.hdr_len {
+                        let mut tmp = ReadBuf::new(&mut me.hdr_buf[me.hdr_read..me.hdr_len]);
+                        match Pin::new(&mut me.inner).poll_read(cx, &mut tmp) {
+                            Poll::Ready(Ok(())) => {
+                                let n = tmp.filled().len();
+                                if n == 0 {
+                                    return if me.hdr_read == 0 {
+                                        Poll::Ready(Ok(())) // clean EOF
+                                    } else {
+                                        Poll::Ready(Err(std::io::Error::new(
+                                            std::io::ErrorKind::UnexpectedEof,
+                                            "incomplete WS frame header",
+                                        )))
+                                    };
+                                }
+                                me.hdr_read += n;
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+
+                        // After reading base 2 bytes, determine full header size
+                        if me.hdr_read >= 2 && me.hdr_len == 2 {
+                            let mask_bit = (me.hdr_buf[1] & 0x80) != 0;
+                            let len_code = (me.hdr_buf[1] & 0x7F) as usize;
+                            let ext_len = match len_code {
+                                0..=125 => 0,
+                                126 => 2,
+                                _ => 8,
+                            };
+                            let mask_len = if mask_bit { 4 } else { 0 };
+                            me.hdr_len = 2 + ext_len + mask_len;
+                            // hdr_len now correct, loop continues reading remaining bytes
+                        }
+                    }
+
+                    // Full header read — parse it
+                    let mask_bit = (me.hdr_buf[1] & 0x80) != 0;
+                    let len_code = (me.hdr_buf[1] & 0x7F) as usize;
+                    let payload_len = match len_code {
+                        0..=125 => len_code,
+                        126 => u16::from_be_bytes([me.hdr_buf[2], me.hdr_buf[3]]) as usize,
+                        _ => u64::from_be_bytes(
+                            me.hdr_buf[2..10].try_into().unwrap(),
+                        ) as usize,
+                    };
+
+                    me.has_mask = mask_bit;
+                    if mask_bit {
+                        let mask_start = 2 + match len_code {
+                            0..=125 => 0,
+                            126 => 2,
+                            _ => 8,
+                        };
+                        me.mask_key.copy_from_slice(&me.hdr_buf[mask_start..mask_start + 4]);
+                    }
+
+                    me.remaining_payload = payload_len;
+                    me.mask_offset = 0;
+
+                    // Control frames (opcode >= 0x08): skip payload, read next frame
+                    let opcode = me.hdr_buf[0] & 0x0F;
+                    if opcode >= 0x08 {
+                        // Drain control frame payload
+                        me.state = WsReadState::ReadingPayload;
+                        // We'll drain it below but discard into nowhere
+                        if me.remaining_payload == 0 {
+                            me.reset_for_next_frame();
+                            continue;
+                        }
+                        // For control frames, drain into a local buffer
+                        let mut discard = [0u8; 125];
+                        let to_drain = me.remaining_payload.min(125);
+                        let mut tmp = ReadBuf::new(&mut discard[..to_drain]);
+                        match Pin::new(&mut me.inner).poll_read(cx, &mut tmp) {
+                            Poll::Ready(Ok(())) => {
+                                let n = tmp.filled().len();
+                                me.remaining_payload -= n;
+                                if me.remaining_payload == 0 {
+                                    me.reset_for_next_frame();
+                                    continue;
+                                }
+                                return Poll::Pending;
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+
+                    if payload_len == 0 {
+                        // Empty data frame — read next
+                        me.reset_for_next_frame();
+                        continue;
+                    }
+
+                    me.state = WsReadState::ReadingPayload;
+                    // Fall through to payload reading
+                }
+                WsReadState::ReadingPayload => {
+                    if me.remaining_payload == 0 {
+                        me.reset_for_next_frame();
+                        continue;
+                    }
+
+                    let to_read = me.remaining_payload.min(buf.remaining());
+                    if to_read == 0 {
+                        return Poll::Ready(Ok(()));
+                    }
+
+                    let before = buf.filled().len();
+                    let mut limited_buf = buf.take(to_read);
+                    match Pin::new(&mut me.inner).poll_read(cx, &mut limited_buf) {
+                        Poll::Ready(Ok(())) => {
+                            let n = buf.filled().len() - before;
+                            if n == 0 {
+                                return Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "WS frame payload truncated",
+                                )));
+                            }
+                            me.remaining_payload -= n;
+
+                            // Unmask in-place
+                            if me.has_mask {
+                                let start = buf.filled().len() - n;
+                                let filled = buf.filled_mut();
+                                for i in start..start + n {
+                                    filled[i] ^= me.mask_key[me.mask_offset % 4];
+                                    me.mask_offset += 1;
+                                }
+                            } else {
+                                me.mask_offset += n;
+                            }
+
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Fake TLS 1.3 post-handshake messages to complete the handshake appearance.
+// In real TLS 1.3: ServerHello is followed by CCS + encrypted handshake records
+// (EncryptedExtensions, Certificate, CertificateVerify, Finished).
+fn build_fake_server_encrypted_handshake() -> Vec<u8> {
+    let mut out = Vec::with_capacity(4096);
+    // ChangeCipherSpec (required for TLS 1.3 middlebox compatibility)
+    out.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+    // Fake encrypted handshake records (appear as Application Data to DPI).
+    // Randomize sizes to avoid a fixed statistical fingerprint.
+    let r1_len = 1300 + (rand::random::<u16>() % 400) as usize;
+    let r2_len = 1000 + (rand::random::<u16>() % 400) as usize;
+    let fake_r1: Vec<u8> = (0..r1_len).map(|_| rand::random::<u8>()).collect();
+    let fake_r2: Vec<u8> = (0..r2_len).map(|_| rand::random::<u8>()).collect();
+    out.extend_from_slice(&[0x17, 0x03, 0x03]);
+    out.extend_from_slice(&(r1_len as u16).to_be_bytes());
+    out.extend_from_slice(&fake_r1);
+    out.extend_from_slice(&[0x17, 0x03, 0x03]);
+    out.extend_from_slice(&(r2_len as u16).to_be_bytes());
+    out.extend_from_slice(&fake_r2);
+    out
+}
+
+fn build_fake_client_finished() -> Vec<u8> {
+    let mut out = Vec::with_capacity(80);
+    // Client ChangeCipherSpec
+    out.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+    // Client Finished (encrypted, appears as Application Data)
+    let finished_len = 36 + (rand::random::<u8>() % 20) as usize;
+    out.extend_from_slice(&[0x17, 0x03, 0x03]);
+    out.extend_from_slice(&(finished_len as u16).to_be_bytes());
+    let fake_finished: Vec<u8> = (0..finished_len).map(|_| rand::random::<u8>()).collect();
+    out.extend_from_slice(&fake_finished);
+    out
 }
 
 // --- Handshake logic ---
 
-async fn perform_client_handshake(
-    stream: &mut TcpStream,
-    payload: &FakeHttpPayload,
-) -> Result<(), TunnelError> {
-    let data = payload.client_bytes();
-    stream.write_all(&data).await?;
-
-    // Read server response (we only need to confirm something came back)
-    let mut resp_buf = [0u8; 512];
-    let n = stream.read(&mut resp_buf).await?;
-    if n == 0 {
-        return Err(TunnelError::InternalError(
-            "fakehttp handshake: server closed connection".to_string(),
-        ));
+async fn drain_tls_records(stream: &mut TcpStream, count: usize) -> Result<(), TunnelError> {
+    let mut hdr = [0u8; 5];
+    for _ in 0..count {
+        stream.read_exact(&mut hdr).await?;
+        let record_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+        if record_len > 16384 {
+            return Err(TunnelError::InternalError(
+                "fakehttp: TLS record too large during handshake drain".to_string(),
+            ));
+        }
+        // CCS records have content_type 0x14 and are only 1 byte payload
+        // but we still read via the length field for uniformity
+        let mut body = vec![0u8; record_len];
+        stream.read_exact(&mut body).await?;
     }
     Ok(())
 }
 
-async fn perform_server_handshake(stream: &mut TcpStream) -> Result<(), TunnelError> {
+enum HandshakeResult {
+    Plain,
+    TlsWrapped,
+}
+
+async fn perform_client_handshake(
+    stream: &mut TcpStream,
+    payload: &FakeHttpPayload,
+) -> Result<HandshakeResult, TunnelError> {
+    let data = payload.client_bytes();
+    stream.write_all(&data).await?;
+
+    let is_tls = matches!(payload, FakeHttpPayload::Https { .. });
+
+    if is_tls {
+        // Read server's TLS records: ServerHello + CCS + 2 encrypted AppData records
+        drain_tls_records(stream, 4).await?;
+        // Send client CCS + fake Finished
+        stream.write_all(&build_fake_client_finished()).await?;
+        Ok(HandshakeResult::TlsWrapped)
+    } else {
+        // HTTP/Raw: just read any response
+        let mut resp_buf = [0u8; 512];
+        let n = stream.read(&mut resp_buf).await?;
+        if n == 0 {
+            return Err(TunnelError::InternalError(
+                "fakehttp handshake: server closed connection".to_string(),
+            ));
+        }
+        if matches!(payload, FakeHttpPayload::Http { .. }) {
+            Ok(HandshakeResult::Plain)
+        } else {
+            Ok(HandshakeResult::Plain)
+        }
+    }
+}
+
+async fn perform_server_handshake(stream: &mut TcpStream) -> Result<HandshakeResult, TunnelError> {
     let mut peek_buf = [0u8; 4];
     let n = stream.peek(&mut peek_buf).await?;
     if n == 0 {
@@ -314,11 +1089,14 @@ async fn perform_server_handshake(stream: &mut TcpStream) -> Result<(), TunnelEr
     }
 
     if (n >= 3 && &peek_buf[..3] == b"GET") || (n >= 4 && &peek_buf[..4] == b"POST") {
-        server_handle_http(stream).await
+        server_handle_http(stream).await?;
+        Ok(HandshakeResult::Plain)
     } else if n >= 2 && peek_buf[0] == 0x16 && peek_buf[1] == 0x03 {
-        server_handle_tls(stream).await
+        server_handle_tls(stream).await?;
+        Ok(HandshakeResult::TlsWrapped)
     } else {
-        server_handle_raw(stream).await
+        server_handle_raw(stream).await?;
+        Ok(HandshakeResult::Plain)
     }
 }
 
@@ -361,15 +1139,34 @@ async fn server_handle_tls(stream: &mut TcpStream) -> Result<(), TunnelError> {
             "fakehttp: TLS record too large".to_string(),
         ));
     }
-    // Drain the record body
-    let mut remaining = record_len;
-    let mut discard = [0u8; 4096];
-    while remaining > 0 {
-        let to_read = remaining.min(discard.len());
-        stream.read_exact(&mut discard[..to_read]).await?;
-        remaining -= to_read;
-    }
-    stream.write_all(&build_tls_server_hello()).await?;
+    // Read the full record body to extract session_id
+    let mut record_body = vec![0u8; record_len];
+    stream.read_exact(&mut record_body).await?;
+
+    // Parse session_id from ClientHello:
+    // handshake_type(1) + length(3) + version(2) + random(32) + session_id_len(1) = offset 39
+    let session_id = if record_body.len() > 39 {
+        let sid_len = record_body[38] as usize;
+        if record_body.len() >= 39 + sid_len {
+            Some(&record_body[39..39 + sid_len])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Send ServerHello + fake encrypted handshake (CCS + encrypted records)
+    let server_hello = build_tls_server_hello(session_id);
+    let fake_hs = build_fake_server_encrypted_handshake();
+    let mut combined = Vec::with_capacity(server_hello.len() + fake_hs.len());
+    combined.extend_from_slice(&server_hello);
+    combined.extend_from_slice(&fake_hs);
+    stream.write_all(&combined).await?;
+
+    // Read client's CCS + fake Finished (2 TLS records, variable size)
+    drain_tls_records(stream, 2).await?;
+
     Ok(())
 }
 
@@ -466,7 +1263,7 @@ impl FakeHttpTunnelListener {
             tracing::warn!(?e, "fakehttp: set_nodelay fail in accept");
         }
 
-        timeout(HANDSHAKE_TIMEOUT, perform_server_handshake(&mut stream))
+        let hs_result = timeout(HANDSHAKE_TIMEOUT, perform_server_handshake(&mut stream))
             .await
             .map_err(|_| {
                 TunnelError::InternalError("fakehttp handshake timed out".to_string())
@@ -493,11 +1290,18 @@ impl FakeHttpTunnelListener {
         };
 
         let (r, w) = stream.into_split();
-        Ok(Box::new(TunnelWrapper::new(
-            FramedReader::new(r, TCP_MTU_BYTES),
-            FramedWriter::new(w),
-            Some(info),
-        )))
+        match hs_result {
+            HandshakeResult::TlsWrapped => Ok(Box::new(TunnelWrapper::new(
+                FramedReader::new(TlsRecordReader::new(r), TCP_MTU_BYTES),
+                FramedWriter::new(TlsRecordWriter::new(w)),
+                Some(info),
+            ))),
+            HandshakeResult::Plain => Ok(Box::new(TunnelWrapper::new(
+                FramedReader::new(r, TCP_MTU_BYTES),
+                FramedWriter::new(w),
+                Some(info),
+            ))),
+        }
     }
 }
 
@@ -626,7 +1430,7 @@ impl super::TunnelConnector for FakeHttpTunnelConnector {
         }
 
         let payload = self.next_payload();
-        timeout(HANDSHAKE_TIMEOUT, perform_client_handshake(&mut stream, payload))
+        let hs_result = timeout(HANDSHAKE_TIMEOUT, perform_client_handshake(&mut stream, payload))
             .await
             .map_err(|_| {
                 TunnelError::InternalError(
@@ -638,11 +1442,18 @@ impl super::TunnelConnector for FakeHttpTunnelConnector {
 
         let info = build_tunnel_info(&stream, &self.addr)?;
         let (r, w) = stream.into_split();
-        Ok(Box::new(TunnelWrapper::new(
-            FramedReader::new(r, TCP_MTU_BYTES),
-            FramedWriter::new(w),
-            Some(info),
-        )))
+        match hs_result {
+            HandshakeResult::TlsWrapped => Ok(Box::new(TunnelWrapper::new(
+                FramedReader::new(TlsRecordReader::new(r), TCP_MTU_BYTES),
+                FramedWriter::new(TlsRecordWriter::new(w)),
+                Some(info),
+            ))),
+            HandshakeResult::Plain => Ok(Box::new(TunnelWrapper::new(
+                FramedReader::new(r, TCP_MTU_BYTES),
+                FramedWriter::new(w),
+                Some(info),
+            ))),
+        }
     }
 
     fn remote_url(&self) -> url::Url {
@@ -757,5 +1568,401 @@ mod tests {
         _tunnel_pingpong(listener, connector).await;
 
         std::fs::remove_file(&tmp_file).ok();
+    }
+
+    // --- DPI Detection Tests ---
+
+    const GREASE_VALUES: &[u16] = &[
+        0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a,
+        0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa,
+    ];
+
+    fn is_grease(val: u16) -> bool {
+        GREASE_VALUES.contains(&val)
+    }
+
+    fn parse_tls_record(data: &[u8]) -> Option<(u8, [u8; 2], &[u8])> {
+        if data.len() < 5 {
+            return None;
+        }
+        let content_type = data[0];
+        let version = [data[1], data[2]];
+        let length = u16::from_be_bytes([data[3], data[4]]) as usize;
+        if data.len() < 5 + length {
+            return None;
+        }
+        Some((content_type, version, &data[5..5 + length]))
+    }
+
+    fn parse_handshake(payload: &[u8]) -> Option<(u8, &[u8])> {
+        if payload.len() < 4 {
+            return None;
+        }
+        let hs_type = payload[0];
+        let length =
+            ((payload[1] as usize) << 16) | ((payload[2] as usize) << 8) | payload[3] as usize;
+        if payload.len() < 4 + length {
+            return None;
+        }
+        Some((hs_type, &payload[4..4 + length]))
+    }
+
+    fn find_extension(extensions_data: &[u8], target_type: u16) -> Option<&[u8]> {
+        let mut offset = 0;
+        while offset + 4 <= extensions_data.len() {
+            let ext_type =
+                u16::from_be_bytes([extensions_data[offset], extensions_data[offset + 1]]);
+            let ext_len = u16::from_be_bytes([
+                extensions_data[offset + 2],
+                extensions_data[offset + 3],
+            ]) as usize;
+            if offset + 4 + ext_len > extensions_data.len() {
+                break;
+            }
+            if ext_type == target_type {
+                return Some(&extensions_data[offset + 4..offset + 4 + ext_len]);
+            }
+            offset += 4 + ext_len;
+        }
+        None
+    }
+
+    fn shannon_entropy(data: &[u8]) -> f64 {
+        if data.is_empty() {
+            return 0.0;
+        }
+        let mut freq = [0u64; 256];
+        for &b in data {
+            freq[b as usize] += 1;
+        }
+        let len = data.len() as f64;
+        freq.iter()
+            .filter(|&&c| c > 0)
+            .map(|&c| {
+                let p = c as f64 / len;
+                -p * p.log2()
+            })
+            .sum()
+    }
+
+    struct ClientHelloFields<'a> {
+        version: [u8; 2],
+        random: &'a [u8],
+        session_id: &'a [u8],
+        cipher_suites: Vec<u16>,
+        extensions_raw: &'a [u8],
+    }
+
+    fn parse_client_hello(body: &[u8]) -> Option<ClientHelloFields<'_>> {
+        if body.len() < 38 {
+            return None;
+        }
+        let version = [body[0], body[1]];
+        let random = &body[2..34];
+        let sid_len = body[34] as usize;
+        if body.len() < 35 + sid_len {
+            return None;
+        }
+        let session_id = &body[35..35 + sid_len];
+        let mut offset = 35 + sid_len;
+
+        // cipher suites
+        if offset + 2 > body.len() {
+            return None;
+        }
+        let cs_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+        offset += 2;
+        if offset + cs_len > body.len() {
+            return None;
+        }
+        let mut cipher_suites = Vec::new();
+        let cs_data = &body[offset..offset + cs_len];
+        for chunk in cs_data.chunks_exact(2) {
+            cipher_suites.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+        }
+        offset += cs_len;
+
+        // compression
+        if offset + 1 > body.len() {
+            return None;
+        }
+        let comp_len = body[offset] as usize;
+        offset += 1 + comp_len;
+
+        // extensions
+        if offset + 2 > body.len() {
+            return None;
+        }
+        let ext_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+        offset += 2;
+        let extensions_raw = if offset + ext_len <= body.len() {
+            &body[offset..offset + ext_len]
+        } else {
+            &body[offset..]
+        };
+
+        Some(ClientHelloFields {
+            version,
+            random,
+            session_id,
+            cipher_suites,
+            extensions_raw,
+        })
+    }
+
+    #[test]
+    fn test_dpi_tls_record_format() {
+        let data = build_tls_client_hello("www.google.com");
+        let (ct, ver, payload) = parse_tls_record(&data).expect("valid TLS record");
+        assert_eq!(ct, 0x16, "content_type should be Handshake");
+        assert_eq!(ver, [0x03, 0x01], "record version should be TLS 1.0");
+        let (hs_type, _body) = parse_handshake(payload).expect("valid handshake");
+        assert_eq!(hs_type, 0x01, "handshake type should be ClientHello");
+
+        let server_data = build_tls_server_hello(Some(&[0xAA; 32]));
+        let (ct, ver, payload) = parse_tls_record(&server_data).expect("valid ServerHello record");
+        assert_eq!(ct, 0x16);
+        assert_eq!(ver, [0x03, 0x03], "ServerHello record version should be TLS 1.2");
+        let (hs_type, _) = parse_handshake(payload).expect("valid handshake");
+        assert_eq!(hs_type, 0x02, "handshake type should be ServerHello");
+    }
+
+    #[test]
+    fn test_dpi_tls_client_hello_fields() {
+        let data = build_tls_client_hello("example.com");
+        let (_, _, payload) = parse_tls_record(&data).unwrap();
+        let (_, body) = parse_handshake(payload).unwrap();
+        let ch = parse_client_hello(body).expect("valid ClientHello");
+
+        assert_eq!(ch.version, [0x03, 0x03], "protocol version TLS 1.2");
+        assert_eq!(ch.random.len(), 32);
+        assert!(ch.random.iter().any(|&b| b != 0), "random should not be all zeros");
+        assert_eq!(ch.session_id.len(), 32);
+        assert!(ch.session_id.iter().any(|&b| b != 0), "session_id should not be all zeros");
+        assert!(
+            ch.cipher_suites.iter().any(|&cs| is_grease(cs)),
+            "should contain GREASE cipher suite"
+        );
+        assert!(
+            ch.cipher_suites.contains(&0x1301),
+            "should contain TLS_AES_128_GCM"
+        );
+        assert!(
+            ch.cipher_suites.contains(&0x1302),
+            "should contain TLS_AES_256_GCM"
+        );
+        assert!(
+            ch.cipher_suites.contains(&0x1303),
+            "should contain TLS_CHACHA20"
+        );
+    }
+
+    #[test]
+    fn test_dpi_tls_extensions_presence() {
+        let host = "www.google.com";
+        let data = build_tls_client_hello(host);
+        let (_, _, payload) = parse_tls_record(&data).unwrap();
+        let (_, body) = parse_handshake(payload).unwrap();
+        let ch = parse_client_hello(body).unwrap();
+        let ext = ch.extensions_raw;
+
+        // SNI
+        let sni = find_extension(ext, 0x0000).expect("should have SNI extension");
+        let sni_str = std::str::from_utf8(&sni[5..]).unwrap_or("");
+        assert_eq!(sni_str, host, "SNI hostname should match");
+
+        // key_share
+        assert!(find_extension(ext, 0x0033).is_some(), "should have key_share");
+
+        // supported_versions
+        assert!(find_extension(ext, 0x002b).is_some(), "should have supported_versions");
+
+        // ALPN
+        let alpn = find_extension(ext, 0x0010).expect("should have ALPN");
+        let alpn_str = String::from_utf8_lossy(alpn);
+        assert!(alpn_str.contains("h2"), "ALPN should contain h2");
+
+        // session_ticket
+        assert!(find_extension(ext, 0x0023).is_some(), "should have session_ticket");
+
+        // status_request
+        assert!(find_extension(ext, 0x0005).is_some(), "should have status_request");
+
+        // GREASE extension
+        let mut has_grease_ext = false;
+        let mut offset = 0;
+        while offset + 4 <= ext.len() {
+            let ext_type = u16::from_be_bytes([ext[offset], ext[offset + 1]]);
+            let ext_len =
+                u16::from_be_bytes([ext[offset + 2], ext[offset + 3]]) as usize;
+            if is_grease(ext_type) {
+                has_grease_ext = true;
+                break;
+            }
+            offset += 4 + ext_len;
+        }
+        assert!(has_grease_ext, "should have GREASE extension");
+    }
+
+    #[test]
+    fn test_dpi_tls_hello_length() {
+        let data = build_tls_client_hello("www.example.com");
+        assert!(
+            data.len() >= 517,
+            "ClientHello record should be >= 517 bytes (got {})",
+            data.len()
+        );
+        let (_, _, payload) = parse_tls_record(&data).unwrap();
+        let (_, body) = parse_handshake(payload).unwrap();
+        assert!(
+            body.len() >= 512,
+            "ClientHello body should be >= 512 bytes (got {})",
+            body.len()
+        );
+    }
+
+    #[test]
+    fn test_dpi_tls_server_hello_compliance() {
+        let client_sid: [u8; 32] = rand::random();
+        let server_data = build_tls_server_hello(Some(&client_sid));
+        let (_, _, payload) = parse_tls_record(&server_data).unwrap();
+        let (_, body) = parse_handshake(payload).unwrap();
+
+        // Parse ServerHello: version(2) + random(32) + sid_len(1) + sid + cipher(2) + comp(1) + ext
+        assert!(body.len() > 70, "ServerHello body too short");
+        let sid_len = body[34] as usize;
+        assert_eq!(sid_len, 32);
+        let server_sid = &body[35..35 + sid_len];
+        assert_eq!(server_sid, &client_sid, "ServerHello should echo client session_id");
+
+        // Check extensions exist
+        // ServerHello body: version(2) + random(32) + sid_len(1) + sid(32) + cipher(2) + comp(1)
+        let offset = 2 + 32 + 1 + sid_len + 2 + 1;
+        assert!(body.len() > offset + 2, "ServerHello should have extensions");
+        let ext_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+        assert!(ext_len > 0, "ServerHello extensions should not be empty");
+
+        let ext_data = &body[offset + 2..offset + 2 + ext_len];
+        assert!(
+            find_extension(ext_data, 0x002b).is_some(),
+            "should have supported_versions extension"
+        );
+        assert!(
+            find_extension(ext_data, 0x0033).is_some(),
+            "should have key_share extension"
+        );
+    }
+
+    #[test]
+    fn test_dpi_tls_randomness() {
+        let data1 = build_tls_client_hello("example.com");
+        let data2 = build_tls_client_hello("example.com");
+
+        let (_, _, p1) = parse_tls_record(&data1).unwrap();
+        let (_, _, p2) = parse_tls_record(&data2).unwrap();
+        let (_, b1) = parse_handshake(p1).unwrap();
+        let (_, b2) = parse_handshake(p2).unwrap();
+
+        let random1 = &b1[2..34];
+        let random2 = &b2[2..34];
+        assert_ne!(random1, random2, "random should differ between calls");
+
+        let sid1 = &b1[35..67];
+        let sid2 = &b2[35..67];
+        assert_ne!(sid1, sid2, "session_id should differ between calls");
+    }
+
+    #[test]
+    fn test_dpi_tls_entropy() {
+        let data = build_tls_client_hello("www.google.com");
+        let (_, _, payload) = parse_tls_record(&data).unwrap();
+        let (_, body) = parse_handshake(payload).unwrap();
+
+        let random = &body[2..34];
+        let entropy = shannon_entropy(random);
+        assert!(
+            entropy > 3.5,
+            "random field entropy should be reasonable (got {:.2})",
+            entropy
+        );
+
+        // Test with simulated encrypted payload
+        let encrypted: Vec<u8> = (0..1400).map(|_| rand::random::<u8>()).collect();
+        let entropy = shannon_entropy(&encrypted);
+        assert!(
+            entropy > 7.8,
+            "AES-like random data should have high entropy (got {:.2})",
+            entropy
+        );
+    }
+
+    #[test]
+    fn test_dpi_http_request_headers() {
+        let host = "ws.example.com";
+        let req = build_http_request(host);
+        let req_str = String::from_utf8_lossy(&req);
+
+        assert!(req_str.starts_with("GET / HTTP/1.1\r\n"), "should start with GET");
+        assert!(req_str.ends_with("\r\n\r\n"), "should end with double CRLF");
+        assert!(req_str.contains(&format!("Host: {}", host)), "should have Host header");
+        assert!(req_str.contains("Connection: Upgrade"), "should have Connection: Upgrade");
+        assert!(req_str.contains("Upgrade: websocket"), "should have Upgrade: websocket");
+        assert!(
+            req_str.contains("Sec-WebSocket-Version: 13"),
+            "should have WS version"
+        );
+        assert!(req_str.contains("Sec-WebSocket-Key: "), "should have WS key");
+        assert!(
+            req_str.contains(&format!("Origin: http://{}", host)),
+            "should have Origin"
+        );
+        assert!(
+            req_str.contains("Sec-WebSocket-Extensions: permessage-deflate"),
+            "should have WS extensions"
+        );
+        assert!(req_str.contains("Chrome/"), "should have Chrome User-Agent");
+
+        // Validate Sec-WebSocket-Key is valid base64 (24 chars)
+        let key_line = req_str
+            .lines()
+            .find(|l| l.contains("Sec-WebSocket-Key:"))
+            .unwrap();
+        let key = key_line.split(": ").nth(1).unwrap().trim();
+        assert_eq!(key.len(), 24, "WS key should be 24 chars base64");
+    }
+
+    #[test]
+    fn test_dpi_http_response_format() {
+        let resp = build_http_response();
+        let resp_str = String::from_utf8_lossy(&resp);
+
+        assert!(
+            resp_str.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+            "should be 101 response"
+        );
+        assert!(resp_str.ends_with("\r\n\r\n"), "should end with double CRLF");
+        assert!(resp_str.contains("Connection: Upgrade"), "should have Connection: Upgrade");
+        assert!(resp_str.contains("Upgrade: websocket"), "should have Upgrade: websocket");
+        assert!(
+            resp_str.contains("Sec-WebSocket-Accept:"),
+            "should have WS Accept"
+        );
+        assert!(resp_str.contains("Date:"), "should have Date header");
+    }
+
+    #[test]
+    fn test_dpi_tls_empty_host() {
+        let data = build_tls_client_hello("");
+        let (ct, _, _) = parse_tls_record(&data).expect("should produce valid record");
+        assert_eq!(ct, 0x16);
+    }
+
+    #[test]
+    fn test_dpi_tls_long_host() {
+        let long_host = "a".repeat(255);
+        let data = build_tls_client_hello(&long_host);
+        let (ct, _, payload) = parse_tls_record(&data).expect("should produce valid record");
+        assert_eq!(ct, 0x16);
+        assert!(payload.len() <= 16384, "should not exceed TLS max record");
     }
 }

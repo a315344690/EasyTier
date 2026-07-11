@@ -60,6 +60,7 @@ const TIMEOUT: time::Duration = time::Duration::from_secs(1);
 const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 512;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
+const ACK_THRESHOLD: u32 = 65536; // 64KB: send immediate standalone ACK after this much unacked data
 
 #[async_trait::async_trait]
 pub trait Tun: Send + Sync + 'static {
@@ -213,6 +214,16 @@ impl Socket {
         }
     }
 
+    pub fn send_ack(&self) {
+        let ack = self.ack.load(Ordering::Relaxed);
+        let last = self.last_ack.load(Ordering::Relaxed);
+        if ack == last {
+            return;
+        }
+        let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
+        let _ = self.tun.try_send(&buf);
+    }
+
     pub fn close(&self) {
         if self.state.load() != State::Idle {
             let buf = self.build_tcp_packet(tcp::TcpFlags::RST, None);
@@ -277,42 +288,15 @@ impl Socket {
                     let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
                     self.ack.store(new_ack, Ordering::Relaxed);
 
+                    let last = self.last_ack.load(Ordering::Relaxed);
+                    if new_ack.wrapping_sub(last) >= ACK_THRESHOLD {
+                        self.send_ack();
+                    }
+
                     for opt in tcp_packet.get_options_iter() {
                         if opt.get_number() == TcpOptionNumbers::SACK {
-                            // SACK 选项类型为 5
-                            let payload = opt.payload();
-                            for chunk in payload.chunks(8) {
-                                if chunk.len() != 8 {
-                                    continue;
-                                }
-                                let left = tcp_packet.get_acknowledgement();
-                                let right = u32::from_be_bytes(chunk[0..4].try_into().unwrap());
-                                let len = right.wrapping_sub(left);
-
-                                let sack_end = u32::from_be_bytes(chunk[4..8].try_into().unwrap());
-                                if len == 0 || sack_end <= left {
-                                    continue;
-                                }
-
-                                let send_len = std::cmp::min(len, 1400) as usize;
-                                let data = vec![0u8; send_len];
-
-                                let buf = build_tcp_packet(
-                                    self.local_mac,
-                                    self.remote_mac.load().unwrap_or(MacAddr::zero()),
-                                    self.local_addr,
-                                    self.remote_addr,
-                                    left,
-                                    self.ack.load(Ordering::Relaxed),
-                                    tcp::TcpFlags::ACK,
-                                    Some(&data),
-                                );
-
-                                if let Err(e) = self.tun.try_send(&buf) {
-                                    tracing::error!("Failed to send SACK response: {}", e);
-                                }
-                                break;
-                            }
+                            self.send_ack();
+                            break;
                         }
                     }
 
