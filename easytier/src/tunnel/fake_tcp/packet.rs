@@ -44,13 +44,17 @@ pub fn build_tcp_packet(
     ack: u32,
     flags: u8,
     payload: Option<&[u8]>,
+    timestamps: Option<(u32, u32)>,
 ) -> Bytes {
     let ip_header_len = match local_addr {
         SocketAddr::V4(_) => IPV4_HEADER_LEN,
         SocketAddr::V6(_) => IPV6_HEADER_LEN,
     };
-    let wscale = (flags & tcp::TcpFlags::SYN) != 0;
-    let tcp_header_len = TCP_HEADER_LEN + if wscale { 4 } else { 0 }; // nop + wscale
+    let is_syn = (flags & tcp::TcpFlags::SYN) != 0;
+    let has_ts = timestamps.is_some();
+    // Options: SYN adds NOP+WScale(4 bytes); Timestamp adds NOP+NOP+TS(12 bytes)
+    let options_len = if is_syn { 4 } else { 0 } + if has_ts { 12 } else { 0 };
+    let tcp_header_len = TCP_HEADER_LEN + options_len;
     let tcp_total_len = tcp_header_len + payload.map_or(0, |payload| payload.len());
     let total_len = ip_header_len + tcp_total_len;
     let mut buf = BytesMut::zeroed(ETH_HDR_LEN + total_len);
@@ -61,16 +65,38 @@ pub fn build_tcp_packet(
     assert_eq!(0, buf.len());
 
     let mut tcp = tcp::MutableTcpPacket::new(&mut tcp_buf).unwrap();
-    tcp.set_window(0xffff);
+    // Mild window randomization using low bits of seq to avoid fingerprinting
+    let window = 0xFFFF_u16.wrapping_sub((seq as u16) & 0xFF);
+    tcp.set_window(window);
     tcp.set_source(local_addr.port());
     tcp.set_destination(remote_addr.port());
     tcp.set_sequence(seq);
     tcp.set_acknowledgement(ack);
     tcp.set_flags(flags);
-    tcp.set_data_offset(TCP_HEADER_LEN as u8 / 4 + if wscale { 1 } else { 0 });
-    if wscale {
-        let wscale = tcp::TcpOption::wscale(14);
-        tcp.set_options(&[tcp::TcpOption::nop(), wscale]);
+    tcp.set_data_offset((tcp_header_len / 4) as u8);
+    match (is_syn, has_ts) {
+        (true, true) => {
+            let (tsval, tsecr) = timestamps.unwrap();
+            tcp.set_options(&[
+                tcp::TcpOption::nop(),
+                tcp::TcpOption::wscale(14),
+                tcp::TcpOption::nop(),
+                tcp::TcpOption::nop(),
+                tcp::TcpOption::timestamp(tsval, tsecr),
+            ]);
+        }
+        (true, false) => {
+            tcp.set_options(&[tcp::TcpOption::nop(), tcp::TcpOption::wscale(14)]);
+        }
+        (false, true) => {
+            let (tsval, tsecr) = timestamps.unwrap();
+            tcp.set_options(&[
+                tcp::TcpOption::nop(),
+                tcp::TcpOption::nop(),
+                tcp::TcpOption::timestamp(tsval, tsecr),
+            ]);
+        }
+        (false, false) => {}
     }
 
     if let Some(payload) = payload {
@@ -190,6 +216,7 @@ mod tests {
             20,
             tcp::TcpFlags::ACK,
             Some(payload),
+            None,
         );
 
         let (parsed_src_mac, parsed_dst_mac, ip_packet, tcp_packet) =
@@ -221,6 +248,7 @@ mod tests {
             40,
             tcp::TcpFlags::ACK,
             Some(payload),
+            None,
         );
 
         let ethernet = EthernetPacket::new(packet.as_ref()).unwrap();
@@ -255,6 +283,7 @@ mod tests {
             2,
             tcp::TcpFlags::ACK,
             None,
+            None,
         );
         let truncated = Bytes::copy_from_slice(&packet[..ETH_HDR_LEN + IPV4_HEADER_LEN + 10]);
 
@@ -271,6 +300,7 @@ mod tests {
             1,
             2,
             tcp::TcpFlags::ACK,
+            None,
             None,
         );
         let truncated = Bytes::copy_from_slice(&packet[..ETH_HDR_LEN + IPV6_HEADER_LEN - 1]);

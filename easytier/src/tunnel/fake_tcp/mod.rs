@@ -215,6 +215,10 @@ fn build_os_socket_reader_task(mut socket: TcpStream) -> AbortOnDropHandle<()> {
             )
         };
         if ret != 0 {
+            tracing::warn!(
+                errno = std::io::Error::last_os_error().raw_os_error(),
+                "faketcp: TCP_REPAIR setsockopt failed, kernel may send RST"
+            );
             let timeout_ms: libc::c_int = 0;
             unsafe {
                 libc::setsockopt(
@@ -225,6 +229,8 @@ fn build_os_socket_reader_task(mut socket: TcpStream) -> AbortOnDropHandle<()> {
                     std::mem::size_of_val(&timeout_ms) as libc::socklen_t,
                 );
             }
+        } else {
+            tracing::debug!("faketcp: TCP_REPAIR set successfully");
         }
     }
 
@@ -238,6 +244,87 @@ fn build_os_socket_reader_task(mut socket: TcpStream) -> AbortOnDropHandle<()> {
         }
         tracing::info!("FakeTcpTunnelListener os socket closed");
     }))
+}
+
+#[cfg(target_os = "linux")]
+fn get_tcp_seq_ack(socket: &TcpStream) -> (u32, u32) {
+    use nix::libc;
+    use std::os::unix::io::AsRawFd;
+
+    let fd = socket.as_raw_fd();
+
+    // Enter TCP_REPAIR mode to freeze the kernel TCP state machine
+    let repair: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            19, // TCP_REPAIR
+            &repair as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&repair) as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        tracing::warn!(
+            errno = std::io::Error::last_os_error().raw_os_error(),
+            "faketcp: TCP_REPAIR failed in get_tcp_seq_ack, using seq=0 ack=0"
+        );
+        return (0, 0);
+    }
+
+    // Get send seq: set queue to SEND (1), then read TCP_QUEUE_SEQ
+    let send_queue: libc::c_int = 1; // TCP_SEND_QUEUE
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            20, // TCP_REPAIR_QUEUE
+            &send_queue as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&send_queue) as libc::socklen_t,
+        );
+    }
+    let mut seq: u32 = 0;
+    let mut len = std::mem::size_of::<u32>() as libc::socklen_t;
+    unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            21, // TCP_QUEUE_SEQ
+            &mut seq as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+    }
+
+    // Get recv ack: set queue to RECV (0), then read TCP_QUEUE_SEQ
+    let recv_queue: libc::c_int = 0; // TCP_RECV_QUEUE
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            20, // TCP_REPAIR_QUEUE
+            &recv_queue as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&recv_queue) as libc::socklen_t,
+        );
+    }
+    let mut ack: u32 = 0;
+    len = std::mem::size_of::<u32>() as libc::socklen_t;
+    unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            21, // TCP_QUEUE_SEQ
+            &mut ack as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+    }
+
+    tracing::debug!(seq, ack, "faketcp: got TCP seq/ack via TCP_REPAIR");
+    (seq, ack)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_tcp_seq_ack(_socket: &TcpStream) -> (u32, u32) {
+    (0, 0)
 }
 
 #[derive(Debug)]
@@ -270,10 +357,13 @@ impl TunnelListener for FakeTcpTunnelListener {
         tracing::debug!("FakeTcpTunnelListener waiting for accept");
         let (res, stack, socket) = loop {
             let res = self.do_accept().await?;
+            let (seq, ack) = get_tcp_seq_ack(&res.socket);
             let stack = self.get_stack(&res).await?;
             let socket = stack.try_alloc_established_socket(
                 res.local_addr,
                 res.remote_addr,
+                seq,
+                ack,
                 stack::State::Established,
             );
             let Some(socket) = socket else {
@@ -408,12 +498,31 @@ impl TunnelConnector for FakeTcpTunnelConnector {
         let driver_type = stack.driver_type();
 
         let socket = stack
-            .try_alloc_established_socket(local_addr, remote_addr, stack::State::SynSent)
+            .try_alloc_established_socket(local_addr, remote_addr, 0, 0, stack::State::SynSent)
             .ok_or(TunnelError::InternalError(
                 "FakeTCP stack closed while allocating socket".into(),
             ))?;
 
         let os_stream = os_socket.connect(remote_addr).await?;
+
+        // Set TCP_REPAIR immediately after connect to prevent kernel from
+        // interfering with the connection before the userspace stack takes over
+        #[cfg(target_os = "linux")]
+        {
+            use nix::libc;
+            use std::os::unix::io::AsRawFd;
+            let fd = os_stream.as_raw_fd();
+            let repair: libc::c_int = 1;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    19, // TCP_REPAIR
+                    &repair as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&repair) as libc::socklen_t,
+                );
+            }
+        }
 
         tracing::info!(?remote_addr, "FakeTcpTunnelConnector connecting");
 

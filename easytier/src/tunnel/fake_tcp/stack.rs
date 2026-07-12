@@ -138,6 +138,10 @@ pub struct Socket {
     seq: AtomicU32,
     ack: AtomicU32,
     last_ack: AtomicU32,
+    remote_ack: AtomicU32,
+    remote_window: AtomicU32,
+    ts_base: std::time::Instant,
+    remote_tsval: AtomicU32,
     state: AtomicCell<State>,
 }
 
@@ -157,7 +161,8 @@ impl Socket {
         remote_addr: SocketAddr,
         local_mac: MacAddr,
         remote_mac: Option<MacAddr>,
-        ack: Option<u32>,
+        seq: u32,
+        ack: u32,
         state: State,
     ) -> (Socket, flume::Sender<Bytes>) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
@@ -171,9 +176,13 @@ impl Socket {
                 remote_addr,
                 local_mac,
                 remote_mac: AtomicCell::new(remote_mac),
-                seq: AtomicU32::new(0),
-                ack: AtomicU32::new(ack.unwrap_or(0)),
-                last_ack: AtomicU32::new(ack.unwrap_or(0)),
+                seq: AtomicU32::new(seq),
+                ack: AtomicU32::new(ack),
+                last_ack: AtomicU32::new(ack),
+                remote_ack: AtomicU32::new(seq),
+                remote_window: AtomicU32::new(0xFFFF << 14),
+                ts_base: std::time::Instant::now(),
+                remote_tsval: AtomicU32::new(0),
                 state: AtomicCell::new(state),
             },
             incoming_tx,
@@ -181,18 +190,26 @@ impl Socket {
     }
 
     fn build_tcp_packet(&self, flags: u8, payload: Option<&[u8]>) -> Bytes {
+        self.build_tcp_packet_with_seq(flags, payload, self.seq.load(Ordering::Relaxed))
+    }
+
+    fn build_tcp_packet_with_seq(&self, flags: u8, payload: Option<&[u8]>, seq: u32) -> Bytes {
         let ack = self.ack.load(Ordering::Relaxed);
         self.last_ack.store(ack, Ordering::Relaxed);
+
+        let tsval = self.ts_base.elapsed().as_millis() as u32;
+        let tsecr = self.remote_tsval.load(Ordering::Relaxed);
 
         build_tcp_packet(
             self.local_mac,
             self.remote_mac.load().unwrap_or(MacAddr::zero()),
             self.local_addr,
             self.remote_addr,
-            self.seq.load(Ordering::Relaxed),
+            seq,
             ack,
             flags,
             payload,
+            Some((tsval, tsecr)),
         )
     }
 
@@ -206,8 +223,24 @@ impl Socket {
     pub fn try_send(&self, payload: &[u8]) -> Option<()> {
         match self.state.load() {
             State::Established => {
-                let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, Some(payload));
-                self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
+                let remote_ack = self.remote_ack.load(Ordering::Relaxed);
+                let window = self.remote_window.load(Ordering::Relaxed);
+                let current_seq = self.seq.load(Ordering::Relaxed);
+
+                let unacked = current_seq.wrapping_sub(remote_ack);
+                let send_seq = if unacked.wrapping_add(payload.len() as u32) > window {
+                    remote_ack
+                } else {
+                    current_seq
+                };
+
+                let buf = self.build_tcp_packet_with_seq(
+                    tcp::TcpFlags::ACK,
+                    Some(payload),
+                    send_seq,
+                );
+                self.seq
+                    .store(send_seq.wrapping_add(payload.len() as u32), Ordering::Relaxed);
                 self.tun.try_send(&buf).ok().and(Some(()))
             }
             _ => unreachable!(),
@@ -276,11 +309,35 @@ impl Socket {
                         return None;
                     }
 
-                    if (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0
-                        && tcp_packet.payload().is_empty()
-                    {
-                        self.seq
-                            .store(tcp_packet.get_acknowledgement(), Ordering::Relaxed);
+                    // Update remote_ack (monotonically advancing) and remote state
+                    if (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0 {
+                        let received_ack = tcp_packet.get_acknowledgement();
+                        let _ = self.remote_ack.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |current| {
+                                let diff = received_ack.wrapping_sub(current);
+                                if diff > 0 && diff < MAX_UNACKED_LEN {
+                                    Some(received_ack)
+                                } else {
+                                    None
+                                }
+                            },
+                        );
+
+                        let raw_window = tcp_packet.get_window() as u32;
+                        self.remote_window.store(raw_window << 14, Ordering::Relaxed);
+
+                        for opt in tcp_packet.get_options_iter() {
+                            if opt.get_number() == TcpOptionNumbers::TIMESTAMPS
+                                && opt.payload().len() >= 4
+                            {
+                                let tsval =
+                                    u32::from_be_bytes(opt.payload()[0..4].try_into().unwrap());
+                                self.remote_tsval.store(tsval, Ordering::Relaxed);
+                                break;
+                            }
+                        }
                     }
 
                     let payload = tcp_packet.payload();
@@ -328,10 +385,13 @@ impl Socket {
                     let expected_flag = tcp::TcpFlags::SYN | tcp::TcpFlags::ACK;
                     if (tcp_packet.get_flags() & expected_flag) == expected_flag {
                         // found our SYN + ACK
-                        self.seq
-                            .store(tcp_packet.get_acknowledgement(), Ordering::Relaxed);
+                        let initial_seq = tcp_packet.get_acknowledgement();
+                        self.seq.store(initial_seq, Ordering::Relaxed);
+                        self.remote_ack.store(initial_seq, Ordering::Relaxed);
                         self.ack
                             .store(tcp_packet.get_sequence() + 1, Ordering::Relaxed);
+                        let raw_window = tcp_packet.get_window() as u32;
+                        self.remote_window.store(raw_window << 14, Ordering::Relaxed);
                         self.remote_mac.store(Some(src_mac));
                         self.state.store(State::Established);
                         return Some(0);
@@ -379,6 +439,7 @@ impl Drop for Socket {
             self.seq.load(Ordering::Relaxed),
             0,
             tcp::TcpFlags::RST,
+            None,
             None,
         );
         if let Err(e) = self.tun.try_send(&buf) {
@@ -453,6 +514,8 @@ impl Stack {
         &self,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
+        initial_seq: u32,
+        initial_ack: u32,
         state: State,
     ) -> Option<Socket> {
         let tuple = AddrTuple::new(local_addr, remote_addr);
@@ -467,13 +530,13 @@ impl Stack {
         }
         let (sock, incoming) = Socket::new(
             self.shared.clone(),
-            // self.shared.tun.choose(&mut rng).unwrap().clone(),
-            self.shared.tun.clone(), // Simplification: just use the first tun
+            self.shared.tun.clone(),
             local_addr,
             remote_addr,
             self.local_mac,
             None,
-            Some(0), // Initial ACK
+            initial_seq,
+            initial_ack,
             state,
         );
         assert!(stack_state.tuples.insert(tuple, incoming).is_none());
@@ -649,6 +712,8 @@ mod tests {
             .try_alloc_established_socket(
                 SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 10_000),
                 SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 20_000),
+                0,
+                0,
                 State::Established,
             )
             .expect("socket allocation should succeed before tun failure");
@@ -670,6 +735,8 @@ mod tests {
         let new_socket = stack.try_alloc_established_socket(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 10_001),
             SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 20_001),
+            0,
+            0,
             State::Established,
         );
         assert!(new_socket.is_none());
