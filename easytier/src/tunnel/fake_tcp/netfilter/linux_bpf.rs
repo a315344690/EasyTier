@@ -490,7 +490,7 @@ impl LinuxBpfTun {
                         read_fd,
                         msgvec.as_mut_ptr(),
                         RECV_BATCH_SIZE as u32,
-                        libc::MSG_WAITFORONE,
+                        libc::MSG_WAITFORONE as u32,
                         std::ptr::null_mut(),
                     )
                 };
