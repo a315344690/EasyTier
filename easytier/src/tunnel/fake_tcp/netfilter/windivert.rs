@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::sync::Mutex;
 use windivert::error::WinDivertError;
 use windivert::packet::WinDivertPacket;
@@ -181,13 +181,10 @@ fn build_filter(src_addr: Option<SocketAddr>, dst_addr: SocketAddr) -> io::Resul
 
 #[async_trait::async_trait]
 impl stack::Tun for WinDivertTun {
-    async fn recv(&self, packet: &mut BytesMut) -> Result<usize, std::io::Error> {
+    async fn recv(&self) -> Result<Bytes, std::io::Error> {
         let mut rx = self.recv_queue.lock().await;
         match rx.recv().await {
-            Some(data) => {
-                packet.extend_from_slice(&data);
-                Ok(data.len())
-            }
+            Some(data) => Ok(Bytes::from(data)),
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "Channel closed",

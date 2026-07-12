@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use pnet::{
@@ -268,14 +268,10 @@ impl Drop for PnetTun {
 
 #[async_trait::async_trait]
 impl stack::Tun for PnetTun {
-    async fn recv(&self, packet: &mut BytesMut) -> Result<usize, std::io::Error> {
+    async fn recv(&self) -> Result<Bytes, std::io::Error> {
         let mut rx = self.recv_queue.lock().await;
         match rx.recv().await {
-            Some(data) => {
-                tracing::trace!(?data, "PnetTun received packet");
-                packet.extend_from_slice(&data);
-                Ok(data.len())
-            }
+            Some(data) => Ok(Bytes::from(data)),
             None => {
                 tracing::warn!("PnetTun recv channel closed");
                 Err(std::io::Error::new(

@@ -41,8 +41,9 @@
 use super::packet::*;
 use bytes::{Bytes, BytesMut};
 use crossbeam::atomic::AtomicCell;
+use pnet::packet::Packet as _;
 use pnet::packet::tcp::TcpOptionNumbers;
-use pnet::packet::{Packet, tcp};
+use pnet::packet::tcp;
 use pnet::util::MacAddr;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -58,14 +59,34 @@ use tracing::{error, info, trace, warn};
 
 const TIMEOUT: time::Duration = time::Duration::from_secs(1);
 const RETRIES: usize = 6;
-const MPMC_BUFFER_LEN: usize = 512;
+const MPMC_BUFFER_LEN: usize = 4096;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
 const ACK_THRESHOLD: u32 = 65536; // 64KB: send immediate standalone ACK after this much unacked data
 
+pub(crate) struct ParsedPacketMeta {
+    pub src_mac: MacAddr,
+    pub flags: u8,
+    pub seq: u32,
+    pub ack: u32,
+    pub window: u16,
+    pub payload_offset: usize,
+    pub payload_len: usize,
+    pub tsval: Option<u32>,
+    pub has_sack: bool,
+}
+
 #[async_trait::async_trait]
 pub trait Tun: Send + Sync + 'static {
-    async fn recv(&self, packet: &mut BytesMut) -> Result<usize, std::io::Error>;
+    async fn recv(&self) -> Result<Bytes, std::io::Error>;
     fn try_send(&self, packet: &Bytes) -> Result<(), std::io::Error>;
+    fn try_send_batch(&self, packets: &[Bytes]) -> Result<usize, std::io::Error> {
+        let mut sent = 0;
+        for p in packets {
+            self.try_send(p)?;
+            sent += 1;
+        }
+        Ok(sent)
+    }
     fn driver_type(&self) -> &'static str;
 }
 
@@ -84,9 +105,11 @@ impl AddrTuple {
     }
 }
 
+type DispatchItem = (Bytes, ParsedPacketMeta);
+
 #[derive(Default)]
 struct StackState {
-    tuples: HashMap<AddrTuple, flume::Sender<Bytes>>,
+    tuples: HashMap<AddrTuple, flume::Sender<DispatchItem>>,
     closed: bool,
 }
 
@@ -130,7 +153,7 @@ pub enum State {
 pub struct Socket {
     shared: Arc<Shared>,
     tun: Arc<dyn Tun>,
-    incoming: flume::Receiver<Bytes>,
+    incoming: flume::Receiver<DispatchItem>,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     local_mac: MacAddr,
@@ -164,7 +187,7 @@ impl Socket {
         seq: u32,
         ack: u32,
         state: State,
-    ) -> (Socket, flume::Sender<Bytes>) {
+    ) -> (Socket, flume::Sender<DispatchItem>) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
 
         (
@@ -223,28 +246,54 @@ impl Socket {
     pub fn try_send(&self, payload: &[u8]) -> Option<()> {
         match self.state.load() {
             State::Established => {
-                let remote_ack = self.remote_ack.load(Ordering::Relaxed);
-                let window = self.remote_window.load(Ordering::Relaxed);
                 let current_seq = self.seq.load(Ordering::Relaxed);
-
+                let remote_ack = self.remote_ack.load(Ordering::Relaxed);
                 let unacked = current_seq.wrapping_sub(remote_ack);
-                let send_seq = if unacked.wrapping_add(payload.len() as u32) > window {
-                    remote_ack
-                } else {
-                    current_seq
-                };
+
+                if unacked > MAX_UNACKED_LEN {
+                    tracing::trace!("unacked {} exceeds limit, dropping send", unacked);
+                    return Some(());
+                }
 
                 let buf = self.build_tcp_packet_with_seq(
                     tcp::TcpFlags::ACK,
                     Some(payload),
-                    send_seq,
+                    current_seq,
                 );
                 self.seq
-                    .store(send_seq.wrapping_add(payload.len() as u32), Ordering::Relaxed);
+                    .store(current_seq.wrapping_add(payload.len() as u32), Ordering::Relaxed);
                 self.tun.try_send(&buf).ok().and(Some(()))
             }
             _ => unreachable!(),
         }
+    }
+
+    pub fn build_packet(&self, payload: &[u8]) -> Option<Bytes> {
+        match self.state.load() {
+            State::Established => {
+                let current_seq = self.seq.load(Ordering::Relaxed);
+                let remote_ack = self.remote_ack.load(Ordering::Relaxed);
+                let unacked = current_seq.wrapping_sub(remote_ack);
+
+                if unacked > MAX_UNACKED_LEN {
+                    return None;
+                }
+
+                let buf = self.build_tcp_packet_with_seq(
+                    tcp::TcpFlags::ACK,
+                    Some(payload),
+                    current_seq,
+                );
+                self.seq
+                    .store(current_seq.wrapping_add(payload.len() as u32), Ordering::Relaxed);
+                Some(buf)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn flush_batch(&self, packets: &[Bytes]) -> usize {
+        self.tun.try_send_batch(packets).unwrap_or(0)
     }
 
     pub fn send_ack(&self) {
@@ -281,68 +330,40 @@ impl Socket {
         loop {
             match self.state.load() {
                 State::Established => {
-                    let Ok(raw_buf) = self.incoming.recv_async().await else {
+                    let Ok((frame, meta)) = self.incoming.recv_async().await else {
                         info!("Connection {} recv error", self);
                         return None;
                     };
 
-                    let Some((src_mac, dst_mac, _v4_packet, tcp_packet)) =
-                        parse_ip_packet(&raw_buf)
-                    else {
-                        trace!("Dropping malformed fake tcp packet for established socket");
-                        continue;
-                    };
+                    self.remote_mac.store(Some(meta.src_mac));
 
-                    tracing::trace!(
-                        "Socket received TCP packet from {}({:?}) to {}({:?}): {:?}",
-                        self.remote_addr,
-                        src_mac,
-                        self.local_addr,
-                        dst_mac,
-                        tcp_packet
-                    );
-
-                    self.remote_mac.store(Some(src_mac));
-
-                    if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
+                    if (meta.flags & tcp::TcpFlags::RST) != 0 {
                         info!("Connection {} reset by peer", self);
                         return None;
                     }
 
-                    // Update remote_ack (monotonically advancing) and remote state
-                    if (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0 {
-                        let received_ack = tcp_packet.get_acknowledgement();
+                    if (meta.flags & tcp::TcpFlags::ACK) != 0 {
                         let _ = self.remote_ack.fetch_update(
                             Ordering::Relaxed,
                             Ordering::Relaxed,
                             |current| {
-                                let diff = received_ack.wrapping_sub(current);
+                                let diff = meta.ack.wrapping_sub(current);
                                 if diff > 0 && diff < MAX_UNACKED_LEN {
-                                    Some(received_ack)
+                                    Some(meta.ack)
                                 } else {
                                     None
                                 }
                             },
                         );
 
-                        let raw_window = tcp_packet.get_window() as u32;
-                        self.remote_window.store(raw_window << 14, Ordering::Relaxed);
+                        self.remote_window.store((meta.window as u32) << 14, Ordering::Relaxed);
 
-                        for opt in tcp_packet.get_options_iter() {
-                            if opt.get_number() == TcpOptionNumbers::TIMESTAMPS
-                                && opt.payload().len() >= 4
-                            {
-                                let tsval =
-                                    u32::from_be_bytes(opt.payload()[0..4].try_into().unwrap());
-                                self.remote_tsval.store(tsval, Ordering::Relaxed);
-                                break;
-                            }
+                        if let Some(tsval) = meta.tsval {
+                            self.remote_tsval.store(tsval, Ordering::Relaxed);
                         }
                     }
 
-                    let payload = tcp_packet.payload();
-
-                    let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
+                    let new_ack = meta.seq.wrapping_add(meta.payload_len as u32);
                     self.ack.store(new_ack, Ordering::Relaxed);
 
                     let last = self.last_ack.load(Ordering::Relaxed);
@@ -350,49 +371,38 @@ impl Socket {
                         self.send_ack();
                     }
 
-                    for opt in tcp_packet.get_options_iter() {
-                        if opt.get_number() == TcpOptionNumbers::SACK {
-                            self.send_ack();
-                            break;
-                        }
+                    if meta.has_sack {
+                        self.send_ack();
                     }
 
-                    if payload.is_empty() {
+                    if meta.payload_len == 0 {
                         continue;
                     }
 
-                    buf.extend_from_slice(payload);
+                    buf.extend_from_slice(&frame[meta.payload_offset..meta.payload_offset + meta.payload_len]);
 
-                    return Some(payload.len());
+                    return Some(meta.payload_len);
                 }
                 State::SynSent => {
-                    let Ok(Ok(buf)) = time::timeout(TIMEOUT, self.incoming.recv_async()).await
+                    let Ok(Ok((_frame, meta))) = time::timeout(TIMEOUT, self.incoming.recv_async()).await
                     else {
                         info!("Waiting for client SYN + ACK timed out");
                         return None;
                     };
-                    let Some((src_mac, _dst_mac, _v4_packet, tcp_packet)) = parse_ip_packet(&buf)
-                    else {
-                        trace!("Dropping malformed fake tcp packet during handshake");
-                        continue;
-                    };
 
-                    if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
+                    if (meta.flags & tcp::TcpFlags::RST) != 0 {
                         tracing::trace!("Connection {} reset by peer", self);
                         return None;
                     }
 
                     let expected_flag = tcp::TcpFlags::SYN | tcp::TcpFlags::ACK;
-                    if (tcp_packet.get_flags() & expected_flag) == expected_flag {
-                        // found our SYN + ACK
-                        let initial_seq = tcp_packet.get_acknowledgement();
+                    if (meta.flags & expected_flag) == expected_flag {
+                        let initial_seq = meta.ack;
                         self.seq.store(initial_seq, Ordering::Relaxed);
                         self.remote_ack.store(initial_seq, Ordering::Relaxed);
-                        self.ack
-                            .store(tcp_packet.get_sequence() + 1, Ordering::Relaxed);
-                        let raw_window = tcp_packet.get_window() as u32;
-                        self.remote_window.store(raw_window << 14, Ordering::Relaxed);
-                        self.remote_mac.store(Some(src_mac));
+                        self.ack.store(meta.seq + 1, Ordering::Relaxed);
+                        self.remote_window.store((meta.window as u32) << 14, Ordering::Relaxed);
+                        self.remote_mac.store(Some(meta.src_mac));
                         self.state.store(State::Established);
                         return Some(0);
                     }
@@ -548,15 +558,13 @@ impl Stack {
         shared: Arc<Shared>,
         mut tuples_purge: broadcast::Receiver<AddrTuple>,
     ) {
-        let mut tuples: HashMap<AddrTuple, flume::Sender<Bytes>> = HashMap::new();
+        let mut tuples: HashMap<AddrTuple, flume::Sender<DispatchItem>> = HashMap::new();
 
         loop {
-            let mut buf = BytesMut::new();
-
             tokio::select! {
-                size = tun.recv(&mut buf) => {
-                    let size = match size {
-                        Ok(size) => size,
+                result = tun.recv() => {
+                    let buf = match result {
+                        Ok(buf) => buf,
                         Err(e) => {
                             let shared_tuple_count = shared.mark_closed_and_clear_tuples();
                             let cached_tuple_count = tuples.len();
@@ -571,11 +579,10 @@ impl Stack {
                             break;
                         }
                     };
-                    tracing::trace!(len = size, ?buf, "PnetTun received packet");
-                    let buf = buf.split().freeze();
+                    tracing::trace!(len = buf.len(), "received packet");
 
                     match parse_ip_packet(&buf) {
-                        Some((_src_mac, _dst_mac, ip_packet, tcp_packet)) => {
+                        Some((src_mac, _dst_mac, ip_packet, tcp_packet)) => {
                             let local_addr = SocketAddr::new(
                                 ip_packet.get_destination(),
                                 tcp_packet.get_destination(),
@@ -585,16 +592,55 @@ impl Stack {
                                 tcp_packet.get_source(),
                             );
 
+                            let flags = tcp_packet.get_flags();
+                            let payload = tcp_packet.payload();
+                            let payload_offset = if payload.is_empty() {
+                                0
+                            } else {
+                                let offset = payload.as_ptr() as usize - buf.as_ptr() as usize;
+                                if offset + payload.len() > buf.len() {
+                                    trace!("Dropping packet with invalid payload offset");
+                                    continue;
+                                }
+                                offset
+                            };
+
+                            let mut tsval = None;
+                            let mut has_sack = false;
+                            for opt in tcp_packet.get_options_iter() {
+                                match opt.get_number() {
+                                    TcpOptionNumbers::TIMESTAMPS if opt.payload().len() >= 4 => {
+                                        tsval = Some(u32::from_be_bytes(
+                                            opt.payload()[0..4].try_into().unwrap(),
+                                        ));
+                                    }
+                                    TcpOptionNumbers::SACK => {
+                                        has_sack = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            let meta = ParsedPacketMeta {
+                                src_mac,
+                                flags,
+                                seq: tcp_packet.get_sequence(),
+                                ack: tcp_packet.get_acknowledgement(),
+                                window: tcp_packet.get_window(),
+                                payload_offset,
+                                payload_len: payload.len(),
+                                tsval,
+                                has_sack,
+                            };
+
                             let tuple = AddrTuple::new(local_addr, remote_addr);
+                            let item: DispatchItem = (buf, meta);
                             if let Some(c) = tuples.get(&tuple) {
-                                if c.send_async(buf).await.is_err() {
-                                    trace!("Cache hit, but receiver already closed, dropping packet");
+                                if c.try_send(item).is_err() {
+                                    tracing::warn!("fake_tcp dispatch channel full, dropping packet for {:?}", tuple);
                                 }
 
                                 continue;
-
-                                // If not Ok, receiver has been closed and just fall through to the slow
-                                // path below
                             } else {
                                 trace!("Cache miss, checking the shared tuples table for connection");
                                 let sender = {
@@ -604,24 +650,25 @@ impl Stack {
 
                                 if let Some(c) = sender {
                                     trace!("Storing connection information into local tuples");
+                                    let send_result = c.try_send(item);
                                     tuples.insert(tuple, c.clone());
-                                    if let Err(e) = c.send_async(buf).await {
-                                        trace!("Error sending packet to connection: {:?}", e);
+                                    if send_result.is_err() {
+                                        tracing::warn!("fake_tcp dispatch channel full, dropping packet");
                                     }
                                     continue;
                                 }
                             }
 
-                            if tcp_packet.get_flags() == tcp::TcpFlags::SYN
+                            if flags == tcp::TcpFlags::SYN
                                 && shared
                                     .listening
                                     .read()
                                     .unwrap()
-                                    .contains(&tcp_packet.get_destination())
+                                    .contains(&local_addr.port())
                             {
-                                trace!(?tcp_packet, "Received SYN packet for port {}, ignoring", tcp_packet.get_destination());
+                                trace!("Received SYN packet for port {}, ignoring", local_addr.port());
                                 continue;
-                            } else if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
+                            } else if (flags & tcp::TcpFlags::RST) != 0 {
                                 info!("Unknown RST TCP packet from {}, ignoring", remote_addr);
                                 continue;
                             } else {
@@ -690,7 +737,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tun for FailingTun {
-        async fn recv(&self, _packet: &mut BytesMut) -> Result<usize, io::Error> {
+        async fn recv(&self) -> Result<Bytes, io::Error> {
             self.fail.notified().await;
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "test tun closed"))
         }

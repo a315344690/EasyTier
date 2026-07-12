@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use bytes::BytesMut;
 use nix::libc;
 use std::ffi::CString;
 use std::io;
@@ -451,27 +450,52 @@ impl LinuxBpfTun {
         };
 
         let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
         let stop_clone = stop.clone();
         let read_fd = fd.as_ref().as_raw_fd();
         let fd_guard = fd.clone();
         let interface_name_for_worker = interface_name.to_string();
 
+        const RECV_BATCH_SIZE: usize = 64;
+        const RECV_BUF_SIZE: usize = 2048;
+
         let worker = std::thread::spawn(move || {
-            // Keep the packet socket alive until the detached worker actually exits.
             let _fd_guard = fd_guard;
-            let mut buf = vec![0u8; 65536];
+            let mut bufs: Vec<Vec<u8>> = (0..RECV_BATCH_SIZE)
+                .map(|_| vec![0u8; RECV_BUF_SIZE])
+                .collect();
+            let mut iovecs: Vec<libc::iovec> = vec![unsafe { mem::zeroed() }; RECV_BATCH_SIZE];
+            let mut msgvec: Vec<libc::mmsghdr> = vec![unsafe { mem::zeroed() }; RECV_BATCH_SIZE];
+
             let mut stats_enabled = true;
             let mut total_packets: u64 = 0;
             let mut total_drops: u64 = 0;
             let mut total_bytes: u64 = 0;
             let mut dropped_by_queue_full: u64 = 0;
             let mut last_stats_log = Instant::now();
+
             while !stop_clone.load(AtomicOrdering::Relaxed) {
-                let n = unsafe {
-                    libc::recv(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+                for i in 0..RECV_BATCH_SIZE {
+                    iovecs[i] = libc::iovec {
+                        iov_base: bufs[i].as_mut_ptr() as *mut libc::c_void,
+                        iov_len: RECV_BUF_SIZE,
+                    };
+                    msgvec[i] = unsafe { mem::zeroed() };
+                    msgvec[i].msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+                    msgvec[i].msg_hdr.msg_iovlen = 1;
+                }
+
+                let ret = unsafe {
+                    libc::recvmmsg(
+                        read_fd,
+                        msgvec.as_mut_ptr(),
+                        RECV_BATCH_SIZE as u32,
+                        libc::MSG_WAITFORONE,
+                        std::ptr::null_mut(),
+                    )
                 };
-                if n < 0 {
+
+                if ret < 0 {
                     let err = io::Error::last_os_error();
                     if matches!(
                         err.kind(),
@@ -481,17 +505,25 @@ impl LinuxBpfTun {
                     }
                     break;
                 }
-                if n == 0 {
+                if ret == 0 {
                     continue;
                 }
-                let data = buf[..(n as usize)].to_vec();
-                total_bytes = total_bytes.wrapping_add(n as u64);
-                match tx.try_send(data) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        dropped_by_queue_full = dropped_by_queue_full.wrapping_add(1);
+
+                let count = ret as usize;
+                for i in 0..count {
+                    let len = msgvec[i].msg_len as usize;
+                    if len == 0 {
+                        continue;
                     }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    let data = bufs[i][..len].to_vec();
+                    total_bytes = total_bytes.wrapping_add(len as u64);
+                    match tx.try_send(data) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            dropped_by_queue_full = dropped_by_queue_full.wrapping_add(1);
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                    }
                 }
 
                 if last_stats_log.elapsed() >= Duration::from_secs(1) {
@@ -576,13 +608,10 @@ impl Drop for LinuxBpfTun {
 
 #[async_trait::async_trait]
 impl stack::Tun for LinuxBpfTun {
-    async fn recv(&self, packet: &mut BytesMut) -> Result<usize, std::io::Error> {
+    async fn recv(&self) -> Result<Bytes, std::io::Error> {
         let mut rx = self.recv_queue.lock().await;
         match rx.recv().await {
-            Some(data) => {
-                packet.extend_from_slice(&data);
-                Ok(data.len())
-            }
+            Some(data) => Ok(Bytes::from(data)),
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "LinuxBpfTun channel closed",
@@ -619,6 +648,60 @@ impl stack::Tun for LinuxBpfTun {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    fn try_send_batch(&self, packets: &[Bytes]) -> Result<usize, std::io::Error> {
+        if packets.is_empty() {
+            return Ok(0);
+        }
+        if packets.len() == 1 {
+            return self.try_send(&packets[0]).map(|_| 1);
+        }
+
+        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(packets.len());
+        let mut addrs: Vec<libc::sockaddr_ll> = Vec::with_capacity(packets.len());
+        let mut msgvec: Vec<libc::mmsghdr> = Vec::with_capacity(packets.len());
+
+        for pkt in packets {
+            if pkt.len() < 6 {
+                continue;
+            }
+
+            let mut addr: libc::sockaddr_ll = unsafe { mem::zeroed() };
+            addr.sll_family = libc::AF_PACKET as u16;
+            addr.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+            addr.sll_ifindex = self.ifindex;
+            addr.sll_halen = 6;
+            addr.sll_addr[..6].copy_from_slice(&pkt[..6]);
+            addrs.push(addr);
+
+            iovecs.push(libc::iovec {
+                iov_base: pkt.as_ptr() as *mut libc::c_void,
+                iov_len: pkt.len(),
+            });
+        }
+
+        for i in 0..iovecs.len() {
+            let mut msghdr: libc::mmsghdr = unsafe { mem::zeroed() };
+            msghdr.msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+            msghdr.msg_hdr.msg_iovlen = 1;
+            msghdr.msg_hdr.msg_name = &mut addrs[i] as *mut _ as *mut libc::c_void;
+            msghdr.msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_ll>() as u32;
+            msgvec.push(msghdr);
+        }
+
+        let ret = unsafe {
+            libc::sendmmsg(
+                self.fd.as_ref().as_raw_fd(),
+                msgvec.as_mut_ptr(),
+                msgvec.len() as u32,
+                0,
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(ret as usize)
     }
 
     fn driver_type(&self) -> &'static str {
@@ -747,16 +830,15 @@ mod tests {
 
         send_raw_frame(&ifname, &frame).unwrap();
 
-        let mut received = BytesMut::new();
-        let n = timeout(Duration::from_secs(2), tun.recv(&mut received))
+        let received = timeout(Duration::from_secs(2), tun.recv())
             .await
             .unwrap()
             .unwrap();
         eprintln!(
             "linux_bpf_tun_receives_matching_ipv4_frame: received {} bytes",
-            n
+            received.len()
         );
-        assert_eq!(n, frame.len());
+        assert_eq!(received.len(), frame.len());
         assert_eq!(&received[..], &frame[..]);
     }
 
@@ -799,8 +881,7 @@ mod tests {
         );
         send_raw_frame(&ifname, &non_matching).unwrap();
 
-        let mut received = BytesMut::new();
-        let non_matching_timeout = timeout(Duration::from_millis(400), tun.recv(&mut received))
+        let non_matching_timeout = timeout(Duration::from_millis(400), tun.recv())
             .await
             .is_err();
         eprintln!(
@@ -824,16 +905,15 @@ mod tests {
         );
         send_raw_frame(&ifname, &matching).unwrap();
 
-        let mut received2 = BytesMut::new();
-        let n = timeout(Duration::from_secs(2), tun.recv(&mut received2))
+        let received2 = timeout(Duration::from_secs(2), tun.recv())
             .await
             .unwrap()
             .unwrap();
         eprintln!(
             "linux_bpf_tun_filters_out_non_matching_ipv4_frame: received {} bytes",
-            n
+            received2.len()
         );
-        assert_eq!(n, matching.len());
+        assert_eq!(received2.len(), matching.len());
         assert_eq!(&received2[..], &matching[..]);
     }
 }

@@ -692,6 +692,11 @@ pub struct Instance {
     #[cfg(target_os = "linux")]
     default_route_mgr: Option<super::default_route::DefaultRouteManager>,
 
+    #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+    default_route_mgr: Option<Arc<tokio::sync::Mutex<super::default_route_macos::DefaultRouteManager>>>,
+    #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+    default_route_task: Option<AbortOnDropHandle<()>>,
+
     global_ctx: ArcGlobalCtx,
 }
 
@@ -782,6 +787,11 @@ impl Instance {
 
             #[cfg(target_os = "linux")]
             default_route_mgr: None,
+
+            #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+            default_route_mgr: None,
+            #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+            default_route_task: None,
 
             global_ctx,
         }
@@ -1114,6 +1124,63 @@ impl Instance {
                     tracing::error!(?e, "failed to activate default route");
                 } else {
                     self.default_route_mgr = Some(mgr);
+                }
+            }
+        }
+
+        #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+        if self.global_ctx.config.get_flags().default_route {
+            if let Some(tun_name) = self.global_ctx.get_tun_device_name() {
+                let mut mgr = super::default_route_macos::DefaultRouteManager::new(tun_name);
+
+                // Collect initial peer IPs from config to install host routes
+                // BEFORE /1 routes, preventing any routing loop window.
+                let initial_peer_ips: Vec<_> = self
+                    .global_ctx
+                    .config
+                    .get_peers()
+                    .iter()
+                    .filter_map(|p| super::default_route_macos::extract_ipv4_from_url(&p.uri))
+                    .collect();
+
+                if let Err(e) = mgr.activate(initial_peer_ips).await {
+                    tracing::error!(?e, "failed to activate default route");
+                } else {
+                    let mgr = Arc::new(tokio::sync::Mutex::new(mgr));
+                    self.default_route_mgr = Some(mgr.clone());
+
+                    // Spawn background task to handle dynamic peer route updates.
+                    // Handles peers discovered at runtime (direct connections,
+                    // relay-resolved addresses, domain-name peers after DNS resolution).
+                    let mut receiver = self.global_ctx.subscribe();
+                    let task = tokio::spawn(async move {
+                        loop {
+                            match receiver.recv().await {
+                                Ok(GlobalCtxEvent::PeerConnAdded(info)) => {
+                                    if let Some(addr) = info.tunnel.as_ref()
+                                        .and_then(|t| t.effective_remote_addr())
+                                        .and_then(|u| super::default_route_macos::extract_ipv4_from_url_str(&u.url))
+                                    {
+                                        let _ = mgr.lock().await.add_peer_route(addr).await;
+                                    }
+                                }
+                                Ok(GlobalCtxEvent::PeerConnRemoved(info)) => {
+                                    if let Some(addr) = info.tunnel.as_ref()
+                                        .and_then(|t| t.effective_remote_addr())
+                                        .and_then(|u| super::default_route_macos::extract_ipv4_from_url_str(&u.url))
+                                    {
+                                        let _ = mgr.lock().await.remove_peer_route(addr).await;
+                                    }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    receiver = receiver.resubscribe();
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+                    self.default_route_task = Some(AbortOnDropHandle::new(task));
                 }
             }
         }
@@ -1677,6 +1744,16 @@ impl Instance {
         if let Some(mut mgr) = self.default_route_mgr.take() {
             if let Err(e) = mgr.deactivate().await {
                 tracing::error!(?e, "failed to deactivate default route during cleanup");
+            }
+        }
+
+        #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+        {
+            self.default_route_task.take();
+            if let Some(mgr) = self.default_route_mgr.take() {
+                if let Err(e) = mgr.lock().await.deactivate().await {
+                    tracing::error!(?e, "failed to deactivate default route during cleanup");
+                }
             }
         }
         self.public_ipv6_provider_task.shutdown().await;

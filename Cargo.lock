@@ -2423,6 +2423,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "service-manager",
+ "sha1",
  "sha2",
  "shellexpand",
  "smoltcp",

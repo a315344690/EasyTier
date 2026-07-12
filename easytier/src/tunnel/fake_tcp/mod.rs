@@ -2,7 +2,7 @@ mod netfilter;
 mod packet;
 mod stack;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::{Sink, Stream};
 use network_interface::NetworkInterfaceConfig;
 use pnet::util::MacAddr;
@@ -676,13 +676,27 @@ impl Stream for FakeTcpStream {
     }
 }
 
+const FAKE_TCP_SINK_BATCH_SIZE: usize = 64;
+
 struct FakeTcpSink {
     socket: Arc<stack::Socket>,
+    pending: Vec<Bytes>,
 }
 
 impl FakeTcpSink {
     fn new(socket: Arc<stack::Socket>) -> Self {
-        Self { socket }
+        Self {
+            socket,
+            pending: Vec::with_capacity(FAKE_TCP_SINK_BATCH_SIZE),
+        }
+    }
+
+    fn do_flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.socket.flush_batch(&self.pending);
+        self.pending.clear();
     }
 }
 
@@ -690,34 +704,41 @@ impl Sink<SinkItem> for FakeTcpSink {
     type Error = SinkError;
 
     fn poll_ready(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         _cx: &mut TaskContext<'_>,
     ) -> Poll<Result<(), Self::Error>> {
+        if self.pending.len() >= FAKE_TCP_SINK_BATCH_SIZE {
+            self.do_flush();
+        }
         Poll::Ready(Ok(()))
     }
 
-    fn start_send(self: Pin<&mut Self>, item: SinkItem) -> Result<(), Self::Error> {
+    fn start_send(mut self: Pin<&mut Self>, item: SinkItem) -> Result<(), Self::Error> {
         let mut packet = item.convert_type(ZCPacketType::TCP);
         let len = packet.buf_len();
         packet.mut_tcp_tunnel_header().unwrap().len.set(len as u32);
         let data = packet.into_bytes();
 
-        self.socket.try_send(&data);
+        if let Some(built) = self.socket.build_packet(&data) {
+            self.pending.push(built);
+        }
 
         Ok(())
     }
 
     fn poll_flush(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         _cx: &mut TaskContext<'_>,
     ) -> Poll<Result<(), Self::Error>> {
+        self.do_flush();
         Poll::Ready(Ok(()))
     }
 
     fn poll_close(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         _cx: &mut TaskContext<'_>,
     ) -> Poll<Result<(), Self::Error>> {
+        self.do_flush();
         self.socket.close();
         Poll::Ready(Ok(()))
     }

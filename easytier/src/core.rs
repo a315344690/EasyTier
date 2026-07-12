@@ -544,11 +544,11 @@ struct NetworkOptions {
     )]
     socket_mark: Option<u32>,
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(target_os = "macos", not(feature = "macos-ne"))))]
     #[arg(
         long,
         env = "ET_DEFAULT_ROUTE",
-        help = "Route all traffic through VPN tunnel (Linux only)"
+        help = "Route all traffic through VPN tunnel (Linux/macOS)"
     )]
     default_route: Option<bool>,
 
@@ -1160,12 +1160,13 @@ impl NetworkOptions {
         {
             f.socket_mark = self.socket_mark.or(f.socket_mark);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", all(target_os = "macos", not(feature = "macos-ne"))))]
         {
             f.default_route = self.default_route.unwrap_or(f.default_route);
-            if f.default_route && f.socket_mark.is_none() {
-                f.socket_mark = Some(0x6846);
-            }
+        }
+        #[cfg(target_os = "linux")]
+        if f.default_route && f.socket_mark.is_none() {
+            f.socket_mark = Some(0x6846);
         }
         f.enable_kcp_proxy = self.enable_kcp_proxy.unwrap_or(f.enable_kcp_proxy);
         f.disable_kcp_input = self.disable_kcp_input.unwrap_or(f.disable_kcp_input);

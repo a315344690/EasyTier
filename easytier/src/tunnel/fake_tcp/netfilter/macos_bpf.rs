@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use bytes::BytesMut;
 use nix::libc;
 use std::ffi::CString;
 use std::io;
@@ -1008,13 +1007,10 @@ impl Drop for MacosBpfTun {
 
 #[async_trait::async_trait]
 impl stack::Tun for MacosBpfTun {
-    async fn recv(&self, packet: &mut BytesMut) -> Result<usize, std::io::Error> {
+    async fn recv(&self) -> Result<Bytes, std::io::Error> {
         let mut rx = self.recv_queue.lock().await;
         match rx.recv().await {
-            Some(data) => {
-                packet.extend_from_slice(&data);
-                Ok(data.len())
-            }
+            Some(data) => Ok(Bytes::from(data)),
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "MacosBpfTun channel closed",

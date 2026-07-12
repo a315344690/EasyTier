@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use futures::stream::FuturesUnordered;
+use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::time::{Duration, timeout};
@@ -18,7 +20,7 @@ use crate::tunnel::common::apply_socket_mark;
 
 const TCP_MTU_BYTES: usize = 2000;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_RAW_PAYLOAD_SIZE: usize = 2048;
+const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-5AB5DC30CE87";
 
 // --- Payload types ---
 
@@ -26,17 +28,16 @@ const MAX_RAW_PAYLOAD_SIZE: usize = 2048;
 enum FakeHttpPayload {
     Http { host: String },
     Https { host: String },
-    RawFile {
-        wire_data: Vec<u8>, // pre-computed: 4-byte length prefix + file content
-    },
 }
 
 impl FakeHttpPayload {
-    fn client_bytes(&self) -> Vec<u8> {
+    fn client_bytes(&self) -> (Vec<u8>, Option<String>) {
         match self {
-            Self::Http { host } => build_http_request(host),
-            Self::Https { host } => build_tls_client_hello(host),
-            Self::RawFile { wire_data } => wire_data.clone(),
+            Self::Http { host } => {
+                let (req, key) = build_http_request(host);
+                (req, Some(key))
+            }
+            Self::Https { host } => (build_tls_client_hello(host), None),
         }
     }
 }
@@ -53,27 +54,7 @@ fn parse_payloads(hosts: Vec<String>) -> Vec<FakeHttpPayload> {
                 host: host.to_string(),
             });
         } else {
-            match std::fs::read(&entry) {
-                Ok(mut data) => {
-                    if data.len() > MAX_RAW_PAYLOAD_SIZE {
-                        tracing::warn!(
-                            path = %entry,
-                            size = data.len(),
-                            max = MAX_RAW_PAYLOAD_SIZE,
-                            "fakehttp payload file truncated"
-                        );
-                        data.truncate(MAX_RAW_PAYLOAD_SIZE);
-                    }
-                    // Pre-compute wire format: 4-byte BE length + data
-                    let mut wire_data = Vec::with_capacity(4 + data.len());
-                    wire_data.extend_from_slice(&(data.len() as u32).to_be_bytes());
-                    wire_data.extend_from_slice(&data);
-                    payloads.push(FakeHttpPayload::RawFile { wire_data });
-                }
-                Err(e) => {
-                    tracing::warn!(path = %entry, error = %e, "fakehttp payload file not found, skipping");
-                }
-            }
+            tracing::warn!(entry = %entry, "fakehttp: unsupported entry (must start with http:// or https://), skipping");
         }
     }
     payloads
@@ -81,67 +62,48 @@ fn parse_payloads(hosts: Vec<String>) -> Vec<FakeHttpPayload> {
 
 // --- Protocol builders ---
 
-fn build_http_request(host: &str) -> Vec<u8> {
-    // Use HTTP Upgrade mechanism (RFC 7230 §6.7) to legitimize the protocol switch.
-    // After 101 response, DPI state machines expect non-HTTP binary framing.
+fn compute_ws_accept(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(WS_MAGIC.as_bytes());
+    BASE64_STANDARD.encode(hasher.finalize())
+}
+
+fn build_http_request(host: &str) -> (Vec<u8>, String) {
     let ws_key: [u8; 16] = rand::random();
-    let ws_key_b64 = base64_encode(&ws_key);
-    format!(
+    let ws_key_b64 = BASE64_STANDARD.encode(ws_key);
+    let req = format!(
         "GET / HTTP/1.1\r\n\
          Host: {host}\r\n\
-         User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n\
-         Accept: */*\r\n\
-         Accept-Language: en-US,en;q=0.5\r\n\
-         Accept-Encoding: gzip, deflate\r\n\
-         Origin: http://{host}\r\n\
          Connection: Upgrade\r\n\
+         Pragma: no-cache\r\n\
+         Cache-Control: no-cache\r\n\
+         User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36\r\n\
          Upgrade: websocket\r\n\
+         Origin: http://{host}\r\n\
          Sec-WebSocket-Version: 13\r\n\
+         Accept-Encoding: gzip, deflate\r\n\
+         Accept-Language: en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7\r\n\
          Sec-WebSocket-Key: {ws_key_b64}\r\n\
          Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\
          \r\n"
     )
-    .into_bytes()
+    .into_bytes();
+    (req, ws_key_b64)
 }
 
-fn build_http_response() -> Vec<u8> {
+fn build_http_response(ws_accept: &str) -> Vec<u8> {
     let date_str = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
-    // 101 Switching Protocols legitimizes the binary data that follows.
-    // DPI state machines treat this as a valid protocol upgrade.
     format!(
         "HTTP/1.1 101 Switching Protocols\r\n\
-         Date: {date_str}\r\n\
-         Connection: Upgrade\r\n\
          Upgrade: websocket\r\n\
-         Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {ws_accept}\r\n\
          Server: nginx/1.24.0\r\n\
+         Date: {date_str}\r\n\
          \r\n"
     )
     .into_bytes()
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-        if chunk.len() > 2 {
-            result.push(CHARS[(triple & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-    }
-    result
 }
 
 /// Wrap a handshake body in TLS record + handshake headers.
@@ -516,17 +478,18 @@ impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
             return Poll::Ready(Ok(()));
         }
 
-        // 2. If mid-record, read payload directly into caller's buf (zero-copy path)
+        // 2. If mid-record, read payload into local buf then copy to caller
         if me.remaining_in_record > 0 {
             let to_read = me.remaining_in_record.min(buf.remaining());
             if to_read == 0 {
                 return Poll::Ready(Ok(()));
             }
-            let before = buf.filled().len();
-            let mut sub = buf.take(to_read);
-            match Pin::new(&mut me.inner).poll_read(cx, &mut sub) {
+            let mut tmp = [0u8; 4096];
+            let read_len = to_read.min(tmp.len());
+            let mut tmp_buf = ReadBuf::new(&mut tmp[..read_len]);
+            match Pin::new(&mut me.inner).poll_read(cx, &mut tmp_buf) {
                 Poll::Ready(Ok(())) => {
-                    let n = buf.filled().len() - before;
+                    let n = tmp_buf.filled().len();
                     if n == 0 {
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
@@ -534,6 +497,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
                         )));
                     }
                     me.remaining_in_record -= n;
+                    buf.put_slice(&tmp[..n]);
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -616,17 +580,20 @@ impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
                     }
                     Poll::Ready(Ok(()))
                 } else if me.remaining_in_record > 0 {
-                    // Header parsed but payload starts in next read — direct path
                     let to_read = me.remaining_in_record.min(buf.remaining());
                     if to_read == 0 {
                         return Poll::Ready(Ok(()));
                     }
-                    let before = buf.filled().len();
-                    let mut sub = buf.take(to_read);
-                    match Pin::new(&mut me.inner).poll_read(cx, &mut sub) {
+                    let mut tmp2 = [0u8; 4096];
+                    let read_len = to_read.min(tmp2.len());
+                    let mut tmp2_buf = ReadBuf::new(&mut tmp2[..read_len]);
+                    match Pin::new(&mut me.inner).poll_read(cx, &mut tmp2_buf) {
                         Poll::Ready(Ok(())) => {
-                            let rd = buf.filled().len() - before;
+                            let rd = tmp2_buf.filled().len();
                             me.remaining_in_record -= rd;
+                            if rd > 0 {
+                                buf.put_slice(&tmp2[..rd]);
+                            }
                             Poll::Ready(Ok(()))
                         }
                         Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -685,17 +652,21 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for WsFrameWriter<W> {
         if me.has_pending() {
             loop {
                 match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_offset..]) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "WS frame write: zero bytes written",
+                        )));
+                    }
                     Poll::Ready(Ok(n)) => {
                         me.send_offset += n;
                         if me.send_offset >= me.send_buf.len() {
-                            // Pending frame fully sent — report the original payload len
                             let len = me.pending_payload_len;
                             me.send_buf.clear();
                             me.send_offset = 0;
                             me.pending_payload_len = 0;
                             return Poll::Ready(Ok(len));
                         }
-                        // Continue writing remaining bytes
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
@@ -751,9 +722,15 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for WsFrameWriter<W> {
 
         me.pending_payload_len = payload_len;
 
-        // Try to write the entire frame; loop until fully sent or Pending
+        // Try to write the entire frame
         loop {
             match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_offset..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "WS frame write: zero bytes written",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     me.send_offset += n;
                     if me.send_offset >= me.send_buf.len() {
@@ -762,7 +739,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for WsFrameWriter<W> {
                         me.pending_payload_len = 0;
                         return Poll::Ready(Ok(payload_len));
                     }
-                    // Partial write — continue loop
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -772,14 +748,22 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for WsFrameWriter<W> {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let me = &mut *self;
-        // Flush any remaining send_buf
         while me.send_offset < me.send_buf.len() {
             match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_offset..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "WS frame flush: zero bytes written",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => me.send_offset += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         }
+        me.send_buf.clear();
+        me.send_offset = 0;
+        me.pending_payload_len = 0;
         Pin::new(&mut me.inner).poll_flush(cx)
     }
 
@@ -796,13 +780,14 @@ enum WsReadState {
 struct WsFrameReader<R> {
     inner: R,
     state: WsReadState,
-    hdr_buf: [u8; 14], // max header: 2 + 8 (ext len) + 4 (mask) = 14
-    hdr_len: usize,    // total header bytes needed
-    hdr_read: usize,   // header bytes read so far
+    hdr_buf: [u8; 14],
+    hdr_len: usize,
+    hdr_read: usize,
     remaining_payload: usize,
     mask_key: [u8; 4],
     has_mask: bool,
     mask_offset: usize,
+    read_buf: Box<[u8; 4096]>,
 }
 
 impl<R> WsFrameReader<R> {
@@ -811,12 +796,13 @@ impl<R> WsFrameReader<R> {
             inner,
             state: WsReadState::ReadingHeader,
             hdr_buf: [0u8; 14],
-            hdr_len: 2, // start by reading 2 base bytes
+            hdr_len: 2,
             hdr_read: 0,
             remaining_payload: 0,
             mask_key: [0; 4],
             has_mask: false,
             mask_offset: 0,
+            read_buf: Box::new([0u8; 4096]),
         }
     }
 
@@ -905,25 +891,29 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
                     // Control frames (opcode >= 0x08): skip payload, read next frame
                     let opcode = me.hdr_buf[0] & 0x0F;
                     if opcode >= 0x08 {
-                        // Drain control frame payload
-                        me.state = WsReadState::ReadingPayload;
-                        // We'll drain it below but discard into nowhere
                         if me.remaining_payload == 0 {
                             me.reset_for_next_frame();
                             continue;
                         }
-                        // For control frames, drain into a local buffer
+                        // Drain control frame payload (max 125 bytes per RFC 6455)
                         let mut discard = [0u8; 125];
                         let to_drain = me.remaining_payload.min(125);
                         let mut tmp = ReadBuf::new(&mut discard[..to_drain]);
                         match Pin::new(&mut me.inner).poll_read(cx, &mut tmp) {
                             Poll::Ready(Ok(())) => {
                                 let n = tmp.filled().len();
+                                if n == 0 {
+                                    return Poll::Ready(Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "WS control frame truncated",
+                                    )));
+                                }
                                 me.remaining_payload -= n;
                                 if me.remaining_payload == 0 {
                                     me.reset_for_next_frame();
                                     continue;
                                 }
+                                cx.waker().wake_by_ref();
                                 return Poll::Pending;
                             }
                             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -951,35 +941,53 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
                         return Poll::Ready(Ok(()));
                     }
 
-                    let before = buf.filled().len();
-                    let mut limited_buf = buf.take(to_read);
-                    match Pin::new(&mut me.inner).poll_read(cx, &mut limited_buf) {
-                        Poll::Ready(Ok(())) => {
-                            let n = buf.filled().len() - before;
-                            if n == 0 {
-                                return Poll::Ready(Err(std::io::Error::new(
-                                    std::io::ErrorKind::UnexpectedEof,
-                                    "WS frame payload truncated",
-                                )));
+                    if !me.has_mask {
+                        // No mask: read directly into caller's buffer (zero-copy)
+                        let before = buf.filled().len();
+                        let dst = buf.initialize_unfilled_to(to_read);
+                        let mut tmp_buf = ReadBuf::new(&mut dst[..to_read]);
+                        match Pin::new(&mut me.inner).poll_read(cx, &mut tmp_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let n = tmp_buf.filled().len();
+                                if n == 0 {
+                                    return Poll::Ready(Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "WS frame payload truncated",
+                                    )));
+                                }
+                                me.remaining_payload -= n;
+                                me.mask_offset += n;
+                                // Advance caller's buf by what we read
+                                buf.set_filled(before + n);
+                                return Poll::Ready(Ok(()));
                             }
-                            me.remaining_payload -= n;
-
-                            // Unmask in-place
-                            if me.has_mask {
-                                let start = buf.filled().len() - n;
-                                let filled = buf.filled_mut();
-                                for i in start..start + n {
-                                    filled[i] ^= me.mask_key[me.mask_offset % 4];
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    } else {
+                        // Masked: read into internal buffer, unmask, then copy
+                        let read_len = to_read.min(me.read_buf.len());
+                        let mut tmp_buf = ReadBuf::new(&mut me.read_buf[..read_len]);
+                        match Pin::new(&mut me.inner).poll_read(cx, &mut tmp_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let n = tmp_buf.filled().len();
+                                if n == 0 {
+                                    return Poll::Ready(Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "WS frame payload truncated",
+                                    )));
+                                }
+                                me.remaining_payload -= n;
+                                for i in 0..n {
+                                    me.read_buf[i] ^= me.mask_key[me.mask_offset % 4];
                                     me.mask_offset += 1;
                                 }
-                            } else {
-                                me.mask_offset += n;
+                                buf.put_slice(&me.read_buf[..n]);
+                                return Poll::Ready(Ok(()));
                             }
-
-                            return Poll::Ready(Ok(()));
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => return Poll::Pending,
                     }
                 }
             }
@@ -1051,29 +1059,42 @@ async fn perform_client_handshake(
     stream: &mut TcpStream,
     payload: &FakeHttpPayload,
 ) -> Result<HandshakeResult, TunnelError> {
-    let data = payload.client_bytes();
+    let (data, ws_key) = payload.client_bytes();
     stream.write_all(&data).await?;
 
-    let is_tls = matches!(payload, FakeHttpPayload::Https { .. });
-
-    if is_tls {
-        // Read server's TLS records: ServerHello + CCS + 2 encrypted AppData records
-        drain_tls_records(stream, 4).await?;
-        // Send client CCS + fake Finished
-        stream.write_all(&build_fake_client_finished()).await?;
-        Ok(HandshakeResult::TlsWrapped)
-    } else {
-        // HTTP/Raw: just read any response
-        let mut resp_buf = [0u8; 512];
-        let n = stream.read(&mut resp_buf).await?;
-        if n == 0 {
-            return Err(TunnelError::InternalError(
-                "fakehttp handshake: server closed connection".to_string(),
-            ));
+    match payload {
+        FakeHttpPayload::Https { .. } => {
+            drain_tls_records(stream, 4).await?;
+            stream.write_all(&build_fake_client_finished()).await?;
+            Ok(HandshakeResult::TlsWrapped)
         }
-        if matches!(payload, FakeHttpPayload::Http { .. }) {
-            Ok(HandshakeResult::Plain)
-        } else {
+        FakeHttpPayload::Http { .. } => {
+            let mut resp_buf = Vec::with_capacity(512);
+            let mut tmp = [0u8; 512];
+            loop {
+                let n = stream.read(&mut tmp).await?;
+                if n == 0 {
+                    return Err(TunnelError::InternalError(
+                        "fakehttp handshake: server closed connection".to_string(),
+                    ));
+                }
+                resp_buf.extend_from_slice(&tmp[..n]);
+                if resp_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if resp_buf.len() > 4096 {
+                    return Err(TunnelError::InternalError(
+                        "fakehttp handshake: response too large".to_string(),
+                    ));
+                }
+            }
+            if let Some(key) = ws_key {
+                let expected_accept = compute_ws_accept(&key);
+                let resp_str = String::from_utf8_lossy(&resp_buf);
+                if !resp_str.contains(&expected_accept) {
+                    tracing::warn!("fakehttp: server Sec-WebSocket-Accept mismatch");
+                }
+            }
             Ok(HandshakeResult::Plain)
         }
     }
@@ -1095,13 +1116,13 @@ async fn perform_server_handshake(stream: &mut TcpStream) -> Result<HandshakeRes
         server_handle_tls(stream).await?;
         Ok(HandshakeResult::TlsWrapped)
     } else {
-        server_handle_raw(stream).await?;
-        Ok(HandshakeResult::Plain)
+        Err(TunnelError::InternalError(
+            "fakehttp: unrecognized protocol (expected HTTP or TLS)".to_string(),
+        ))
     }
 }
 
 async fn server_handle_http(stream: &mut TcpStream) -> Result<(), TunnelError> {
-    // Read until \r\n\r\n (end of HTTP headers)
     let mut buf = Vec::with_capacity(1024);
     let mut search_from: usize = 0;
     loop {
@@ -1113,7 +1134,6 @@ async fn server_handle_http(stream: &mut TcpStream) -> Result<(), TunnelError> {
             ));
         }
         buf.extend_from_slice(&tmp[..nr]);
-        // Only search the newly added region (with 3 bytes overlap for boundary)
         let start = search_from.saturating_sub(3);
         if buf[start..].windows(4).any(|w| w == b"\r\n\r\n") {
             break;
@@ -1125,8 +1145,24 @@ async fn server_handle_http(stream: &mut TcpStream) -> Result<(), TunnelError> {
             ));
         }
     }
-    stream.write_all(&build_http_response()).await?;
+    let ws_accept = extract_ws_key(&buf)
+        .map(|key| compute_ws_accept(key))
+        .unwrap_or_default();
+    stream.write_all(&build_http_response(&ws_accept)).await?;
     Ok(())
+}
+
+fn extract_ws_key(headers: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(headers).ok()?;
+    for line in text.split("\r\n") {
+        if let Some(colon_pos) = line.find(':') {
+            let name = &line[..colon_pos];
+            if name.eq_ignore_ascii_case("Sec-WebSocket-Key") {
+                return Some(line[colon_pos + 1..].trim());
+            }
+        }
+    }
+    None
 }
 
 async fn server_handle_tls(stream: &mut TcpStream) -> Result<(), TunnelError> {
@@ -1170,29 +1206,6 @@ async fn server_handle_tls(stream: &mut TcpStream) -> Result<(), TunnelError> {
     Ok(())
 }
 
-async fn server_handle_raw(stream: &mut TcpStream) -> Result<(), TunnelError> {
-    // 4-byte BE length prefix
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let payload_len = u32::from_be_bytes(len_buf) as usize;
-    if payload_len > MAX_RAW_PAYLOAD_SIZE {
-        return Err(TunnelError::InternalError(
-            "fakehttp: raw payload too large".to_string(),
-        ));
-    }
-    // Drain payload
-    let mut remaining = payload_len;
-    let mut discard = [0u8; 2048];
-    while remaining > 0 {
-        let to_read = remaining.min(discard.len());
-        stream.read_exact(&mut discard[..to_read]).await?;
-        remaining -= to_read;
-    }
-    stream
-        .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-        .await?;
-    Ok(())
-}
 
 // --- Shared TCP connection helper ---
 
@@ -1297,8 +1310,8 @@ impl FakeHttpTunnelListener {
                 Some(info),
             ))),
             HandshakeResult::Plain => Ok(Box::new(TunnelWrapper::new(
-                FramedReader::new(r, TCP_MTU_BYTES),
-                FramedWriter::new(w),
+                FramedReader::new(WsFrameReader::new(r), TCP_MTU_BYTES),
+                FramedWriter::new(WsFrameWriter::new(w, false)),
                 Some(info),
             ))),
         }
@@ -1449,8 +1462,8 @@ impl super::TunnelConnector for FakeHttpTunnelConnector {
                 Some(info),
             ))),
             HandshakeResult::Plain => Ok(Box::new(TunnelWrapper::new(
-                FramedReader::new(r, TCP_MTU_BYTES),
-                FramedWriter::new(w),
+                FramedReader::new(WsFrameReader::new(r), TCP_MTU_BYTES),
+                FramedWriter::new(WsFrameWriter::new(w, true)),
                 Some(info),
             ))),
         }
@@ -1544,30 +1557,12 @@ mod tests {
     async fn fakehttp_no_payload_connector_fails() {
         let mut connector = FakeHttpTunnelConnector::new(
             "fakehttp://127.0.0.1:41015".parse().unwrap(),
-            vec!["/nonexistent/file.bin".to_string()],
+            vec!["invalid_entry".to_string()],
         );
         let result = connector.connect().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("no valid fakehttp payload"));
-    }
-
-    #[tokio::test]
-    async fn fakehttp_raw_file_pingpong() {
-        let tmp_dir = std::env::temp_dir();
-        let tmp_file = tmp_dir.join("fakehttp_test_payload.bin");
-        std::fs::write(&tmp_file, b"FAKE_PAYLOAD_DATA_FOR_TESTING_1234567890").unwrap();
-
-        let hosts = vec![tmp_file.to_string_lossy().to_string()];
-        let listener =
-            FakeHttpTunnelListener::new("fakehttp://0.0.0.0:41016".parse().unwrap(), hosts.clone());
-        let connector = FakeHttpTunnelConnector::new(
-            "fakehttp://127.0.0.1:41016".parse().unwrap(),
-            hosts,
-        );
-        _tunnel_pingpong(listener, connector).await;
-
-        std::fs::remove_file(&tmp_file).ok();
     }
 
     // --- DPI Detection Tests ---
@@ -1899,7 +1894,7 @@ mod tests {
     #[test]
     fn test_dpi_http_request_headers() {
         let host = "ws.example.com";
-        let req = build_http_request(host);
+        let (req, ws_key) = build_http_request(host);
         let req_str = String::from_utf8_lossy(&req);
 
         assert!(req_str.starts_with("GET / HTTP/1.1\r\n"), "should start with GET");
@@ -1921,19 +1916,18 @@ mod tests {
             "should have WS extensions"
         );
         assert!(req_str.contains("Chrome/"), "should have Chrome User-Agent");
+        assert!(req_str.contains("Pragma: no-cache"), "should have Pragma");
+        assert!(req_str.contains("Cache-Control: no-cache"), "should have Cache-Control");
 
-        // Validate Sec-WebSocket-Key is valid base64 (24 chars)
-        let key_line = req_str
-            .lines()
-            .find(|l| l.contains("Sec-WebSocket-Key:"))
-            .unwrap();
-        let key = key_line.split(": ").nth(1).unwrap().trim();
-        assert_eq!(key.len(), 24, "WS key should be 24 chars base64");
+        // Validate returned key matches the one in the request
+        assert_eq!(ws_key.len(), 24, "WS key should be 24 chars base64");
+        assert!(req_str.contains(&ws_key), "returned key should match request");
     }
 
     #[test]
     fn test_dpi_http_response_format() {
-        let resp = build_http_response();
+        let ws_accept = compute_ws_accept("dGhlIHNhbXBsZSBub25jZQ==");
+        let resp = build_http_response(&ws_accept);
         let resp_str = String::from_utf8_lossy(&resp);
 
         assert!(
@@ -1944,10 +1938,21 @@ mod tests {
         assert!(resp_str.contains("Connection: Upgrade"), "should have Connection: Upgrade");
         assert!(resp_str.contains("Upgrade: websocket"), "should have Upgrade: websocket");
         assert!(
-            resp_str.contains("Sec-WebSocket-Accept:"),
-            "should have WS Accept"
+            resp_str.contains(&format!("Sec-WebSocket-Accept: {}", ws_accept)),
+            "should have computed WS Accept"
         );
         assert!(resp_str.contains("Date:"), "should have Date header");
+    }
+
+    #[test]
+    fn test_ws_accept_roundtrip() {
+        let ws_key: [u8; 16] = rand::random();
+        let key_b64 = BASE64_STANDARD.encode(ws_key);
+        let accept = compute_ws_accept(&key_b64);
+        assert!(!accept.is_empty());
+        assert_ne!(accept, key_b64);
+        // Verify deterministic
+        assert_eq!(accept, compute_ws_accept(&key_b64));
     }
 
     #[test]

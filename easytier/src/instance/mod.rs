@@ -1,6 +1,8 @@
 pub mod dns_server;
 #[cfg(target_os = "linux")]
 pub mod default_route;
+#[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+pub mod default_route_macos;
 #[allow(clippy::module_inception)]
 pub mod instance;
 
