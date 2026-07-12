@@ -3,12 +3,15 @@ use std::net::Ipv4Addr;
 
 use crate::common::{error::Error, ifcfg::run_shell_cmd};
 
+const PF_ANCHOR_NAME: &str = "com.easytier";
+const PF_ANCHOR_FILE: &str = "/tmp/easytier_pf_anchor.conf";
+
 struct ActiveState {
     original_gateway: String,
-    #[allow(dead_code)]
     original_interface: String,
     /// Reference-counted peer host routes: IP -> active connection count
     peer_host_routes: HashMap<Ipv4Addr, usize>,
+    pf_token: Option<String>,
 }
 
 pub struct DefaultRouteManager {
@@ -38,6 +41,7 @@ impl DefaultRouteManager {
             original_gateway: gateway.clone(),
             original_interface: interface.clone(),
             peer_host_routes: HashMap::new(),
+            pf_token: None,
         });
 
         // Step 1: Add host routes for known peers FIRST to prevent routing loop
@@ -62,6 +66,14 @@ impl DefaultRouteManager {
         ))
         .await?;
 
+        // Step 3: Setup PF anchor for inbound traffic protection.
+        // Ensures reply packets from the physical IP go out the physical interface,
+        // equivalent to Linux's `ip rule add from <phy_ip> table main`.
+        // PF state is kernel-memory only — cleared on reboot automatically.
+        if let Err(e) = self.setup_pf_anchor(&interface, &gateway).await {
+            tracing::warn!(?e, "failed to setup PF anchor, inbound protection disabled");
+        }
+
         tracing::info!(
             tun = %self.tun_ifname,
             %gateway,
@@ -77,6 +89,14 @@ impl DefaultRouteManager {
             return Ok(());
         };
 
+        // Clean PF anchor first
+        let _ = run_shell_cmd(&format!("pfctl -a {} -F all", PF_ANCHOR_NAME)).await;
+        if let Some(token) = &state.pf_token {
+            let _ = run_shell_cmd(&format!("pfctl -X {}", token)).await;
+        }
+        let _ = std::fs::remove_file(PF_ANCHOR_FILE);
+
+        // Remove /1 routes
         let _ = run_shell_cmd(&format!(
             "route -n delete -net 0.0.0.0/1 -interface {}",
             self.tun_ifname
@@ -88,6 +108,7 @@ impl DefaultRouteManager {
         ))
         .await;
 
+        // Remove peer host routes
         for peer_ip in state.peer_host_routes.keys() {
             let _ = run_shell_cmd(&format!(
                 "route -n delete -host {} {}",
@@ -147,8 +168,44 @@ impl DefaultRouteManager {
         self.state.is_some()
     }
 
+    async fn setup_pf_anchor(&mut self, interface: &str, gateway: &str) -> Result<(), Error> {
+        let phy_ips = detect_interface_ips(interface)?;
+        if phy_ips.is_empty() {
+            return Ok(());
+        }
+
+        let mut rules = String::new();
+        for ip in &phy_ips {
+            rules.push_str(&format!(
+                "pass out on {} route-to ({} {}) from {} to any no state\n",
+                interface, interface, gateway, ip
+            ));
+        }
+
+        std::fs::write(PF_ANCHOR_FILE, &rules).map_err(|e| Error::AnyhowError(e.into()))?;
+
+        run_shell_cmd(&format!("pfctl -a {} -f {}", PF_ANCHOR_NAME, PF_ANCHOR_FILE)).await?;
+
+        let token = enable_pf();
+        if let Some(state) = self.state.as_mut() {
+            state.pf_token = token;
+        }
+
+        tracing::debug!(?phy_ips, "PF anchor installed for inbound protection");
+        Ok(())
+    }
+
     fn generate_cleanup_script(&self) -> String {
         let mut script = String::new();
+        script.push_str(&format!(
+            "pfctl -a {} -F all 2>/dev/null;",
+            PF_ANCHOR_NAME
+        ));
+        if let Some(state) = &self.state {
+            if let Some(token) = &state.pf_token {
+                script.push_str(&format!("pfctl -X {} 2>/dev/null;", token));
+            }
+        }
         script.push_str(&format!(
             "route -n delete -net 0.0.0.0/1 -interface {} 2>/dev/null;",
             self.tun_ifname
@@ -165,6 +222,7 @@ impl DefaultRouteManager {
                 ));
             }
         }
+        script.push_str(&format!("rm -f {} 2>/dev/null", PF_ANCHOR_FILE));
         script
     }
 }
@@ -213,6 +271,44 @@ async fn detect_default_route() -> Result<(String, String), Error> {
             "failed to parse default route (gateway or interface not found)"
         ))),
     }
+}
+
+fn detect_interface_ips(interface: &str) -> Result<Vec<Ipv4Addr>, Error> {
+    let output = std::process::Command::new("ifconfig")
+        .arg(interface)
+        .output()
+        .map_err(|e| Error::AnyhowError(e.into()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut ips = Vec::new();
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("inet ") {
+            if let Some(ip_str) = rest.split_whitespace().next() {
+                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                    ips.push(ip);
+                }
+            }
+        }
+    }
+
+    Ok(ips)
+}
+
+fn enable_pf() -> Option<String> {
+    let output = std::process::Command::new("pfctl")
+        .arg("-E")
+        .output()
+        .ok()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines() {
+        if let Some(rest) = line.strip_prefix("Token : ") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
 }
 
 pub fn extract_ipv4_from_url(url: &url::Url) -> Option<Ipv4Addr> {

@@ -175,7 +175,7 @@ impl PeerConnPinger {
         // should add seq here. so latency can be calculated more accurately
         let req = Self::new_ping_packet(my_node_id, peer_id, seq);
         let req_len = req.buf_len() as u64;
-        sink.send(req).await?;
+        sink.try_send(req)?;
         control_metrics.record_tx(req_len);
 
         let now = Instant::now();
