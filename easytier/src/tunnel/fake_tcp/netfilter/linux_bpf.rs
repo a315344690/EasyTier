@@ -210,15 +210,16 @@ fn build_tcp_filter(
         b.push_jeq(IPPROTO_TCP_U32, l_v4_proto_ok, l_reject);
 
         b.set_label(l_v4_proto_ok);
-        let dst_ip = match dst_addr.ip() {
-            IpAddr::V4(ip) => u32::from(ip),
+        let dst_ip_v4 = match dst_addr.ip() {
+            IpAddr::V4(ip) => ip,
             _ => unreachable!(),
         };
-        let l_v4_dstip_ok = b.new_label();
-        b.push(stmt(BPF_LD | BPF_W | BPF_ABS, (ETH_HDR_LEN + 16) as u32));
-        b.push_jeq(dst_ip, l_v4_dstip_ok, l_reject);
-
-        b.set_label(l_v4_dstip_ok);
+        if !dst_ip_v4.is_unspecified() {
+            let l_v4_dstip_ok = b.new_label();
+            b.push(stmt(BPF_LD | BPF_W | BPF_ABS, (ETH_HDR_LEN + 16) as u32));
+            b.push_jeq(u32::from(dst_ip_v4), l_v4_dstip_ok, l_reject);
+            b.set_label(l_v4_dstip_ok);
+        }
         if let Some(src) = src_addr {
             let src_ip = match src.ip() {
                 IpAddr::V4(ip) => u32::from(ip),
@@ -250,17 +251,20 @@ fn build_tcp_filter(
         b.push_jeq(IPPROTO_TCP_U32, l_v6_proto_ok, l_reject);
 
         b.set_label(l_v6_proto_ok);
-        let dst_ip = match dst_addr.ip() {
-            IpAddr::V6(ip) => ip.octets(),
+        let dst_ip_v6 = match dst_addr.ip() {
+            IpAddr::V6(ip) => ip,
             _ => unreachable!(),
         };
-        for (i, chunk) in dst_ip.chunks_exact(4).enumerate() {
-            let off = ETH_HDR_LEN + 24 + (i * 4);
-            let v = u32::from_be_bytes(chunk.try_into().unwrap());
-            let l_v6_dstip_word_ok = b.new_label();
-            b.push(stmt(BPF_LD | BPF_W | BPF_ABS, off as u32));
-            b.push_jeq(v, l_v6_dstip_word_ok, l_reject);
-            b.set_label(l_v6_dstip_word_ok);
+        if !dst_ip_v6.is_unspecified() {
+            let dst_ip = dst_ip_v6.octets();
+            for (i, chunk) in dst_ip.chunks_exact(4).enumerate() {
+                let off = ETH_HDR_LEN + 24 + (i * 4);
+                let v = u32::from_be_bytes(chunk.try_into().unwrap());
+                let l_v6_dstip_word_ok = b.new_label();
+                b.push(stmt(BPF_LD | BPF_W | BPF_ABS, off as u32));
+                b.push_jeq(v, l_v6_dstip_word_ok, l_reject);
+                b.set_label(l_v6_dstip_word_ok);
+            }
         }
 
         if let Some(src) = src_addr {

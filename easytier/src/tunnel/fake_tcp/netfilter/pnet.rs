@@ -64,7 +64,9 @@ fn filter_tcp_packet(
             }
 
             if let Some(dst_addr) = dst_addr {
-                if IpAddr::V4(ipv4.get_destination()) != dst_addr.ip() {
+                if !dst_addr.ip().is_unspecified()
+                    && IpAddr::V4(ipv4.get_destination()) != dst_addr.ip()
+                {
                     return false;
                 }
                 if tcp.get_destination() != dst_addr.port() {
@@ -101,7 +103,9 @@ fn filter_tcp_packet(
             };
 
             if let Some(src_addr) = src_addr {
-                if IpAddr::V6(ipv6.get_source()) != src_addr.ip() {
+                if !src_addr.ip().is_unspecified()
+                    && IpAddr::V6(ipv6.get_source()) != src_addr.ip()
+                {
                     return false;
                 }
                 if tcp.get_source() != src_addr.port() {
@@ -110,7 +114,9 @@ fn filter_tcp_packet(
             }
 
             if let Some(dst_addr) = dst_addr {
-                if IpAddr::V6(ipv6.get_destination()) != dst_addr.ip() {
+                if !dst_addr.ip().is_unspecified()
+                    && IpAddr::V6(ipv6.get_destination()) != dst_addr.ip()
+                {
                     return false;
                 }
                 if tcp.get_destination() != dst_addr.port() {

@@ -174,8 +174,15 @@ impl FakeTcpTunnelListener {
             self.stack_map.remove(interface_name);
         }
 
-        let tun =
-            create_tun_off_runtime(interface_name.to_string(), None, local_socket_addr).await?;
+        let filter_addr = SocketAddr::new(
+            if local_socket_addr.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+            },
+            local_socket_addr.port(),
+        );
+        let tun = create_tun_off_runtime(interface_name.to_string(), None, filter_addr).await?;
         tracing::info!(
             ?local_socket_addr,
             "create new stack with interface_name: {:?}",
