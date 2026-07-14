@@ -53,11 +53,9 @@ use std::sync::{
     atomic::{AtomicU16, AtomicU32, Ordering},
 };
 use tokio::sync::broadcast;
-use tokio::time;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, info, trace, warn};
 
-const TIMEOUT: time::Duration = time::Duration::from_secs(1);
 const MPMC_BUFFER_LEN: usize = 4096;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
 const ACK_THRESHOLD: u32 = 4096; // 4KB: send immediate standalone ACK frequently to avoid sender stall
@@ -163,8 +161,6 @@ pub struct Stack {
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub enum State {
     Idle,
-    SynSent,
-    SynReceived,
     Established,
 }
 
@@ -379,32 +375,6 @@ impl Socket {
 
                     return Some(meta.payload_len);
                 }
-                State::SynSent => {
-                    let Ok(Ok((_frame, meta))) = time::timeout(TIMEOUT, self.incoming.recv_async()).await
-                    else {
-                        info!("Waiting for client SYN + ACK timed out");
-                        return None;
-                    };
-
-                    if (meta.flags & tcp::TcpFlags::RST) != 0 {
-                        tracing::trace!("Connection {} reset by peer", self);
-                        return None;
-                    }
-
-                    let expected_flag = tcp::TcpFlags::SYN | tcp::TcpFlags::ACK;
-                    if (meta.flags & expected_flag) == expected_flag {
-                        let initial_seq = meta.ack;
-                        self.seq.store(initial_seq, Ordering::Relaxed);
-                        self.ack.store(meta.seq.wrapping_add(1), Ordering::Relaxed);
-                        self.remote_mac.store(Some(meta.src_mac));
-                        if let Some(tsval) = meta.tsval {
-                            self.remote_tsval.store(tsval, Ordering::Relaxed);
-                        }
-                        self.state.store(State::Established);
-                        return Some(0);
-                    }
-                }
-
                 _ => unreachable!(),
             }
         }

@@ -555,57 +555,31 @@ impl TunnelConnector for FakeTcpTunnelConnector {
 
         let tun =
             create_tun_off_runtime(interface_name.clone(), Some(remote_addr), local_addr).await?;
+
+        let os_stream = os_socket.connect(remote_addr).await?;
+
+        let (seq, ack) = get_tcp_seq_ack(&os_stream);
+
+        #[cfg(target_os = "linux")]
+        let nft_guard = netfilter_guard::NftGuard::new(local_addr, remote_addr);
+
         let local_ip = local_ip.unwrap_or("0.0.0.0".parse().unwrap());
         let stack = stack::Stack::new(tun, local_ip, local_ip6, mac);
         let driver_type = stack.driver_type();
 
         let socket = stack
-            .try_alloc_established_socket(local_addr, remote_addr, 0, 0, stack::State::SynSent)
+            .try_alloc_established_socket(
+                local_addr,
+                remote_addr,
+                seq,
+                ack,
+                stack::State::Established,
+            )
             .ok_or(TunnelError::InternalError(
                 "FakeTCP stack closed while allocating socket".into(),
             ))?;
 
-        let os_stream = os_socket.connect(remote_addr).await?;
-
-        // Set TCP_REPAIR immediately after connect to prevent kernel from
-        // interfering with the connection before the userspace stack takes over
-        #[cfg(target_os = "linux")]
-        {
-            use nix::libc;
-            use std::os::unix::io::AsRawFd;
-            let fd = os_stream.as_raw_fd();
-            let repair: libc::c_int = 1;
-            let ret = unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    19, // TCP_REPAIR
-                    &repair as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&repair) as libc::socklen_t,
-                )
-            };
-            if ret != 0 {
-                tracing::warn!(
-                    errno = std::io::Error::last_os_error().raw_os_error(),
-                    "faketcp connector: TCP_REPAIR failed, kernel may send RST"
-                );
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        let nft_guard = netfilter_guard::NftGuard::new(local_addr, remote_addr);
-
-        tracing::info!(?remote_addr, "FakeTcpTunnelConnector connecting");
-
-        let mut buf = BytesMut::new();
-        socket
-            .recv(&mut buf)
-            .await
-            .ok_or(TunnelError::InternalError(
-                "Failed to recv bytes to establish connection".into(),
-            ))?;
-
-        tracing::info!(local_addr = ?socket.local_addr(), "FakeTcpTunnelConnector connected");
+        tracing::info!(?remote_addr, seq, ack, "FakeTcpTunnelConnector connected");
 
         let info = TunnelInfo {
             tunnel_type: get_faketcp_tunnel_type_str(driver_type),
