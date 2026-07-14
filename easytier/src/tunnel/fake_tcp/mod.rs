@@ -1,4 +1,6 @@
 mod netfilter;
+#[cfg(target_os = "linux")]
+mod netfilter_guard;
 mod packet;
 mod stack;
 
@@ -355,9 +357,21 @@ impl TunnelListener for FakeTcpTunnelListener {
 
     async fn accept(&mut self) -> Result<Box<dyn Tunnel>, TunnelError> {
         tracing::debug!("FakeTcpTunnelListener waiting for accept");
+        #[cfg(target_os = "linux")]
+        let mut nft_guard = None::<netfilter_guard::NftGuard>;
+
         let (res, stack, socket) = loop {
             let res = self.do_accept().await?;
             let (seq, ack) = get_tcp_seq_ack(&res.socket);
+
+            #[cfg(target_os = "linux")]
+            {
+                nft_guard = Some(netfilter_guard::NftGuard::new(
+                    res.local_addr,
+                    res.remote_addr,
+                ));
+            }
+
             let stack = self.get_stack(&res).await?;
             let socket = stack.try_alloc_established_socket(
                 res.local_addr,
@@ -406,11 +420,20 @@ impl TunnelListener for FakeTcpTunnelListener {
         let reader = FakeTcpStream::new(socket.clone());
         let writer = FakeTcpSink::new(socket);
 
+        #[cfg(target_os = "linux")]
+        let associate_data: Box<dyn std::any::Any + Send> = Box::new((
+            build_os_socket_reader_task(res.socket),
+            nft_guard,
+        ));
+        #[cfg(not(target_os = "linux"))]
+        let associate_data: Box<dyn std::any::Any + Send> =
+            Box::new(build_os_socket_reader_task(res.socket));
+
         Ok(Box::new(TunnelWrapper::new_with_associate_data(
             reader,
             writer,
             Some(info),
-            Some(Box::new(build_os_socket_reader_task(res.socket))),
+            Some(associate_data),
         )))
     }
 
@@ -530,6 +553,9 @@ impl TunnelConnector for FakeTcpTunnelConnector {
             }
         }
 
+        #[cfg(target_os = "linux")]
+        let nft_guard = netfilter_guard::NftGuard::new(local_addr, remote_addr);
+
         tracing::info!(?remote_addr, "FakeTcpTunnelConnector connecting");
 
         let mut buf = BytesMut::new();
@@ -560,13 +586,23 @@ impl TunnelConnector for FakeTcpTunnelConnector {
 
         let socket = Arc::new(socket);
         let reader = FakeTcpStream::new(socket.clone());
-        let writer = FakeTcpSink::new(socket);
+        let writer = FakeTcpSink::new(socket.clone());
+
+        #[cfg(target_os = "linux")]
+        let associate_data: Box<dyn std::any::Any + Send> = Box::new((
+            build_os_socket_reader_task(os_stream),
+            stack,
+            nft_guard,
+        ));
+        #[cfg(not(target_os = "linux"))]
+        let associate_data: Box<dyn std::any::Any + Send> =
+            Box::new((build_os_socket_reader_task(os_stream), stack));
 
         Ok(Box::new(TunnelWrapper::new_with_associate_data(
             reader,
             writer,
             Some(info),
-            Some(Box::new((build_os_socket_reader_task(os_stream), stack))),
+            Some(associate_data),
         )))
     }
 
