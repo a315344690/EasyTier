@@ -61,7 +61,7 @@ const TIMEOUT: time::Duration = time::Duration::from_secs(1);
 const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 4096;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
-const ACK_THRESHOLD: u32 = 65536; // 64KB: send immediate standalone ACK after this much unacked data
+const ACK_THRESHOLD: u32 = 4096; // 4KB: send immediate standalone ACK frequently to avoid sender stall
 
 fn system_boot_instant() -> std::time::Instant {
     #[cfg(target_os = "linux")]
@@ -272,6 +272,7 @@ impl Socket {
 
                 if unacked > MAX_UNACKED_LEN {
                     tracing::trace!("unacked {} exceeds limit, dropping send", unacked);
+                    self.send_ack();
                     return Some(());
                 }
 
@@ -295,6 +296,7 @@ impl Socket {
                 let unacked = current_seq.wrapping_sub(remote_ack);
 
                 if unacked > MAX_UNACKED_LEN {
+                    self.send_ack();
                     return None;
                 }
 
