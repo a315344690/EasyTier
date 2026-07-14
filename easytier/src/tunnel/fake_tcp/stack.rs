@@ -50,7 +50,7 @@ use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicU16, AtomicU32, Ordering},
 };
 use tokio::sync::broadcast;
 use tokio::time;
@@ -62,6 +62,25 @@ const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 4096;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
 const ACK_THRESHOLD: u32 = 65536; // 64KB: send immediate standalone ACK after this much unacked data
+
+fn system_boot_instant() -> std::time::Instant {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts = nix::libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe {
+            nix::libc::clock_gettime(nix::libc::CLOCK_MONOTONIC, &mut ts);
+        }
+        let since_boot = std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+        std::time::Instant::now() - since_boot
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::time::Instant::now()
+    }
+}
 
 pub(crate) struct ParsedPacketMeta {
     pub src_mac: MacAddr,
@@ -165,6 +184,7 @@ pub struct Socket {
     remote_window: AtomicU32,
     ts_base: std::time::Instant,
     remote_tsval: AtomicU32,
+    ip_id: AtomicU16,
     state: AtomicCell<State>,
 }
 
@@ -204,8 +224,9 @@ impl Socket {
                 last_ack: AtomicU32::new(ack),
                 remote_ack: AtomicU32::new(seq),
                 remote_window: AtomicU32::new(0xFFFF << 14),
-                ts_base: std::time::Instant::now(),
+                ts_base: system_boot_instant(),
                 remote_tsval: AtomicU32::new(0),
+                ip_id: AtomicU16::new(1),
                 state: AtomicCell::new(state),
             },
             incoming_tx,
@@ -222,6 +243,7 @@ impl Socket {
 
         let tsval = self.ts_base.elapsed().as_millis() as u32;
         let tsecr = self.remote_tsval.load(Ordering::Relaxed);
+        let ip_id = self.ip_id.fetch_add(1, Ordering::Relaxed);
 
         build_tcp_packet(
             self.local_mac,
@@ -233,21 +255,19 @@ impl Socket {
             flags,
             payload,
             Some((tsval, tsecr)),
+            ip_id,
         )
     }
 
     /// Sends a datagram to the other end.
-    ///
-    /// This method takes `&self`, and it can be called safely by multiple threads
-    /// at the same time.
     ///
     /// A return of `None` means the Tun socket returned an error
     /// and this socket must be closed.
     pub fn try_send(&self, payload: &[u8]) -> Option<()> {
         match self.state.load() {
             State::Established => {
-                let current_seq = self.seq.load(Ordering::Relaxed);
                 let remote_ack = self.remote_ack.load(Ordering::Relaxed);
+                let current_seq = self.seq.load(Ordering::Relaxed);
                 let unacked = current_seq.wrapping_sub(remote_ack);
 
                 if unacked > MAX_UNACKED_LEN {
@@ -255,13 +275,12 @@ impl Socket {
                     return Some(());
                 }
 
+                let seq = self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
                 let buf = self.build_tcp_packet_with_seq(
                     tcp::TcpFlags::ACK,
                     Some(payload),
-                    current_seq,
+                    seq,
                 );
-                self.seq
-                    .store(current_seq.wrapping_add(payload.len() as u32), Ordering::Relaxed);
                 self.tun.try_send(&buf).ok().and(Some(()))
             }
             _ => unreachable!(),
@@ -271,21 +290,20 @@ impl Socket {
     pub fn build_packet(&self, payload: &[u8]) -> Option<Bytes> {
         match self.state.load() {
             State::Established => {
-                let current_seq = self.seq.load(Ordering::Relaxed);
                 let remote_ack = self.remote_ack.load(Ordering::Relaxed);
+                let current_seq = self.seq.load(Ordering::Relaxed);
                 let unacked = current_seq.wrapping_sub(remote_ack);
 
                 if unacked > MAX_UNACKED_LEN {
                     return None;
                 }
 
+                let seq = self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
                 let buf = self.build_tcp_packet_with_seq(
                     tcp::TcpFlags::ACK,
                     Some(payload),
-                    current_seq,
+                    seq,
                 );
-                self.seq
-                    .store(current_seq.wrapping_add(payload.len() as u32), Ordering::Relaxed);
                 Some(buf)
             }
             _ => None,
@@ -364,7 +382,18 @@ impl Socket {
                     }
 
                     let new_ack = meta.seq.wrapping_add(meta.payload_len as u32);
-                    self.ack.store(new_ack, Ordering::Relaxed);
+                    let _ = self.ack.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |current| {
+                            let diff = new_ack.wrapping_sub(current);
+                            if diff > 0 && diff < MAX_UNACKED_LEN {
+                                Some(new_ack)
+                            } else {
+                                None
+                            }
+                        },
+                    );
 
                     let last = self.last_ack.load(Ordering::Relaxed);
                     if new_ack.wrapping_sub(last) >= ACK_THRESHOLD {
@@ -403,6 +432,9 @@ impl Socket {
                         self.ack.store(meta.seq + 1, Ordering::Relaxed);
                         self.remote_window.store((meta.window as u32) << 14, Ordering::Relaxed);
                         self.remote_mac.store(Some(meta.src_mac));
+                        if let Some(tsval) = meta.tsval {
+                            self.remote_tsval.store(tsval, Ordering::Relaxed);
+                        }
                         self.state.store(State::Established);
                         return Some(0);
                     }
@@ -451,6 +483,7 @@ impl Drop for Socket {
             tcp::TcpFlags::RST,
             None,
             None,
+            self.ip_id.fetch_add(1, Ordering::Relaxed),
         );
         if let Err(e) = self.tun.try_send(&buf) {
             warn!("Unable to send RST to remote end: {}", e);

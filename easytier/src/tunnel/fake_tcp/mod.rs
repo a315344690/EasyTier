@@ -513,13 +513,19 @@ impl TunnelConnector for FakeTcpTunnelConnector {
             use std::os::unix::io::AsRawFd;
             let fd = os_stream.as_raw_fd();
             let repair: libc::c_int = 1;
-            unsafe {
+            let ret = unsafe {
                 libc::setsockopt(
                     fd,
                     libc::IPPROTO_TCP,
                     19, // TCP_REPAIR
                     &repair as *const _ as *const libc::c_void,
                     std::mem::size_of_val(&repair) as libc::socklen_t,
+                )
+            };
+            if ret != 0 {
+                tracing::warn!(
+                    errno = std::io::Error::last_os_error().raw_os_error(),
+                    "faketcp connector: TCP_REPAIR failed, kernel may send RST"
                 );
             }
         }

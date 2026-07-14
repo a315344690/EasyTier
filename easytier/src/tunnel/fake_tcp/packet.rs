@@ -45,6 +45,7 @@ pub fn build_tcp_packet(
     flags: u8,
     payload: Option<&[u8]>,
     timestamps: Option<(u32, u32)>,
+    ip_id: u16,
 ) -> Bytes {
     let ip_header_len = match local_addr {
         SocketAddr::V4(_) => IPV4_HEADER_LEN,
@@ -118,6 +119,7 @@ pub fn build_tcp_packet(
             v4.set_header_length(IPV4_HEADER_LEN as u8 / 4);
             v4.set_next_level_protocol(ip::IpNextHeaderProtocols::Tcp);
             v4.set_ttl(64);
+            v4.set_identification(ip_id);
             v4.set_source(*local.ip());
             v4.set_destination(*remote.ip());
             v4.set_total_length(total_len.try_into().unwrap());
@@ -217,6 +219,7 @@ mod tests {
             tcp::TcpFlags::ACK,
             Some(payload),
             None,
+            1,
         );
 
         let (parsed_src_mac, parsed_dst_mac, ip_packet, tcp_packet) =
@@ -249,6 +252,7 @@ mod tests {
             tcp::TcpFlags::ACK,
             Some(payload),
             None,
+            1,
         );
 
         let ethernet = EthernetPacket::new(packet.as_ref()).unwrap();
@@ -284,6 +288,7 @@ mod tests {
             tcp::TcpFlags::ACK,
             None,
             None,
+            1,
         );
         let truncated = Bytes::copy_from_slice(&packet[..ETH_HDR_LEN + IPV4_HEADER_LEN + 10]);
 
@@ -302,6 +307,7 @@ mod tests {
             tcp::TcpFlags::ACK,
             None,
             None,
+            1,
         );
         let truncated = Bytes::copy_from_slice(&packet[..ETH_HDR_LEN + IPV6_HEADER_LEN - 1]);
 

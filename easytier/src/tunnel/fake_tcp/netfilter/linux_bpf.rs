@@ -826,6 +826,8 @@ mod tests {
             0,
             TcpFlags::SYN,
             Some(b"ping"),
+            None,
+            1,
         );
 
         send_raw_frame(&ifname, &frame).unwrap();
@@ -878,6 +880,8 @@ mod tests {
             0,
             TcpFlags::SYN,
             Some(b"nope"),
+            None,
+            1,
         );
         send_raw_frame(&ifname, &non_matching).unwrap();
 
@@ -902,6 +906,8 @@ mod tests {
             0,
             TcpFlags::SYN,
             Some(b"ok"),
+            None,
+            2,
         );
         send_raw_frame(&ifname, &matching).unwrap();
 
