@@ -58,7 +58,6 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, info, trace, warn};
 
 const TIMEOUT: time::Duration = time::Duration::from_secs(1);
-const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 4096;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
 const ACK_THRESHOLD: u32 = 4096; // 4KB: send immediate standalone ACK frequently to avoid sender stall
@@ -180,8 +179,6 @@ pub struct Socket {
     seq: AtomicU32,
     ack: AtomicU32,
     last_ack: AtomicU32,
-    remote_ack: AtomicU32,
-    remote_window: AtomicU32,
     ts_base: std::time::Instant,
     remote_tsval: AtomicU32,
     ip_id: AtomicU16,
@@ -222,8 +219,6 @@ impl Socket {
                 seq: AtomicU32::new(seq),
                 ack: AtomicU32::new(ack),
                 last_ack: AtomicU32::new(ack),
-                remote_ack: AtomicU32::new(seq),
-                remote_window: AtomicU32::new(0xFFFF << 14),
                 ts_base: system_boot_instant(),
                 remote_tsval: AtomicU32::new(0),
                 ip_id: AtomicU16::new(1),
@@ -266,16 +261,6 @@ impl Socket {
     pub fn try_send(&self, payload: &[u8]) -> Option<()> {
         match self.state.load() {
             State::Established => {
-                let remote_ack = self.remote_ack.load(Ordering::Relaxed);
-                let current_seq = self.seq.load(Ordering::Relaxed);
-                let unacked = current_seq.wrapping_sub(remote_ack);
-
-                if unacked > MAX_UNACKED_LEN {
-                    tracing::trace!("unacked {} exceeds limit, dropping send", unacked);
-                    self.send_ack();
-                    return Some(());
-                }
-
                 let seq = self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
                 let buf = self.build_tcp_packet_with_seq(
                     tcp::TcpFlags::ACK,
@@ -291,15 +276,6 @@ impl Socket {
     pub fn build_packet(&self, payload: &[u8]) -> Option<Bytes> {
         match self.state.load() {
             State::Established => {
-                let remote_ack = self.remote_ack.load(Ordering::Relaxed);
-                let current_seq = self.seq.load(Ordering::Relaxed);
-                let unacked = current_seq.wrapping_sub(remote_ack);
-
-                if unacked > MAX_UNACKED_LEN {
-                    self.send_ack();
-                    return None;
-                }
-
                 let seq = self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
                 let buf = self.build_tcp_packet_with_seq(
                     tcp::TcpFlags::ACK,
@@ -325,6 +301,7 @@ impl Socket {
         let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
         let _ = self.tun.try_send(&buf);
     }
+
 
     pub fn close(&self) {
         if self.state.load() != State::Idle {
@@ -363,21 +340,6 @@ impl Socket {
                     }
 
                     if (meta.flags & tcp::TcpFlags::ACK) != 0 {
-                        let _ = self.remote_ack.fetch_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |current| {
-                                let diff = meta.ack.wrapping_sub(current);
-                                if diff > 0 && diff < MAX_UNACKED_LEN {
-                                    Some(meta.ack)
-                                } else {
-                                    None
-                                }
-                            },
-                        );
-
-                        self.remote_window.store((meta.window as u32) << 14, Ordering::Relaxed);
-
                         if let Some(tsval) = meta.tsval {
                             self.remote_tsval.store(tsval, Ordering::Relaxed);
                         }
@@ -430,9 +392,7 @@ impl Socket {
                     if (meta.flags & expected_flag) == expected_flag {
                         let initial_seq = meta.ack;
                         self.seq.store(initial_seq, Ordering::Relaxed);
-                        self.remote_ack.store(initial_seq, Ordering::Relaxed);
-                        self.ack.store(meta.seq + 1, Ordering::Relaxed);
-                        self.remote_window.store((meta.window as u32) << 14, Ordering::Relaxed);
+                        self.ack.store(meta.seq.wrapping_add(1), Ordering::Relaxed);
                         self.remote_mac.store(Some(meta.src_mac));
                         if let Some(tsval) = meta.tsval {
                             self.remote_tsval.store(tsval, Ordering::Relaxed);

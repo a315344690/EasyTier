@@ -365,7 +365,7 @@ impl TunnelListener for FakeTcpTunnelListener {
     async fn accept(&mut self) -> Result<Box<dyn Tunnel>, TunnelError> {
         tracing::debug!("FakeTcpTunnelListener waiting for accept");
         #[cfg(target_os = "linux")]
-        let mut nft_guard = None::<netfilter_guard::NftGuard>;
+        let mut nft_guard;
 
         let (res, stack, socket) = loop {
             let res = self.do_accept().await?;
