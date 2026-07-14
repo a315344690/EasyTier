@@ -369,12 +369,21 @@ fn read_packet_socket_stats(fd: i32) -> io::Result<PacketSocketStats> {
     Ok(stats)
 }
 
+struct SendBufs {
+    iovecs: Vec<libc::iovec>,
+    addrs: Vec<libc::sockaddr_ll>,
+    msgvec: Vec<libc::mmsghdr>,
+}
+
+const SEND_BATCH_CAPACITY: usize = 64;
+
 pub struct LinuxBpfTun {
     fd: Arc<OwnedFd>,
     ifindex: i32,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     recv_queue: Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    send_bufs: std::sync::Mutex<SendBufs>,
 }
 
 impl LinuxBpfTun {
@@ -594,6 +603,11 @@ impl LinuxBpfTun {
             stop,
             worker: Some(worker),
             recv_queue: Mutex::new(rx),
+            send_bufs: std::sync::Mutex::new(SendBufs {
+                iovecs: Vec::with_capacity(SEND_BATCH_CAPACITY),
+                addrs: Vec::with_capacity(SEND_BATCH_CAPACITY),
+                msgvec: Vec::with_capacity(SEND_BATCH_CAPACITY),
+            }),
         })
     }
 }
@@ -662,9 +676,10 @@ impl stack::Tun for LinuxBpfTun {
             return self.try_send(&packets[0]).map(|_| 1);
         }
 
-        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(packets.len());
-        let mut addrs: Vec<libc::sockaddr_ll> = Vec::with_capacity(packets.len());
-        let mut msgvec: Vec<libc::mmsghdr> = Vec::with_capacity(packets.len());
+        let mut bufs = self.send_bufs.lock().unwrap();
+        bufs.iovecs.clear();
+        bufs.addrs.clear();
+        bufs.msgvec.clear();
 
         for pkt in packets {
             if pkt.len() < 6 {
@@ -677,28 +692,28 @@ impl stack::Tun for LinuxBpfTun {
             addr.sll_ifindex = self.ifindex;
             addr.sll_halen = 6;
             addr.sll_addr[..6].copy_from_slice(&pkt[..6]);
-            addrs.push(addr);
+            bufs.addrs.push(addr);
 
-            iovecs.push(libc::iovec {
+            bufs.iovecs.push(libc::iovec {
                 iov_base: pkt.as_ptr() as *mut libc::c_void,
                 iov_len: pkt.len(),
             });
         }
 
-        for i in 0..iovecs.len() {
+        for i in 0..bufs.iovecs.len() {
             let mut msghdr: libc::mmsghdr = unsafe { mem::zeroed() };
-            msghdr.msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+            msghdr.msg_hdr.msg_iov = &mut bufs.iovecs[i] as *mut libc::iovec;
             msghdr.msg_hdr.msg_iovlen = 1;
-            msghdr.msg_hdr.msg_name = &mut addrs[i] as *mut _ as *mut libc::c_void;
+            msghdr.msg_hdr.msg_name = &mut bufs.addrs[i] as *mut _ as *mut libc::c_void;
             msghdr.msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_ll>() as u32;
-            msgvec.push(msghdr);
+            bufs.msgvec.push(msghdr);
         }
 
         let ret = unsafe {
             libc::sendmmsg(
                 self.fd.as_ref().as_raw_fd(),
-                msgvec.as_mut_ptr(),
-                msgvec.len() as u32,
+                bufs.msgvec.as_mut_ptr(),
+                bufs.msgvec.len() as u32,
                 0,
             )
         };

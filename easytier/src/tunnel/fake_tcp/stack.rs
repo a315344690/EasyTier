@@ -350,6 +350,9 @@ impl Socket {
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |current| {
+                            if current == 0 {
+                                return Some(new_ack);
+                            }
                             let diff = new_ack.wrapping_sub(current);
                             if diff > 0 && diff < MAX_UNACKED_LEN {
                                 Some(new_ack)
