@@ -540,6 +540,35 @@ impl FakeTcpTunnelConnector {
     }
 }
 
+/// Look up the next-hop MAC toward `dest` from the kernel neighbour table (netlink).
+/// Used as a fallback when the SYN-ACK frame wasn't captured in time. Works for IPv4
+/// and IPv6; returns `None` on non-Linux platforms or if the lookup fails.
+async fn next_hop_mac_fallback(dest: IpAddr) -> Option<MacAddr> {
+    #[cfg(target_os = "linux")]
+    {
+        let mac = tokio::task::spawn_blocking(move || crate::common::ifcfg::get_next_hop_mac(dest))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten()
+            .map(|b| MacAddr::new(b[0], b[1], b[2], b[3], b[4], b[5]));
+        if mac.is_some() {
+            tracing::info!(?mac, "faketcp connector: next-hop MAC via netlink");
+        } else {
+            tracing::warn!(
+                ?dest,
+                "faketcp connector: SYN-ACK timeout and netlink MAC lookup failed"
+            );
+        }
+        mac
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dest;
+        None
+    }
+}
+
 fn get_local_ip_for_destination(destination: IpAddr) -> Option<IpAddr> {
     // 使用一个不可路由的、私有的、或回环地址创建一个临时的 socket，让内核自动选择源接口。
     // 对于 IPv4，使用 0.0.0.0; 对于 IPv6，使用 ::
@@ -599,11 +628,18 @@ impl TunnelConnector for FakeTcpTunnelConnector {
 
         let os_stream = os_socket.connect(remote_addr).await?;
 
-        // Capture SYN-ACK from the BPF tun to learn the next-hop MAC address
-        // and remote TCP timestamp. The BPF worker is already running and will
-        // have queued the SYN-ACK before we get here.
+        // Learn the next-hop MAC address (and, if available, the remote TCP timestamp).
+        //
+        // Fast path: the SYN-ACK the kernel just received during connect() is also captured
+        // by the BPF tun, and carries both the next-hop MAC (Ethernet source) and the remote
+        // TSval. A short timeout keeps us from stalling if the frame was missed.
+        //
+        // Fallback: if the SYN-ACK isn't captured in time, look up the next-hop MAC from the
+        // kernel neighbour table via netlink (the entry is guaranteed present after a
+        // successful connect). This path cannot recover the remote TSval, so it stays 0 and
+        // is learned later from the first inbound packet in Socket::recv().
         let (remote_mac, remote_tsval) = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(200),
             tun.recv(),
         )
         .await
@@ -622,14 +658,12 @@ impl TunnelConnector for FakeTcpTunnelConnector {
                             u32::from_be_bytes(opt.payload()[0..4].try_into().unwrap())
                         })
                         .unwrap_or(0);
+                    tracing::info!(?src_mac, tsval, "faketcp connector: captured SYN-ACK");
                     (Some(src_mac), tsval)
                 }
-                None => (None, 0),
+                None => (next_hop_mac_fallback(remote_addr.ip()).await, 0),
             },
-            _ => {
-                tracing::warn!("faketcp connector: failed to capture SYN-ACK for remote_mac");
-                (None, 0)
-            }
+            _ => (next_hop_mac_fallback(remote_addr.ip()).await, 0),
         };
 
         let (seq, ack, ts_offset) = get_tcp_seq_ack(&os_stream).map_err(|e| {

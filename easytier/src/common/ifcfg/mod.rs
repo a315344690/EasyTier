@@ -189,6 +189,11 @@ pub(crate) fn get_interface_index(name: &str) -> Result<u32, Error> {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn get_next_hop_mac(dest: std::net::IpAddr) -> Result<Option<[u8; 6]>, Error> {
+    netlink::NetlinkIfConfiger::get_next_hop_mac(dest)
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn add_ipv6_ndp_proxy(name: &str, address: Ipv6Addr) -> Result<(), Error> {
     netlink::NetlinkIfConfiger::add_ipv6_ndp_proxy(name, address)
 }

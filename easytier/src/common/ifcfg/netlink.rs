@@ -381,6 +381,167 @@ impl NetlinkIfConfiger {
         Self::list_route_messages(AddressFamily::Inet6)
     }
 
+    /// Resolve the route for `dest` (route get semantics) and return the next-hop IP
+    /// (gateway if present, else `dest` itself for on-link) and egress interface index.
+    fn route_get(dest: IpAddr) -> Result<(IpAddr, Option<u32>), Error> {
+        let (address_family, dst_prefix, dst_addr) = match dest {
+            IpAddr::V4(ip) => (AddressFamily::Inet, 32u8, RouteAddress::Inet(ip)),
+            IpAddr::V6(ip) => (AddressFamily::Inet6, 128u8, RouteAddress::Inet6(ip)),
+        };
+
+        let mut message = RouteMessage::default();
+        message.header.address_family = address_family;
+        message.header.destination_prefix_length = dst_prefix;
+        message
+            .attributes
+            .push(RouteAttribute::Destination(dst_addr));
+
+        let s = send_netlink_req(RouteNetlinkMessage::GetRoute(message), NLM_F_REQUEST)?;
+
+        let mut resp = Vec::<u8>::new();
+        loop {
+            if resp.is_empty() {
+                let (new_resp, _) = s.recv_from_full()?;
+                resp = new_resp;
+            }
+            let ret = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&resp)
+                .with_context(|| "Failed to deserialize netlink route-get message")?;
+            resp = resp.split_off(ret.buffer_len());
+
+            match ret.payload {
+                NetlinkPayload::Error(e) => {
+                    if e.code == NonZero::new(0) {
+                        continue;
+                    } else {
+                        return Err(e.to_io().into());
+                    }
+                }
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(m)) => {
+                    let mut gateway = None;
+                    let mut ifindex = None;
+                    for attr in m.attributes {
+                        match attr {
+                            RouteAttribute::Gateway(addr) => gateway = addr_to_ip(addr),
+                            RouteAttribute::Oif(i) => ifindex = Some(i),
+                            _ => {}
+                        }
+                    }
+                    // Gateway present -> off-link, next hop is the gateway.
+                    // Otherwise the destination is directly reachable (on-link).
+                    return Ok((gateway.unwrap_or(dest), ifindex));
+                }
+                NetlinkPayload::Done(_) => break,
+                p => {
+                    tracing::error!("Unexpected netlink route-get response: {:?}", p);
+                    return Err(anyhow::anyhow!("Unexpected netlink route-get response").into());
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("no route to {dest}").into())
+    }
+
+    /// Dump the neighbour (ARP/NDP) cache for `address_family` without the Proxy filter.
+    fn dump_neighbours(address_family: AddressFamily) -> Result<Vec<NeighbourMessage>, Error> {
+        let mut message = NeighbourMessage::default();
+        message.header.family = address_family;
+
+        let s = send_netlink_req(
+            RouteNetlinkMessage::GetNeighbour(message),
+            NLM_F_REQUEST | NLM_F_DUMP,
+        )?;
+
+        let mut ret_vec = vec![];
+        let mut resp = Vec::<u8>::new();
+        loop {
+            if resp.is_empty() {
+                let (new_resp, _) = s.recv_from_full()?;
+                resp = new_resp;
+            }
+            let ret = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&resp)
+                .with_context(|| "Failed to deserialize netlink neighbour message")?;
+            resp = resp.split_off(ret.buffer_len());
+
+            match ret.payload {
+                NetlinkPayload::Error(e) => {
+                    if e.code == NonZero::new(0) {
+                        continue;
+                    } else {
+                        return Err(e.to_io().into());
+                    }
+                }
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(m)) => {
+                    ret_vec.push(m);
+                }
+                NetlinkPayload::Done(_) => break,
+                p => {
+                    tracing::error!("Unexpected netlink neighbour response: {:?}", p);
+                    return Err(anyhow::anyhow!("Unexpected netlink neighbour response").into());
+                }
+            }
+        }
+
+        Ok(ret_vec)
+    }
+
+    /// Look up the link-layer (MAC) address of the next hop toward `dest`.
+    ///
+    /// After a successful TCP `connect()`, the kernel has already resolved the next hop via
+    /// ARP/NDP, so its entry is present in the neighbour cache. Works for both IPv4 and IPv6.
+    pub(crate) fn get_next_hop_mac(dest: IpAddr) -> Result<Option<[u8; 6]>, Error> {
+        let (next_hop, oif) = Self::route_get(dest)?;
+        let address_family = match next_hop {
+            IpAddr::V4(_) => AddressFamily::Inet,
+            IpAddr::V6(_) => AddressFamily::Inet6,
+        };
+
+        for msg in Self::dump_neighbours(address_family)? {
+            if let Some(oif) = oif
+                && msg.header.ifindex != oif
+            {
+                continue;
+            }
+            // Skip entries whose MAC is not resolvable.
+            if matches!(
+                msg.header.state,
+                NeighbourState::Incomplete | NeighbourState::Failed | NeighbourState::None
+            ) {
+                continue;
+            }
+
+            let mut dst_match = false;
+            let mut mac: Option<[u8; 6]> = None;
+            for attr in &msg.attributes {
+                match attr {
+                    NeighbourAttribute::Destination(NeighbourAddress::Inet(ip))
+                        if IpAddr::V4(*ip) == next_hop =>
+                    {
+                        dst_match = true;
+                    }
+                    NeighbourAttribute::Destination(NeighbourAddress::Inet6(ip))
+                        if IpAddr::V6(*ip) == next_hop =>
+                    {
+                        dst_match = true;
+                    }
+                    NeighbourAttribute::LinkLocalAddress(bytes) if bytes.len() == 6 => {
+                        mac = Some([
+                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+                        ]);
+                    }
+                    _ => {}
+                }
+            }
+
+            if dst_match {
+                if let Some(mac) = mac {
+                    return Ok(Some(mac));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     fn ipv6_ndp_proxy_message(name: &str, address: Ipv6Addr) -> Result<NeighbourMessage, Error> {
         let mut message = NeighbourMessage::default();
         message.header = NeighbourHeader {
