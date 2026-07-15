@@ -451,6 +451,8 @@ impl TunnelListener for FakeTcpTunnelListener {
                 seq,
                 ack,
                 ts_offset,
+                None,
+                0,
                 stack::State::Established,
             );
             let Some(socket) = socket else {
@@ -597,6 +599,39 @@ impl TunnelConnector for FakeTcpTunnelConnector {
 
         let os_stream = os_socket.connect(remote_addr).await?;
 
+        // Capture SYN-ACK from the BPF tun to learn the next-hop MAC address
+        // and remote TCP timestamp. The BPF worker is already running and will
+        // have queued the SYN-ACK before we get here.
+        let (remote_mac, remote_tsval) = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tun.recv(),
+        )
+        .await
+        {
+            Ok(Ok(frame)) => match packet::parse_ip_packet(&frame) {
+                Some((src_mac, _, _, tcp_pkt)) => {
+                    use pnet::packet::Packet as _;
+                    use pnet::packet::tcp::TcpOptionNumbers;
+                    let tsval = tcp_pkt
+                        .get_options_iter()
+                        .find(|opt| {
+                            opt.get_number() == TcpOptionNumbers::TIMESTAMPS
+                                && opt.payload().len() >= 4
+                        })
+                        .map(|opt| {
+                            u32::from_be_bytes(opt.payload()[0..4].try_into().unwrap())
+                        })
+                        .unwrap_or(0);
+                    (Some(src_mac), tsval)
+                }
+                None => (None, 0),
+            },
+            _ => {
+                tracing::warn!("faketcp connector: failed to capture SYN-ACK for remote_mac");
+                (None, 0)
+            }
+        };
+
         let (seq, ack, ts_offset) = get_tcp_seq_ack(&os_stream).map_err(|e| {
             TunnelError::InternalError(format!("faketcp: get_tcp_seq_ack failed: {e}"))
         })?;
@@ -615,13 +650,15 @@ impl TunnelConnector for FakeTcpTunnelConnector {
                 seq,
                 ack,
                 ts_offset,
+                remote_mac,
+                remote_tsval,
                 stack::State::Established,
             )
             .ok_or(TunnelError::InternalError(
                 "FakeTCP stack closed while allocating socket".into(),
             ))?;
 
-        tracing::info!(?remote_addr, seq, ack, "FakeTcpTunnelConnector connected");
+        tracing::info!(?remote_addr, seq, ack, ?remote_mac, "FakeTcpTunnelConnector connected");
 
         let info = TunnelInfo {
             tunnel_type: get_faketcp_tunnel_type_str(driver_type),

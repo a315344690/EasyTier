@@ -201,6 +201,7 @@ impl Socket {
         seq: u32,
         ack: u32,
         ts_offset: u32,
+        initial_remote_tsval: u32,
         state: State,
     ) -> (Socket, flume::Sender<DispatchItem>) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
@@ -219,7 +220,7 @@ impl Socket {
                 last_ack: AtomicU32::new(ack),
                 ts_base: system_boot_instant(),
                 ts_offset,
-                remote_tsval: AtomicU32::new(0),
+                remote_tsval: AtomicU32::new(initial_remote_tsval),
                 ip_id: AtomicU16::new(1),
                 state: AtomicCell::new(state),
             },
@@ -498,6 +499,8 @@ impl Stack {
         initial_seq: u32,
         initial_ack: u32,
         ts_offset: u32,
+        remote_mac: Option<MacAddr>,
+        initial_remote_tsval: u32,
         state: State,
     ) -> Option<Socket> {
         let tuple = AddrTuple::new(local_addr, remote_addr);
@@ -516,10 +519,11 @@ impl Stack {
             local_addr,
             remote_addr,
             self.local_mac,
-            None,
+            remote_mac,
             initial_seq,
             initial_ack,
             ts_offset,
+            initial_remote_tsval,
             state,
         );
         assert!(stack_state.tuples.insert(tuple, incoming).is_none());
@@ -735,6 +739,8 @@ mod tests {
                 0,
                 0,
                 0,
+                None,
+                0,
                 State::Established,
             )
             .expect("socket allocation should succeed before tun failure");
@@ -758,6 +764,8 @@ mod tests {
             SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 20_001),
             0,
             0,
+            0,
+            None,
             0,
             State::Established,
         );
