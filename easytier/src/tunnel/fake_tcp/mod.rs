@@ -256,11 +256,24 @@ fn build_os_socket_reader_task(mut socket: TcpStream) -> AbortOnDropHandle<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn get_tcp_seq_ack(socket: &TcpStream) -> (u32, u32) {
+fn get_tcp_seq_ack(socket: &TcpStream) -> std::io::Result<(u32, u32)> {
     use nix::libc;
     use std::os::unix::io::AsRawFd;
 
     let fd = socket.as_raw_fd();
+
+    let disable_repair = |fd: i32| {
+        let off: libc::c_int = 0;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                19, // TCP_REPAIR
+                &off as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&off) as libc::socklen_t,
+            );
+        }
+    };
 
     // Enter TCP_REPAIR mode to freeze the kernel TCP state machine
     let repair: libc::c_int = 1;
@@ -274,15 +287,13 @@ fn get_tcp_seq_ack(socket: &TcpStream) -> (u32, u32) {
         )
     };
     if ret != 0 {
-        tracing::warn!(
-            errno = std::io::Error::last_os_error().raw_os_error(),
-            "faketcp: TCP_REPAIR failed in get_tcp_seq_ack, using seq=0 ack=0"
-        );
-        return (0, 0);
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(errno = err.raw_os_error(), "faketcp: TCP_REPAIR failed");
+        return Err(err);
     }
 
-    // Get send seq: set queue to SEND (1), then read TCP_QUEUE_SEQ
-    let send_queue: libc::c_int = 1; // TCP_SEND_QUEUE
+    // Get send seq: set queue to SEND (2), then read TCP_QUEUE_SEQ
+    let send_queue: libc::c_int = 2; // TCP_SEND_QUEUE
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -293,11 +304,10 @@ fn get_tcp_seq_ack(socket: &TcpStream) -> (u32, u32) {
         )
     };
     if ret != 0 {
-        tracing::warn!(
-            errno = std::io::Error::last_os_error().raw_os_error(),
-            "faketcp: TCP_REPAIR_QUEUE(SEND) failed, using seq=0 ack=0"
-        );
-        return (0, 0);
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(errno = err.raw_os_error(), "faketcp: TCP_REPAIR_QUEUE(SEND) failed");
+        disable_repair(fd);
+        return Err(err);
     }
     let mut seq: u32 = 0;
     let mut len = std::mem::size_of::<u32>() as libc::socklen_t;
@@ -311,15 +321,14 @@ fn get_tcp_seq_ack(socket: &TcpStream) -> (u32, u32) {
         )
     };
     if ret != 0 {
-        tracing::warn!(
-            errno = std::io::Error::last_os_error().raw_os_error(),
-            "faketcp: TCP_QUEUE_SEQ(SEND) getsockopt failed, using seq=0 ack=0"
-        );
-        return (0, 0);
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(errno = err.raw_os_error(), "faketcp: TCP_QUEUE_SEQ(SEND) getsockopt failed");
+        disable_repair(fd);
+        return Err(err);
     }
 
-    // Get recv ack: set queue to RECV (0), then read TCP_QUEUE_SEQ
-    let recv_queue: libc::c_int = 0; // TCP_RECV_QUEUE
+    // Get recv ack: set queue to RECV (1), then read TCP_QUEUE_SEQ
+    let recv_queue: libc::c_int = 1; // TCP_RECV_QUEUE
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -330,11 +339,10 @@ fn get_tcp_seq_ack(socket: &TcpStream) -> (u32, u32) {
         )
     };
     if ret != 0 {
-        tracing::warn!(
-            errno = std::io::Error::last_os_error().raw_os_error(),
-            "faketcp: TCP_REPAIR_QUEUE(RECV) failed, using seq=0 ack=0"
-        );
-        return (0, 0);
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(errno = err.raw_os_error(), "faketcp: TCP_REPAIR_QUEUE(RECV) failed");
+        disable_repair(fd);
+        return Err(err);
     }
     let mut ack: u32 = 0;
     len = std::mem::size_of::<u32>() as libc::socklen_t;
@@ -348,20 +356,19 @@ fn get_tcp_seq_ack(socket: &TcpStream) -> (u32, u32) {
         )
     };
     if ret != 0 {
-        tracing::warn!(
-            errno = std::io::Error::last_os_error().raw_os_error(),
-            "faketcp: TCP_QUEUE_SEQ(RECV) getsockopt failed, using seq=0 ack=0"
-        );
-        return (0, 0);
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(errno = err.raw_os_error(), "faketcp: TCP_QUEUE_SEQ(RECV) getsockopt failed");
+        disable_repair(fd);
+        return Err(err);
     }
 
     tracing::info!(seq, ack, "faketcp: got TCP seq/ack via TCP_REPAIR");
-    (seq, ack)
+    Ok((seq, ack))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn get_tcp_seq_ack(_socket: &TcpStream) -> (u32, u32) {
-    (0, 0)
+fn get_tcp_seq_ack(_socket: &TcpStream) -> std::io::Result<(u32, u32)> {
+    Ok((0, 0))
 }
 
 #[derive(Debug)]
@@ -398,7 +405,13 @@ impl TunnelListener for FakeTcpTunnelListener {
 
         let (res, stack, socket) = loop {
             let res = self.do_accept().await?;
-            let (seq, ack) = get_tcp_seq_ack(&res.socket);
+            let (seq, ack) = match get_tcp_seq_ack(&res.socket) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(?e, remote = %res.remote_addr, "faketcp accept: get_tcp_seq_ack failed, dropping connection");
+                    continue;
+                }
+            };
 
             #[cfg(target_os = "linux")]
             let cur_nft_guard = netfilter_guard::NftGuard::new(
@@ -558,7 +571,9 @@ impl TunnelConnector for FakeTcpTunnelConnector {
 
         let os_stream = os_socket.connect(remote_addr).await?;
 
-        let (seq, ack) = get_tcp_seq_ack(&os_stream);
+        let (seq, ack) = get_tcp_seq_ack(&os_stream).map_err(|e| {
+            TunnelError::InternalError(format!("faketcp: get_tcp_seq_ack failed: {e}"))
+        })?;
 
         #[cfg(target_os = "linux")]
         let nft_guard = netfilter_guard::NftGuard::new(local_addr, remote_addr);
