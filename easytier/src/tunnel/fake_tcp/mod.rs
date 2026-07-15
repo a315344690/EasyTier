@@ -256,7 +256,7 @@ fn build_os_socket_reader_task(mut socket: TcpStream) -> AbortOnDropHandle<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn get_tcp_seq_ack(socket: &TcpStream) -> std::io::Result<(u32, u32)> {
+fn get_tcp_seq_ack(socket: &TcpStream) -> std::io::Result<(u32, u32, u32)> {
     use nix::libc;
     use std::os::unix::io::AsRawFd;
 
@@ -362,13 +362,38 @@ fn get_tcp_seq_ack(socket: &TcpStream) -> std::io::Result<(u32, u32)> {
         return Err(err);
     }
 
-    tracing::info!(seq, ack, "faketcp: got TCP seq/ack via TCP_REPAIR");
-    Ok((seq, ack))
+    // Read the kernel's TCP timestamp (includes per-destination tsoffset)
+    let mut kernel_ts: u32 = 0;
+    len = std::mem::size_of::<u32>() as libc::socklen_t;
+    let ts_offset = {
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                24, // TCP_TIMESTAMP
+                &mut kernel_ts as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if ret != 0 {
+            tracing::warn!(
+                errno = std::io::Error::last_os_error().raw_os_error(),
+                "faketcp: TCP_TIMESTAMP getsockopt failed, using ts_offset=0"
+            );
+            0u32
+        } else {
+            let current_raw_ts = stack::system_boot_instant().elapsed().as_millis() as u32;
+            kernel_ts.wrapping_sub(current_raw_ts)
+        }
+    };
+
+    tracing::info!(seq, ack, ts_offset, "faketcp: got TCP seq/ack/ts_offset via TCP_REPAIR");
+    Ok((seq, ack, ts_offset))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn get_tcp_seq_ack(_socket: &TcpStream) -> std::io::Result<(u32, u32)> {
-    Ok((0, 0))
+fn get_tcp_seq_ack(_socket: &TcpStream) -> std::io::Result<(u32, u32, u32)> {
+    Ok((0, 0, 0))
 }
 
 #[derive(Debug)]
@@ -405,7 +430,7 @@ impl TunnelListener for FakeTcpTunnelListener {
 
         let (res, stack, socket) = loop {
             let res = self.do_accept().await?;
-            let (seq, ack) = match get_tcp_seq_ack(&res.socket) {
+            let (seq, ack, ts_offset) = match get_tcp_seq_ack(&res.socket) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(?e, remote = %res.remote_addr, "faketcp accept: get_tcp_seq_ack failed, dropping connection");
@@ -425,6 +450,7 @@ impl TunnelListener for FakeTcpTunnelListener {
                 res.remote_addr,
                 seq,
                 ack,
+                ts_offset,
                 stack::State::Established,
             );
             let Some(socket) = socket else {
@@ -571,7 +597,7 @@ impl TunnelConnector for FakeTcpTunnelConnector {
 
         let os_stream = os_socket.connect(remote_addr).await?;
 
-        let (seq, ack) = get_tcp_seq_ack(&os_stream).map_err(|e| {
+        let (seq, ack, ts_offset) = get_tcp_seq_ack(&os_stream).map_err(|e| {
             TunnelError::InternalError(format!("faketcp: get_tcp_seq_ack failed: {e}"))
         })?;
 
@@ -588,6 +614,7 @@ impl TunnelConnector for FakeTcpTunnelConnector {
                 remote_addr,
                 seq,
                 ack,
+                ts_offset,
                 stack::State::Established,
             )
             .ok_or(TunnelError::InternalError(

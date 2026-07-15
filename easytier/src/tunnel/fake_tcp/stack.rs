@@ -60,7 +60,7 @@ const MPMC_BUFFER_LEN: usize = 4096;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
 const ACK_THRESHOLD: u32 = 4096; // 4KB: send immediate standalone ACK frequently to avoid sender stall
 
-fn system_boot_instant() -> std::time::Instant {
+pub(super) fn system_boot_instant() -> std::time::Instant {
     #[cfg(target_os = "linux")]
     {
         let mut ts = nix::libc::timespec {
@@ -176,6 +176,7 @@ pub struct Socket {
     ack: AtomicU32,
     last_ack: AtomicU32,
     ts_base: std::time::Instant,
+    ts_offset: u32,
     remote_tsval: AtomicU32,
     ip_id: AtomicU16,
     state: AtomicCell<State>,
@@ -199,6 +200,7 @@ impl Socket {
         remote_mac: Option<MacAddr>,
         seq: u32,
         ack: u32,
+        ts_offset: u32,
         state: State,
     ) -> (Socket, flume::Sender<DispatchItem>) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
@@ -216,6 +218,7 @@ impl Socket {
                 ack: AtomicU32::new(ack),
                 last_ack: AtomicU32::new(ack),
                 ts_base: system_boot_instant(),
+                ts_offset,
                 remote_tsval: AtomicU32::new(0),
                 ip_id: AtomicU16::new(1),
                 state: AtomicCell::new(state),
@@ -232,7 +235,7 @@ impl Socket {
         let ack = self.ack.load(Ordering::Relaxed);
         self.last_ack.store(ack, Ordering::Relaxed);
 
-        let tsval = self.ts_base.elapsed().as_millis() as u32;
+        let tsval = (self.ts_base.elapsed().as_millis() as u32).wrapping_add(self.ts_offset);
         let tsecr = self.remote_tsval.load(Ordering::Relaxed);
         let ip_id = self.ip_id.fetch_add(1, Ordering::Relaxed);
 
@@ -494,6 +497,7 @@ impl Stack {
         remote_addr: SocketAddr,
         initial_seq: u32,
         initial_ack: u32,
+        ts_offset: u32,
         state: State,
     ) -> Option<Socket> {
         let tuple = AddrTuple::new(local_addr, remote_addr);
@@ -515,6 +519,7 @@ impl Stack {
             None,
             initial_seq,
             initial_ack,
+            ts_offset,
             state,
         );
         assert!(stack_state.tuples.insert(tuple, incoming).is_none());
@@ -729,6 +734,7 @@ mod tests {
                 SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 20_000),
                 0,
                 0,
+                0,
                 State::Established,
             )
             .expect("socket allocation should succeed before tun failure");
@@ -750,6 +756,7 @@ mod tests {
         let new_socket = stack.try_alloc_established_socket(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 10_001),
             SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 20_001),
+            0,
             0,
             0,
             State::Established,
