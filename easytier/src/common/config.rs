@@ -37,7 +37,11 @@ pub fn gen_default_flags() -> Flags {
         dev_name: "".to_string(),
         enable_encryption: true,
         enable_ipv6: true,
-        mtu: 1380,
+        // Keep the on-wire IP packet well under common tunnel/overlay path MTUs
+        // (e.g. 1400). FakeTCP runs a userspace stack that sends DF-set packets
+        // but cannot process the resulting ICMP "fragmentation needed", so an
+        // oversized packet would be silently blackholed with no PMTUD recovery.
+        mtu: 1300,
         latency_first: false,
         enable_exit_node: false,
         proxy_forward_by_system: false,
