@@ -98,7 +98,9 @@ pub trait Tun: Send + Sync + 'static {
     fn try_send_batch(&self, packets: &[Bytes]) -> Result<usize, std::io::Error> {
         let mut sent = 0;
         for p in packets {
-            self.try_send(p)?;
+            if self.try_send(p).is_err() {
+                break;
+            }
             sent += 1;
         }
         Ok(sent)

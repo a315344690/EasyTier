@@ -971,7 +971,7 @@ impl NicCtx {
 
     fn do_forward_nic_to_peers_task(
         &mut self,
-        mut stream: Pin<Box<dyn ZCPacketStream>>,
+        stream: Pin<Box<dyn ZCPacketStream>>,
     ) -> Result<(), Error> {
         // read from nic and write to corresponding tunnel
         let Some(mgr) = self.peer_mgr.upgrade() else {
@@ -979,13 +979,17 @@ impl NicCtx {
         };
         let close_notifier = self.close_notifier.clone();
         self.tasks.spawn(async move {
-            while let Some(ret) = stream.next().await {
-                if ret.is_err() {
-                    tracing::error!("read from nic failed: {:?}", ret);
-                    break;
-                }
-                Self::do_forward_nic_to_peers(ret.unwrap(), mgr.as_ref()).await;
-            }
+            stream
+                .for_each_concurrent(Some(16), |ret| {
+                    let mgr = mgr.clone();
+                    async move {
+                        match ret {
+                            Ok(pkt) => Self::do_forward_nic_to_peers(pkt, mgr.as_ref()).await,
+                            Err(e) => tracing::error!("read from nic failed: {:?}", e),
+                        }
+                    }
+                })
+                .await;
             close_notifier.notify_one();
             tracing::error!("nic closed when recving from it");
         });

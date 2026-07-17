@@ -845,9 +845,11 @@ impl Stream for FakeTcpStream {
 }
 
 const FAKE_TCP_SINK_BATCH_SIZE: usize = 64;
+const MAX_COALESCED_PAYLOAD: usize = 1400;
 
 struct FakeTcpSink {
     socket: Arc<stack::Socket>,
+    raw_pending: BytesMut,
     pending: Vec<Bytes>,
 }
 
@@ -855,16 +857,35 @@ impl FakeTcpSink {
     fn new(socket: Arc<stack::Socket>) -> Self {
         Self {
             socket,
+            raw_pending: BytesMut::with_capacity(MAX_COALESCED_PAYLOAD),
             pending: Vec::with_capacity(FAKE_TCP_SINK_BATCH_SIZE),
         }
     }
 
+    fn seal_current_frame(&mut self) {
+        if self.raw_pending.is_empty() {
+            return;
+        }
+        if let Some(frame) = self.socket.build_packet(&self.raw_pending) {
+            self.pending.push(frame);
+        }
+        self.raw_pending.clear();
+    }
+
     fn do_flush(&mut self) {
+        self.seal_current_frame();
         if self.pending.is_empty() {
             return;
         }
-        self.socket.flush_batch(&self.pending);
-        self.pending.clear();
+        let sent = self.socket.flush_batch(&self.pending);
+        if sent >= self.pending.len() {
+            self.pending.clear();
+        } else if sent > 0 {
+            self.pending.drain(..sent);
+        } else if self.pending.len() > FAKE_TCP_SINK_BATCH_SIZE * 4 {
+            tracing::warn!("fake_tcp sink: dropping {} unsent frames due to persistent send failure", self.pending.len());
+            self.pending.clear();
+        }
     }
 }
 
@@ -887,9 +908,10 @@ impl Sink<SinkItem> for FakeTcpSink {
         packet.mut_tcp_tunnel_header().unwrap().len.set(len as u32);
         let data = packet.into_bytes();
 
-        if let Some(built) = self.socket.build_packet(&data) {
-            self.pending.push(built);
+        if self.raw_pending.len() + data.len() > MAX_COALESCED_PAYLOAD {
+            self.seal_current_frame();
         }
+        self.raw_pending.extend_from_slice(&data);
 
         Ok(())
     }
