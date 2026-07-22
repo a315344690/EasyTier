@@ -68,6 +68,8 @@ pub fn create_listener_by_url(
             IpScheme::FakeTcp => {
                 let mut l = tunnel::fake_tcp::FakeTcpTunnelListener::new(l.clone());
                 l.set_socket_mark(socket_mark);
+                let padding = &global_ctx.config.get_flags().faketcp_padding;
+                l.set_padding_mode(tunnel::fake_tcp::parse_padding_mode(padding));
                 l.boxed()
             }
             #[cfg(feature = "fakehttp")]

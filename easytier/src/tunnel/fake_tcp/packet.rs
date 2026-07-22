@@ -1,7 +1,9 @@
 use bytes::{Bytes, BytesMut};
+use pnet::packet::MutablePacket;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::{ip, ipv4, ipv6, tcp};
 use pnet::util::MacAddr;
+use rand::RngCore;
 use std::convert::TryInto;
 use std::net::{IpAddr, SocketAddr};
 
@@ -46,6 +48,8 @@ pub fn build_tcp_packet(
     payload: Option<&[u8]>,
     timestamps: Option<(u32, u32)>,
     ip_id: u16,
+    window: u16,
+    padding_len: usize,
 ) -> Bytes {
     let ip_header_len = match local_addr {
         SocketAddr::V4(_) => IPV4_HEADER_LEN,
@@ -53,10 +57,11 @@ pub fn build_tcp_packet(
     };
     let is_syn = (flags & tcp::TcpFlags::SYN) != 0;
     let has_ts = timestamps.is_some();
-    // Options: SYN adds NOP+WScale(4 bytes); Timestamp adds NOP+NOP+TS(12 bytes)
-    let options_len = if is_syn { 4 } else { 0 } + if has_ts { 12 } else { 0 };
+    // SYN: MSS(4)+NOP+NOP+SACK_PERM(2)+NOP+WScale(3)=12; TS: NOP+NOP+TS(10)=12
+    let options_len = if is_syn { 12 } else { 0 } + if has_ts { 12 } else { 0 };
     let tcp_header_len = TCP_HEADER_LEN + options_len;
-    let tcp_total_len = tcp_header_len + payload.map_or(0, |payload| payload.len());
+    let payload_len = payload.map_or(0, |p| p.len());
+    let tcp_total_len = tcp_header_len + payload_len + padding_len;
     let total_len = ip_header_len + tcp_total_len;
     let mut buf = BytesMut::zeroed(ETH_HDR_LEN + total_len);
 
@@ -66,8 +71,6 @@ pub fn build_tcp_packet(
     assert_eq!(0, buf.len());
 
     let mut tcp = tcp::MutableTcpPacket::new(&mut tcp_buf).unwrap();
-    // Mild window randomization using low bits of seq to avoid fingerprinting
-    let window = 0xFFFF_u16.wrapping_sub((seq as u16) & 0xFF);
     tcp.set_window(window);
     tcp.set_source(local_addr.port());
     tcp.set_destination(remote_addr.port());
@@ -79,6 +82,10 @@ pub fn build_tcp_packet(
         (true, true) => {
             let (tsval, tsecr) = timestamps.unwrap();
             tcp.set_options(&[
+                tcp::TcpOption::mss(1400),
+                tcp::TcpOption::nop(),
+                tcp::TcpOption::nop(),
+                tcp::TcpOption::sack_perm(),
                 tcp::TcpOption::nop(),
                 tcp::TcpOption::wscale(14),
                 tcp::TcpOption::nop(),
@@ -87,7 +94,14 @@ pub fn build_tcp_packet(
             ]);
         }
         (true, false) => {
-            tcp.set_options(&[tcp::TcpOption::nop(), tcp::TcpOption::wscale(14)]);
+            tcp.set_options(&[
+                tcp::TcpOption::mss(1400),
+                tcp::TcpOption::nop(),
+                tcp::TcpOption::nop(),
+                tcp::TcpOption::sack_perm(),
+                tcp::TcpOption::nop(),
+                tcp::TcpOption::wscale(14),
+            ]);
         }
         (false, true) => {
             let (tsval, tsecr) = timestamps.unwrap();
@@ -102,6 +116,12 @@ pub fn build_tcp_packet(
 
     if let Some(payload) = payload {
         tcp.set_payload(payload);
+    }
+
+    if padding_len > 0 {
+        let padding_start = tcp_header_len + payload_len;
+        rand::thread_rng()
+            .fill_bytes(&mut tcp.packet_mut()[padding_start..padding_start + padding_len]);
     }
 
     let mut ethernet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
@@ -220,6 +240,8 @@ mod tests {
             Some(payload),
             None,
             1,
+            0xFFFF,
+            0,
         );
 
         let (parsed_src_mac, parsed_dst_mac, ip_packet, tcp_packet) =
@@ -253,6 +275,8 @@ mod tests {
             Some(payload),
             None,
             1,
+            0xFFFF,
+            0,
         );
 
         let ethernet = EthernetPacket::new(packet.as_ref()).unwrap();
@@ -289,6 +313,8 @@ mod tests {
             None,
             None,
             1,
+            0xFFFF,
+            0,
         );
         let truncated = Bytes::copy_from_slice(&packet[..ETH_HDR_LEN + IPV4_HEADER_LEN + 10]);
 
@@ -308,6 +334,8 @@ mod tests {
             None,
             None,
             1,
+            0xFFFF,
+            0,
         );
         let truncated = Bytes::copy_from_slice(&packet[..ETH_HDR_LEN + IPV6_HEADER_LEN - 1]);
 

@@ -92,6 +92,8 @@ message FlagsInConfig {
   // (auto-set to 0x6846 if omitted). Uses suppress_prefixlength 0 to preserve
   // LAN routes, and throw routes for private/multicast bypassing.
   bool default_route = 45;
+
+  string faketcp_padding = 46;
 }
 
 message RpcDescriptor {

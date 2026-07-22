@@ -4,6 +4,8 @@ mod netfilter_guard;
 mod packet;
 mod stack;
 
+pub use stack::{PaddingMode, parse_padding_mode};
+
 use bytes::{Bytes, BytesMut};
 use futures::{Sink, Stream};
 use network_interface::NetworkInterfaceConfig;
@@ -91,6 +93,7 @@ pub struct FakeTcpTunnelListener {
     // a cache from ip addr to interface name
     ip_to_ifname: IpToIfNameCache,
     socket_mark: Option<u32>,
+    padding_mode: stack::PaddingMode,
 }
 
 impl FakeTcpTunnelListener {
@@ -101,7 +104,12 @@ impl FakeTcpTunnelListener {
             stack_map: DashMap::new(),
             ip_to_ifname: IpToIfNameCache::new(),
             socket_mark: None,
+            padding_mode: stack::PaddingMode::Off,
         }
+    }
+
+    pub fn set_padding_mode(&mut self, mode: stack::PaddingMode) {
+        self.padding_mode = mode;
     }
 
     pub fn set_socket_mark(&mut self, socket_mark: Option<u32>) {
@@ -454,6 +462,7 @@ impl TunnelListener for FakeTcpTunnelListener {
                 None,
                 0,
                 stack::State::Established,
+                self.padding_mode,
             );
             let Some(socket) = socket else {
                 tracing::warn!(
@@ -498,7 +507,7 @@ impl TunnelListener for FakeTcpTunnelListener {
 
         let socket = Arc::new(socket);
         let reader = FakeTcpStream::new(socket.clone());
-        let writer = FakeTcpSink::new(socket);
+        let writer = FakeTcpSink::new(socket, self.padding_mode);
 
         #[cfg(target_os = "linux")]
         let associate_data: Box<dyn std::any::Any + Send> = Box::new((
@@ -527,6 +536,7 @@ pub struct FakeTcpTunnelConnector {
     ip_to_if_name: IpToIfNameCache,
     resolved_addr: Option<SocketAddr>,
     socket_mark: Option<u32>,
+    padding_mode: stack::PaddingMode,
 }
 
 impl FakeTcpTunnelConnector {
@@ -536,7 +546,12 @@ impl FakeTcpTunnelConnector {
             ip_to_if_name: IpToIfNameCache::new(),
             resolved_addr: None,
             socket_mark: None,
+            padding_mode: stack::PaddingMode::Off,
         }
+    }
+
+    pub fn set_padding_mode(&mut self, mode: stack::PaddingMode) {
+        self.padding_mode = mode;
     }
 }
 
@@ -687,6 +702,7 @@ impl TunnelConnector for FakeTcpTunnelConnector {
                 remote_mac,
                 remote_tsval,
                 stack::State::Established,
+                self.padding_mode,
             )
             .ok_or(TunnelError::InternalError(
                 "FakeTCP stack closed while allocating socket".into(),
@@ -712,7 +728,7 @@ impl TunnelConnector for FakeTcpTunnelConnector {
 
         let socket = Arc::new(socket);
         let reader = FakeTcpStream::new(socket.clone());
-        let writer = FakeTcpSink::new(socket.clone());
+        let writer = FakeTcpSink::new(socket.clone(), self.padding_mode);
 
         #[cfg(target_os = "linux")]
         let associate_data: Box<dyn std::any::Any + Send> = Box::new((
@@ -763,11 +779,9 @@ impl FakeTcpStream {
     fn new(socket: Arc<stack::Socket>) -> Self {
         let ack_socket = socket.clone();
         let ack_task = AbortOnDropHandle::new(tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_millis(40));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
+                let jitter = rand::random::<u64>() % 100;
+                tokio::time::sleep(std::time::Duration::from_millis(150 + jitter)).await;
                 ack_socket.send_ack();
             }
         }));
@@ -851,14 +865,17 @@ struct FakeTcpSink {
     socket: Arc<stack::Socket>,
     raw_pending: BytesMut,
     pending: Vec<Bytes>,
+    max_payload: usize,
 }
 
 impl FakeTcpSink {
-    fn new(socket: Arc<stack::Socket>) -> Self {
+    fn new(socket: Arc<stack::Socket>, padding_mode: stack::PaddingMode) -> Self {
+        let max_payload = MAX_COALESCED_PAYLOAD - padding_mode.max_padding();
         Self {
             socket,
-            raw_pending: BytesMut::with_capacity(MAX_COALESCED_PAYLOAD),
+            raw_pending: BytesMut::with_capacity(max_payload),
             pending: Vec::with_capacity(FAKE_TCP_SINK_BATCH_SIZE),
+            max_payload,
         }
     }
 
@@ -908,7 +925,7 @@ impl Sink<SinkItem> for FakeTcpSink {
         packet.mut_tcp_tunnel_header().unwrap().len.set(len as u32);
         let data = packet.into_bytes();
 
-        if self.raw_pending.len() + data.len() > MAX_COALESCED_PAYLOAD {
+        if self.raw_pending.len() + data.len() > self.max_payload {
             self.seal_current_frame();
         }
         self.raw_pending.extend_from_slice(&data);
