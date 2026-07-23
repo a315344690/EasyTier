@@ -31,13 +31,15 @@ use tokio_util::task::AbortOnDropHandle;
 type ArcPeerConn = Arc<PeerConn>;
 type ConnMap = Arc<DashMap<PeerConnId, ArcPeerConn>>;
 
-fn calc_conn_score(conn: &PeerConn) -> Option<u64> {
-    let latency_us = conn.get_latency_us().max(1);
-    let loss_rate_percent = conn.get_loss_rate_percent() as u64;
-    if loss_rate_percent >= 100 {
+pub(crate) fn calc_score(latency_us: u64, loss_rate_percent: u64) -> Option<u64> {
+    if latency_us == 0 || loss_rate_percent >= 100 {
         return None;
     }
     Some(latency_us * 100 / (100 - loss_rate_percent))
+}
+
+fn calc_conn_score(conn: &PeerConn) -> Option<u64> {
+    calc_score(conn.get_latency_us(), conn.get_loss_rate_percent() as u64)
 }
 
 fn find_best_conn(conns: &DashMap<PeerConnId, ArcPeerConn>) -> Option<(PeerConnId, u64)> {

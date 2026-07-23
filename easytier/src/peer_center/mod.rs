@@ -27,22 +27,26 @@ pub type Digest = u64;
 
 impl From<Vec<PeerInfo>> for PeerInfoForGlobalMap {
     fn from(peers: Vec<PeerInfo>) -> Self {
+        use crate::peers::peer::calc_score;
         let mut peer_map = BTreeMap::new();
         for peer in peers {
-            let Some(min_lat) = peer
+            let Some(min_score) = peer
                 .conns
                 .iter()
-                .map(|conn| conn.stats.as_ref().unwrap().latency_us)
+                .filter_map(|conn| {
+                    let latency_us = conn.stats.as_ref().unwrap().latency_us;
+                    let loss_rate_percent = (conn.loss_rate * 100.0 + 0.5) as u64;
+                    calc_score(latency_us, loss_rate_percent)
+                })
                 .min()
             else {
                 continue;
             };
 
             let dp_info = DirectConnectedPeerInfo {
-                latency_ms: std::cmp::max(1, (min_lat as u32 / 1000) as i32),
+                latency_ms: std::cmp::max(1, (min_score / 1000) as i32),
             };
 
-            // sort conn info so hash result is stable
             peer_map.insert(peer.peer_id, dp_info);
         }
         PeerInfoForGlobalMap {

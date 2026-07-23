@@ -442,13 +442,18 @@ impl PeerCenterPeerManagerTrait for PeerMapWithPeerRpcManager {
         // TODO: currently latency between public server cannot be calculated because one public-server pair
         // has no connection between them. (hard to get latency from peer manager because it's hard to transfrom the peer id)
         // but it's fine because we don't want to too much traffic between public servers.
+        use crate::peers::peer::calc_score;
         let peers = self.peer_map.list_peers();
         let mut ret = PeerInfoForGlobalMap::default();
         for peer in peers {
             if let Some(conns) = self.peer_map.list_peer_conns(peer).await {
-                let Some(min_lat) = conns
+                let Some(min_score) = conns
                     .iter()
-                    .map(|conn| conn.stats.as_ref().unwrap().latency_us)
+                    .filter_map(|conn| {
+                        let latency_us = conn.stats.as_ref().unwrap().latency_us;
+                        let loss_rate_percent = (conn.loss_rate * 100.0 + 0.5) as u64;
+                        calc_score(latency_us, loss_rate_percent)
+                    })
                     .min()
                 else {
                     continue;
@@ -457,7 +462,7 @@ impl PeerCenterPeerManagerTrait for PeerMapWithPeerRpcManager {
                 ret.direct_peers.insert(
                     peer,
                     DirectConnectedPeerInfo {
-                        latency_ms: std::cmp::max(1, (min_lat as u32 / 1000) as i32),
+                        latency_ms: std::cmp::max(1, (min_score / 1000) as i32),
                     },
                 );
             }

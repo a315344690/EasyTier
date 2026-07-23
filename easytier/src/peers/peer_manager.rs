@@ -11,7 +11,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::JoinSet,
@@ -1013,6 +1013,7 @@ impl PeerManager {
                 crate::common::replay_window::ReplayWindow<8192>,
             > = std::collections::HashMap::new();
             let mut replay_pkt_counter: u32 = 0;
+            let forward_semaphore = Arc::new(Semaphore::new(256));
 
             while let Ok(ret) = recv_packet_from_chan(&mut recv).await {
                 let disable_relay_data = global_ctx.flags_arc().disable_relay_data;
@@ -1109,22 +1110,45 @@ impl PeerManager {
                     }
 
                     tracing::trace!(?to_peer_id, ?my_peer_id, "need forward");
-                    let tx_metrics = if from_peer_id == my_peer_id {
-                        Some(&traffic_metrics)
+                    if from_peer_id == my_peer_id {
+                        let ret = Self::send_msg_internal(
+                            &peers,
+                            &foreign_client,
+                            &relay_peer_map,
+                            Some(&traffic_metrics),
+                            ret,
+                            to_peer_id,
+                        )
+                        .await;
+                        if ret.is_err() {
+                            tracing::error!(?ret, ?to_peer_id, ?from_peer_id, "forward packet error");
+                        }
                     } else {
-                        None
-                    };
-                    let ret = Self::send_msg_internal(
-                        &peers,
-                        &foreign_client,
-                        &relay_peer_map,
-                        tx_metrics,
-                        ret,
-                        to_peer_id,
-                    )
-                    .await;
-                    if ret.is_err() {
-                        tracing::error!(?ret, ?to_peer_id, ?from_peer_id, "forward packet error");
+                        match forward_semaphore.clone().try_acquire_owned() {
+                            Ok(permit) => {
+                                let peers_c = peers.clone();
+                                let foreign_client_c = foreign_client.clone();
+                                let relay_peer_map_c = relay_peer_map.clone();
+                                tokio::spawn(async move {
+                                    let result = Self::send_msg_internal(
+                                        &peers_c,
+                                        &foreign_client_c,
+                                        &relay_peer_map_c,
+                                        None,
+                                        ret,
+                                        to_peer_id,
+                                    )
+                                    .await;
+                                    if result.is_err() {
+                                        tracing::debug!(?result, ?to_peer_id, ?from_peer_id, "forward packet error");
+                                    }
+                                    drop(permit);
+                                });
+                            }
+                            Err(_) => {
+                                tracing::debug!(?to_peer_id, ?from_peer_id, "forward semaphore full, dropping packet");
+                            }
+                        }
                     }
                 } else {
                     if packet_type == PacketType::RelayHandshake as u8
