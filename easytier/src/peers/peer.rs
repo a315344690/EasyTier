@@ -27,6 +27,29 @@ use tokio_util::task::AbortOnDropHandle;
 type ArcPeerConn = Arc<PeerConn>;
 type ConnMap = Arc<DashMap<PeerConnId, ArcPeerConn>>;
 
+fn calc_conn_score(conn: &PeerConn) -> Option<u64> {
+    let latency_us = conn.get_latency_us().max(1);
+    let loss_rate_percent = conn.get_loss_rate_percent() as u64;
+    if loss_rate_percent >= 100 {
+        return None;
+    }
+    Some(latency_us * 100 / (100 - loss_rate_percent))
+}
+
+fn find_best_conn(conns: &DashMap<PeerConnId, ArcPeerConn>) -> Option<(PeerConnId, u64)> {
+    let mut best_score = u64::MAX;
+    let mut best_id = None;
+    for conn in conns.iter() {
+        if let Some(score) = calc_conn_score(conn.value()) {
+            if score < best_score {
+                best_score = score;
+                best_id = Some(conn.get_conn_id());
+            }
+        }
+    }
+    best_id.map(|id| (id, best_score))
+}
+
 pub struct Peer {
     pub peer_node_id: PeerId,
     conns: ConnMap,
@@ -110,9 +133,24 @@ impl Peer {
         let default_conn_id_clear_task = AbortOnDropHandle::new(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if conns_copy.len() > 1 {
-                    default_conn_id_copy.store(PeerConnId::default());
+                if conns_copy.len() <= 1 {
+                    continue;
                 }
+
+                let Some((best_id, best_score)) = find_best_conn(&conns_copy) else {
+                    continue;
+                };
+
+                let current_id = default_conn_id_copy.load();
+                if let Some(current_conn) = conns_copy.get(&current_id) {
+                    if let Some(current_score) = calc_conn_score(current_conn.value()) {
+                        if current_score * 5 <= best_score * 6 {
+                            continue;
+                        }
+                    }
+                }
+
+                default_conn_id_copy.store(best_id);
             }
         }));
 
@@ -192,19 +230,17 @@ impl Peer {
             return Some(conn.clone());
         }
 
-        // find a conn with the smallest latency
-        let mut min_latency = u64::MAX;
-        for conn in self.conns.iter() {
-            let latency = conn.value().get_stats().latency_us;
-            if latency < min_latency {
-                min_latency = latency;
-                self.default_conn_id.store(conn.get_conn_id());
-            }
+        let best_id = find_best_conn(&self.conns)
+            .map(|(id, _)| id)
+            .or_else(|| self.conns.iter().next().map(|conn| conn.get_conn_id()))?;
+
+        self.default_conn_id.store(best_id);
+        if let Some(conn) = self.conns.get(&best_id) {
+            return Some(conn.clone());
         }
 
-        self.conns
-            .get(&self.default_conn_id.load())
-            .map(|conn| conn.clone())
+        self.default_conn_id.store(PeerConnId::default());
+        None
     }
 
     pub async fn send_msg(&self, msg: ZCPacket) -> Result<(), Error> {

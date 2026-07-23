@@ -1535,6 +1535,14 @@ impl PeerConn {
         }
     }
 
+    pub fn get_loss_rate_percent(&self) -> u32 {
+        self.loss_rate_stats.load(Ordering::Relaxed)
+    }
+
+    pub fn get_latency_us(&self) -> u64 {
+        self.latency_stats.get_latency_us()
+    }
+
     pub fn get_conn_info(&self) -> PeerConnInfo {
         let info = self.info.as_ref().unwrap();
         PeerConnInfo {
@@ -1544,7 +1552,7 @@ impl PeerConn {
             features: info.features.clone(),
             tunnel: self.tunnel_info.clone(),
             stats: Some(self.get_stats()),
-            loss_rate: (f64::from(self.loss_rate_stats.load(Ordering::Relaxed)) / 100.0) as f32,
+            loss_rate: (f64::from(self.get_loss_rate_percent()) / 100.0) as f32,
             is_client: self.is_client.unwrap_or_default(),
             network_name: info.network_name.clone(),
             is_closed: self.close_event_notifier.is_closed(),
