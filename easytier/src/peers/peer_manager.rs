@@ -1008,6 +1008,12 @@ impl PeerManager {
 
         self.tasks.lock().await.spawn(async move {
             tracing::trace!("start_peer_recv");
+            let mut peer_replay: std::collections::HashMap<
+                PeerId,
+                crate::common::replay_window::ReplayWindow<8192>,
+            > = std::collections::HashMap::new();
+            let mut replay_pkt_counter: u32 = 0;
+
             while let Ok(ret) = recv_packet_from_chan(&mut recv).await {
                 let disable_relay_data = global_ctx.flags_arc().disable_relay_data;
                 let Err(mut ret) = Self::try_handle_foreign_network_packet(
@@ -1033,6 +1039,8 @@ impl PeerManager {
                 let from_peer_id = hdr.from_peer_id.get();
                 let to_peer_id = hdr.to_peer_id.get();
                 let packet_type = hdr.packet_type;
+                let forward_counter = hdr.forward_counter;
+                let pkt_seq = hdr.seq.get();
                 let is_encrypted = hdr.is_encrypted();
                 if to_peer_id != my_peer_id {
                     if disable_relay_data && is_relay_data_packet {
@@ -1142,6 +1150,25 @@ impl PeerManager {
                                 continue;
                             }
                         }
+                    }
+
+                    // Dedup direct data packets via per-peer replay window.
+                    // Relayed packets (forward_counter > 1) are skipped because their
+                    // seq is assigned by the relay node's independent counter.
+                    if traffic_kind(packet_type) == TrafficKind::Data
+                        && forward_counter == 1
+                    {
+                        let window = peer_replay
+                            .entry(from_peer_id)
+                            .or_default();
+                        if !window.accept(pkt_seq as u64) {
+                            continue;
+                        }
+                    }
+
+                    replay_pkt_counter = replay_pkt_counter.wrapping_add(1);
+                    if replay_pkt_counter % 65536 == 0 {
+                        peer_replay.retain(|peer_id, _| peers.has_peer(*peer_id));
                     }
 
                     self_rx_bytes.add(buf_len as u64);

@@ -123,6 +123,7 @@ pub struct PeerManagerHeader {
     pub forward_counter: u8,
     reserved: u8,
     pub len: U32<DefaultEndian>,
+    pub seq: U32<DefaultEndian>,
 }
 pub const PEER_MANAGER_HEADER_SIZE: usize = std::mem::size_of::<PeerManagerHeader>();
 
@@ -366,8 +367,8 @@ const PAYLOAD_OFFSET_FOR_NIC_PACKET: usize = max(
     WG_TUNNEL_HEADER_SIZE,
 ) + PEER_MANAGER_HEADER_SIZE;
 
-// UDP Tunnel: TUN MTU + 24 (Easy) + 20 (Encrypted) + 8(UDP) + 20(IP) = TUN MTU + 72
-// TCP Tunnel: TUN MTU + 20 (Easy) + 20 (Encrypted) + 20(TCP) + 20(IP) = TUN MTU + 80
+// UDP Tunnel: TUN MTU + 28 (Easy) + 20 (Encrypted) + 8(UDP) + 20(IP) = TUN MTU + 76
+// TCP Tunnel: TUN MTU + 24 (Easy) + 20 (Encrypted) + 20(TCP) + 20(IP) = TUN MTU + 84
 
 const INVALID_OFFSET: usize = usize::MAX;
 
@@ -643,6 +644,7 @@ impl ZCPacket {
         hdr.packet_type = packet_type;
         hdr.flags = 0;
         hdr.forward_counter = 1;
+        hdr.seq.set(0);
         hdr.len.set(payload_len as u32);
     }
 

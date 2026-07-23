@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
 
 use crossbeam::atomic::AtomicCell;
 use dashmap::{DashMap, DashSet};
@@ -11,6 +14,7 @@ use tracing::Instrument;
 use super::{
     PacketRecvChan,
     peer_conn::{PeerConn, PeerConnId},
+    traffic_metrics::{TrafficKind, traffic_kind},
 };
 use crate::{common::shrink_dashmap, proto::api::instance::PeerConnInfo};
 use crate::{
@@ -66,6 +70,8 @@ pub struct Peer {
     peer_identity_type: Arc<AtomicCell<Option<PeerIdentityType>>>,
     peer_public_key: Arc<RwLock<Option<Vec<u8>>>>,
     default_conn_id_clear_task: AbortOnDropHandle<()>,
+
+    send_seq: AtomicU32,
 }
 
 impl Peer {
@@ -82,9 +88,12 @@ impl Peer {
         let peer_public_key = Arc::new(RwLock::new(None));
         let peer_public_key_copy = peer_public_key.clone();
 
+        let default_conn_id = Arc::new(AtomicCell::new(PeerConnId::default()));
+
         let conns_copy = conns.clone();
         let shutdown_notifier_copy = shutdown_notifier.clone();
         let global_ctx_copy = global_ctx.clone();
+        let default_conn_id_for_listener = default_conn_id.clone();
         let close_event_listener = AbortOnDropHandle::new(tokio::spawn(
             async move {
                 loop {
@@ -109,6 +118,11 @@ impl Peer {
                                     peer_identity_type_copy.store(None);
                                     *peer_public_key_copy.write() = None;
                                 }
+                                if default_conn_id_for_listener.load() == ret {
+                                    if let Some((best_id, _)) = find_best_conn(&conns_copy) {
+                                        default_conn_id_for_listener.store(best_id);
+                                    }
+                                }
                             }
                         }
 
@@ -126,13 +140,11 @@ impl Peer {
             )),
         ));
 
-        let default_conn_id = Arc::new(AtomicCell::new(PeerConnId::default()));
-
         let conns_copy = conns.clone();
         let default_conn_id_copy = default_conn_id.clone();
         let default_conn_id_clear_task = AbortOnDropHandle::new(tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 if conns_copy.len() <= 1 {
                     continue;
                 }
@@ -168,6 +180,8 @@ impl Peer {
             peer_identity_type,
             peer_public_key,
             default_conn_id_clear_task,
+
+            send_seq: AtomicU32::new(rand::random()),
         }
     }
 
@@ -243,10 +257,16 @@ impl Peer {
         None
     }
 
-    pub async fn send_msg(&self, msg: ZCPacket) -> Result<(), Error> {
+    pub async fn send_msg(&self, mut msg: ZCPacket) -> Result<(), Error> {
         let Some(conn) = self.select_conn().await else {
             return Err(Error::PeerNoConnectionError(self.peer_node_id));
         };
+        if let Some(hdr) = msg.mut_peer_manager_header() {
+            if traffic_kind(hdr.packet_type) == TrafficKind::Data {
+                let seq = self.send_seq.fetch_add(1, Ordering::Relaxed);
+                hdr.seq.set(seq);
+            }
+        }
         conn.send_msg(msg).await?;
 
         Ok(())
