@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -6,8 +7,48 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windivert::prelude::{WinDivertFlags, WinDivertShutdownMode};
 use windivert::{WinDivert, layer};
 
+struct WinDivertHandle {
+    inner: UnsafeCell<WinDivert<layer::NetworkLayer>>,
+}
+
+unsafe impl Send for WinDivertHandle {}
+unsafe impl Sync for WinDivertHandle {}
+
+impl WinDivertHandle {
+    fn new(handle: WinDivert<layer::NetworkLayer>) -> Self {
+        Self {
+            inner: UnsafeCell::new(handle),
+        }
+    }
+
+    fn recv<'a>(
+        &self,
+        buffer: Option<&'a mut [u8]>,
+    ) -> Result<windivert::packet::WinDivertPacket<'a, layer::NetworkLayer>, windivert::error::WinDivertError>
+    {
+        let inner = unsafe { &*self.inner.get() };
+        inner.recv(buffer)
+    }
+
+    fn shutdown(&self) {
+        let inner = unsafe { &mut *self.inner.get() };
+        let _ = inner.shutdown(WinDivertShutdownMode::Recv);
+    }
+
+    fn close(&self) {
+        let inner = unsafe { &mut *self.inner.get() };
+        let _ = inner.close(windivert::CloseAction::Nothing);
+    }
+}
+
+impl Drop for WinDivertHandle {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 pub struct WinDivertGuard {
-    handle: Arc<WinDivert<layer::NetworkLayer>>,
+    handle: Arc<WinDivertHandle>,
     stop: Arc<AtomicBool>,
     _worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -18,9 +59,9 @@ impl WinDivertGuard {
         tracing::debug!(%filter, "WinDivertGuard created with filter");
 
         let flags = WinDivertFlags::default();
-        let handle =
+        let raw_handle =
             WinDivert::network(&filter, 100, flags).map_err(io::Error::other)?;
-        let handle = Arc::new(handle);
+        let handle = Arc::new(WinDivertHandle::new(raw_handle));
         let stop = Arc::new(AtomicBool::new(false));
 
         let worker_handle = handle.clone();
@@ -50,7 +91,7 @@ impl WinDivertGuard {
 impl Drop for WinDivertGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let _ = self.handle.shutdown(WinDivertShutdownMode::Recv);
+        self.handle.shutdown();
         if let Some(worker) = self._worker.take() {
             let _ = worker.join();
         }

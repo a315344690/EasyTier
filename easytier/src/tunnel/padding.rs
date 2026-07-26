@@ -21,19 +21,22 @@ pub fn effective_padding_max(config_value: u32) -> u32 {
 
 pub fn add_padding(pkt: &mut ZCPacket, max_padding: u32) {
     let clamped = max_padding.min(u16::MAX as u32);
-    let padding_len = if clamped == 0 {
-        0u16
-    } else {
-        PADDING_RNG.with(|rng| (rng.borrow_mut().next_u32() % (clamped + 1)) as u16)
-    };
+    PADDING_RNG.with(|rng| {
+        let mut rng = rng.borrow_mut();
+        let padding_len = if clamped == 0 {
+            0u16
+        } else {
+            (rng.next_u32() % (clamped + 1)) as u16
+        };
 
-    let buf = pkt.mut_inner();
-    if padding_len > 0 {
-        let start = buf.len();
-        buf.resize(start + padding_len as usize, 0);
-        PADDING_RNG.with(|rng| rng.borrow_mut().fill_bytes(&mut buf[start..]));
-    }
-    buf.extend_from_slice(&padding_len.to_le_bytes());
+        let buf = pkt.mut_inner();
+        if padding_len > 0 {
+            let start = buf.len();
+            buf.resize(start + padding_len as usize, 0);
+            rng.fill_bytes(&mut buf[start..]);
+        }
+        buf.extend_from_slice(&padding_len.to_le_bytes());
+    });
 }
 
 pub fn remove_padding(pkt: &mut ZCPacket) -> Result<(), crate::peers::encrypt::Error> {

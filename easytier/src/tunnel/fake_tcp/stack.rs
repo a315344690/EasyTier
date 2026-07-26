@@ -50,7 +50,7 @@ use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
 };
 use tokio::sync::broadcast;
 use tokio_util::task::AbortOnDropHandle;
@@ -60,6 +60,7 @@ const MPMC_BUFFER_LEN: usize = 4096;
 const MAX_UNACKED_LEN: u32 = u32::MAX / 2;
 const DEFAULT_WINDOW: u32 = 0x3400000; // ~54.5 MB
 const WINDOW_SCALE: u8 = 14;
+const KEEPALIVE_INTERVAL_MS: u64 = 20_000;
 
 
 
@@ -186,6 +187,7 @@ pub struct Socket {
     ip_id: AtomicU16,
     state: AtomicCell<State>,
     recv_window: AtomicU32,
+    last_send_time: AtomicU64,
 }
 
 /// A socket that represents a unique TCP connection between a server and client.
@@ -232,6 +234,7 @@ impl Socket {
                 ip_id: AtomicU16::new(rand::random()),
                 state: AtomicCell::new(state),
                 recv_window: AtomicU32::new(DEFAULT_WINDOW),
+                last_send_time: AtomicU64::new(0),
             },
             incoming_tx,
         )
@@ -293,6 +296,10 @@ impl Socket {
                     ack,
                     0,
                 );
+                self.last_send_time.store(
+                    self.ts_base.elapsed().as_millis() as u64,
+                    Ordering::Relaxed,
+                );
                 Some(buf)
             }
             _ => None,
@@ -309,11 +316,18 @@ impl Socket {
         }
         let ack = self.ack.load(Ordering::Relaxed);
         let last = self.last_ack.load(Ordering::Relaxed);
-        if ack == last {
+
+        let now_ms = self.ts_base.elapsed().as_millis() as u64;
+        let last_send_ms = self.last_send_time.load(Ordering::Relaxed);
+        let force_keepalive = now_ms.saturating_sub(last_send_ms) >= KEEPALIVE_INTERVAL_MS;
+
+        if ack == last && !force_keepalive {
             return;
         }
+
         let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
         let _ = self.tun.try_send(&buf);
+        self.last_send_time.store(now_ms, Ordering::Relaxed);
     }
 
 
