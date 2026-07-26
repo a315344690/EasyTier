@@ -220,6 +220,7 @@ pub struct SecureDatagramSession {
 
     send_cipher_algorithm: String,
     recv_cipher_algorithm: String,
+    padding_max: u32,
 
     invalidated: AtomicBool,
     decrypt_fail_count: AtomicU32,
@@ -261,6 +262,7 @@ impl SecureDatagramSession {
         initial_epoch: u32,
         send_cipher_algorithm: String,
         recv_cipher_algorithm: String,
+        padding_max: u32,
     ) -> Self {
         let rx_slots = [
             [EpochRxSlot::default(), EpochRxSlot::default()],
@@ -284,6 +286,7 @@ impl SecureDatagramSession {
             sync_rx_grace_expires_at_ms: AtomicU64::new(0),
             send_cipher_algorithm,
             recv_cipher_algorithm,
+            padding_max,
             invalidated: AtomicBool::new(false),
             decrypt_fail_count: AtomicU32::new(0),
         }
@@ -432,8 +435,8 @@ impl SecureDatagramSession {
             epoch,
             generation,
             valid: true,
-            send_cipher: Some(create_encryptor(&self.send_cipher_algorithm, key_128, key)),
-            recv_cipher: Some(create_encryptor(&self.recv_cipher_algorithm, key_128, key)),
+            send_cipher: Some(create_encryptor(&self.send_cipher_algorithm, key_128, key, self.padding_max)),
+            recv_cipher: Some(create_encryptor(&self.recv_cipher_algorithm, key_128, key, self.padding_max)),
         };
         let ret = slot.get_encryptor(is_send);
 
@@ -794,6 +797,7 @@ mod tests {
             initial_epoch,
             "aes-256-gcm".to_string(),
             "chacha20-poly1305".to_string(),
+            128,
         );
         let ba = SecureDatagramSession::new(
             root_key,
@@ -801,6 +805,7 @@ mod tests {
             initial_epoch,
             "chacha20-poly1305".to_string(),
             "aes-256-gcm".to_string(),
+            128,
         );
 
         let plaintext1 = b"hello from a";
@@ -823,6 +828,32 @@ mod tests {
     }
 
     #[test]
+    fn secure_datagram_padding_roundtrip() {
+        let root_key = SecureDatagramSession::new_root_key();
+        let ab = SecureDatagramSession::new(
+            root_key, 1, 0,
+            "aes-256-gcm".to_string(), "aes-256-gcm".to_string(), 128,
+        );
+        let ba = SecureDatagramSession::new(
+            root_key, 1, 0,
+            "aes-256-gcm".to_string(), "aes-256-gcm".to_string(), 128,
+        );
+
+        for i in 0..20 {
+            let text = format!("packet number {}", i);
+            let mut pkt = ZCPacket::new_with_payload(text.as_bytes());
+            pkt.fill_peer_manager_hdr(10, 20, PacketType::Data as u8);
+
+            ab.encrypt_payload(SecureDatagramDirection::AToB, &mut pkt).unwrap();
+            // Ciphertext should be larger than plaintext due to padding + AEAD tail
+            assert!(pkt.payload().len() > text.len());
+
+            ba.decrypt_payload(SecureDatagramDirection::AToB, &mut pkt).unwrap();
+            assert_eq!(pkt.payload(), text.as_bytes());
+        }
+    }
+
+    #[test]
     fn replay_rejects_far_future_epoch_without_poisoning_window() {
         let s = SecureDatagramSession::new(
             SecureDatagramSession::new_root_key(),
@@ -830,6 +861,7 @@ mod tests {
             0,
             "aes-256-gcm".to_string(),
             "aes-256-gcm".to_string(),
+            128,
         );
 
         let now = now_ms();
@@ -852,6 +884,7 @@ mod tests {
             0,
             "aes-256-gcm".to_string(),
             "aes-256-gcm".to_string(),
+            128,
         );
         let receiver = SecureDatagramSession::new(
             root_key,
@@ -859,6 +892,7 @@ mod tests {
             0,
             "aes-256-gcm".to_string(),
             "aes-256-gcm".to_string(),
+            128,
         );
 
         let mut pkt0 = ZCPacket::new_with_payload(b"pkt0");
@@ -939,6 +973,7 @@ mod tests {
             0,
             "aes-256-gcm".to_string(),
             "aes-256-gcm".to_string(),
+            128,
         );
 
         let root_key = s.root_key();
@@ -959,6 +994,7 @@ mod tests {
             0,
             "aes-256-gcm".to_string(),
             "aes-256-gcm".to_string(),
+            128,
         );
 
         let root_key = s.root_key();
@@ -981,6 +1017,7 @@ mod tests {
             0,
             "aes-256-gcm".to_string(),
             "aes-256-gcm".to_string(),
+            128,
         );
 
         let root_key = s.root_key();
@@ -1007,6 +1044,7 @@ mod tests {
             0,
             "aes-256-gcm".to_string(),
             "aes-256-gcm".to_string(),
+            128,
         );
 
         let now = now_ms();

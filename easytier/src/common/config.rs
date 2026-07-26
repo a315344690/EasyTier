@@ -82,7 +82,7 @@ pub fn gen_default_flags() -> Flags {
         socket_mark: None,
         fakehttp_hosts: vec![],
         default_route: false,
-        faketcp_padding: String::new(),
+        padding_max: 0,
     }
 }
 

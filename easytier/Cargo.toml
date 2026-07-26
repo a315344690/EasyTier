@@ -160,7 +160,7 @@ prefix-trie = { version = "0.7.0", features = ["cidr"] }
 # for hole punching
 stun_codec = "0.3.4"
 bytecodec = "0.4.15"
-rand = "0.8.5"
+rand = { version = "0.8.5", features = ["small_rng"] }
 
 serde = { version = "1.0", features = ["derive"] }
 pnet = { version = "0.35.0", features = ["serde"] }

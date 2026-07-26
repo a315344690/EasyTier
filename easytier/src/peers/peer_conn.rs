@@ -1669,6 +1669,7 @@ pub mod tests {
             "aes-gcm".to_string(),
             "aes-gcm".to_string(),
             None,
+            128,
         ));
         session.invalidate();
         filter.set_session(session);

@@ -4,9 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use base64::prelude::{BASE64_STANDARD, Engine as _};
 use futures::stream::FuturesUnordered;
-use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::time::{Duration, timeout};
@@ -14,13 +12,17 @@ use tokio::time::{Duration, timeout};
 use super::{
     FromUrl, IpVersion, Tunnel, TunnelError, TunnelListener,
     common::{FramedReader, FramedWriter, TunnelWrapper, bind, wait_for_connect_futures},
+    disguise_protocol::{
+        self, build_fake_client_finished, build_fake_server_encrypted_handshake,
+        build_http_request, build_http_response, build_tls_client_hello, build_tls_server_hello,
+        compute_ws_accept, extract_ws_key,
+    },
 };
 use crate::tunnel::TunnelInfo;
 use crate::tunnel::common::apply_socket_mark;
 
 const TCP_MTU_BYTES: usize = 2000;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-5AB5DC30CE87";
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 
 // --- Payload types ---
 
@@ -60,272 +62,12 @@ fn parse_payloads(hosts: Vec<String>) -> Vec<FakeHttpPayload> {
     payloads
 }
 
-// --- Protocol builders ---
-
-fn compute_ws_accept(key: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(key.as_bytes());
-    hasher.update(WS_MAGIC.as_bytes());
-    BASE64_STANDARD.encode(hasher.finalize())
-}
-
-fn build_http_request(host: &str) -> (Vec<u8>, String) {
-    let ws_key: [u8; 16] = rand::random();
-    let ws_key_b64 = BASE64_STANDARD.encode(ws_key);
-    let req = format!(
-        "GET / HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         Connection: Upgrade\r\n\
-         Pragma: no-cache\r\n\
-         Cache-Control: no-cache\r\n\
-         User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36\r\n\
-         Upgrade: websocket\r\n\
-         Origin: http://{host}\r\n\
-         Sec-WebSocket-Version: 13\r\n\
-         Accept-Encoding: gzip, deflate\r\n\
-         Accept-Language: en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7\r\n\
-         Sec-WebSocket-Key: {ws_key_b64}\r\n\
-         Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\
-         \r\n"
-    )
-    .into_bytes();
-    (req, ws_key_b64)
-}
-
-fn build_http_response(ws_accept: &str) -> Vec<u8> {
-    let date_str = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
-    format!(
-        "HTTP/1.1 101 Switching Protocols\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Accept: {ws_accept}\r\n\
-         Server: nginx/1.24.0\r\n\
-         Date: {date_str}\r\n\
-         \r\n"
-    )
-    .into_bytes()
-}
-
-/// Wrap a handshake body in TLS record + handshake headers.
-/// `hs_type`: 0x01 = ClientHello, 0x02 = ServerHello
-/// `record_version`: protocol version in the record layer header
-pub(crate) fn wrap_tls_handshake(hs_type: u8, body: &[u8], record_version: [u8; 2]) -> Vec<u8> {
-    let hs_len = body.len();
-    // Handshake: type(1) + length(3, uint24) + body
-    // Record:    content_type(1) + version(2) + length(2) + handshake
-    let total = 5 + 4 + hs_len;
-    let mut buf = Vec::with_capacity(total);
-    // TLS record header
-    buf.push(0x16); // ContentType: Handshake
-    buf.extend_from_slice(&record_version);
-    let hs_with_header_len = (4 + hs_len) as u16;
-    buf.extend_from_slice(&hs_with_header_len.to_be_bytes());
-    // Handshake header
-    buf.push(hs_type);
-    buf.push(((hs_len >> 16) & 0xff) as u8);
-    buf.push(((hs_len >> 8) & 0xff) as u8);
-    buf.push((hs_len & 0xff) as u8);
-    // Handshake body
-    buf.extend_from_slice(body);
-    buf
-}
-
-pub(crate) fn build_tls_client_hello(host: &str) -> Vec<u8> {
-    let host_bytes = host.as_bytes();
-
-    const GREASE_VALUES: &[u16] = &[
-        0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a,
-        0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa,
-    ];
-    let grease_idx: u8 = rand::random::<u8>() % GREASE_VALUES.len() as u8;
-    let grease = GREASE_VALUES[grease_idx as usize];
-    let grease_bytes = grease.to_be_bytes();
-    // Second GREASE for key_share and trailing extension
-    let grease2_idx: u8 = (grease_idx + 1) % GREASE_VALUES.len() as u8;
-    let grease2 = GREASE_VALUES[grease2_idx as usize];
-    let grease2_bytes = grease2.to_be_bytes();
-
-    // Extensions ordered to match Chrome 131
-    let mut extensions = Vec::with_capacity(512);
-
-    // 1. GREASE extension
-    extensions.extend_from_slice(&grease_bytes);
-    extensions.extend_from_slice(&[0x00, 0x00]);
-
-    // 2. SNI (0x0000)
-    let sni_name_len = host_bytes.len();
-    let sni_list_len = 1 + 2 + sni_name_len;
-    let sni_ext_data_len = 2 + sni_list_len;
-    extensions.extend_from_slice(&[0x00, 0x00]);
-    extensions.extend_from_slice(&(sni_ext_data_len as u16).to_be_bytes());
-    extensions.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
-    extensions.push(0x00);
-    extensions.extend_from_slice(&(sni_name_len as u16).to_be_bytes());
-    extensions.extend_from_slice(host_bytes);
-
-    // 3. extended_master_secret (0x0017)
-    extensions.extend_from_slice(&[0x00, 0x17, 0x00, 0x00]);
-
-    // 4. renegotiation_info (0xff01)
-    extensions.extend_from_slice(&[0xff, 0x01, 0x00, 0x01, 0x00]);
-
-    // 5. supported_groups (0x000a)
-    extensions.extend_from_slice(&[0x00, 0x0a, 0x00, 0x0c, 0x00, 0x0a]);
-    extensions.extend_from_slice(&grease_bytes);
-    extensions.extend_from_slice(&[0x00, 0x1d]); // x25519
-    extensions.extend_from_slice(&[0x00, 0x17]); // secp256r1
-    extensions.extend_from_slice(&[0x00, 0x18]); // secp384r1
-    extensions.extend_from_slice(&[0x00, 0x19]); // secp521r1
-
-    // 6. ec_point_formats (0x000b)
-    extensions.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
-
-    // 7. session_ticket (0x0023)
-    extensions.extend_from_slice(&[0x00, 0x23, 0x00, 0x00]);
-
-    // 8. status_request / OCSP (0x0005)
-    extensions.extend_from_slice(&[0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00]);
-
-    // 9. signature_algorithms (0x000d)
-    extensions.extend_from_slice(&[0x00, 0x0d, 0x00, 0x12, 0x00, 0x10]);
-    extensions.extend_from_slice(&[0x04, 0x03]); // ecdsa_secp256r1_sha256
-    extensions.extend_from_slice(&[0x08, 0x04]); // rsa_pss_rsae_sha256
-    extensions.extend_from_slice(&[0x04, 0x01]); // rsa_pkcs1_sha256
-    extensions.extend_from_slice(&[0x05, 0x03]); // ecdsa_secp384r1_sha384
-    extensions.extend_from_slice(&[0x08, 0x05]); // rsa_pss_rsae_sha384
-    extensions.extend_from_slice(&[0x05, 0x01]); // rsa_pkcs1_sha384
-    extensions.extend_from_slice(&[0x08, 0x06]); // rsa_pss_rsae_sha512
-    extensions.extend_from_slice(&[0x06, 0x01]); // rsa_pkcs1_sha512
-
-    // 10. signed_certificate_timestamp (0x0012)
-    extensions.extend_from_slice(&[0x00, 0x12, 0x00, 0x00]);
-
-    // 11. ALPN (0x0010)
-    let alpn_protocols: &[&[u8]] = &[b"h2", b"http/1.1"];
-    let alpn_list_len: usize = alpn_protocols.iter().map(|p| 1 + p.len()).sum();
-    let alpn_ext_data_len = 2 + alpn_list_len;
-    extensions.extend_from_slice(&[0x00, 0x10]);
-    extensions.extend_from_slice(&(alpn_ext_data_len as u16).to_be_bytes());
-    extensions.extend_from_slice(&(alpn_list_len as u16).to_be_bytes());
-    for proto in alpn_protocols {
-        extensions.push(proto.len() as u8);
-        extensions.extend_from_slice(proto);
-    }
-
-    // 12. compress_certificate (0x001b) - brotli
-    extensions.extend_from_slice(&[0x00, 0x1b, 0x00, 0x03, 0x02, 0x00, 0x02]);
-
-    // 13. application_settings / ALPS (0x4469) - h2
-    extensions.extend_from_slice(&[0x44, 0x69, 0x00, 0x05, 0x00, 0x03, 0x02, 0x68, 0x32]);
-
-    // 14. supported_versions (0x002b) - TLS 1.3 + 1.2
-    extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x07, 0x06]);
-    extensions.extend_from_slice(&grease_bytes);
-    extensions.extend_from_slice(&[0x03, 0x04]); // TLS 1.3
-    extensions.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
-
-    // 15. key_share (0x0033) - GREASE entry + x25519
-    let fake_pubkey: [u8; 32] = rand::random();
-    let grease_ks_data: [u8; 1] = rand::random();
-    // GREASE entry: group(2) + key_len(2) + key(1) = 5 bytes
-    // x25519 entry: group(2) + key_len(2) + key(32) = 36 bytes
-    let key_share_list_len: u16 = 5 + 36;
-    let key_share_ext_len: u16 = 2 + key_share_list_len;
-    extensions.extend_from_slice(&[0x00, 0x33]);
-    extensions.extend_from_slice(&key_share_ext_len.to_be_bytes());
-    extensions.extend_from_slice(&key_share_list_len.to_be_bytes());
-    extensions.extend_from_slice(&grease2_bytes); // GREASE group
-    extensions.extend_from_slice(&(1u16).to_be_bytes());
-    extensions.extend_from_slice(&grease_ks_data);
-    extensions.extend_from_slice(&[0x00, 0x1d]); // x25519
-    extensions.extend_from_slice(&(32u16).to_be_bytes());
-    extensions.extend_from_slice(&fake_pubkey);
-
-    // 16. psk_key_exchange_modes (0x002d)
-    extensions.extend_from_slice(&[0x00, 0x2d, 0x00, 0x02, 0x01, 0x01]);
-
-    // 17. Second GREASE extension (Chrome places one before padding)
-    extensions.extend_from_slice(&grease2_bytes);
-    extensions.extend_from_slice(&[0x00, 0x01, 0x00]);
-
-    // ClientHello body (before padding calculation)
-    let mut body = Vec::with_capacity(512);
-    body.extend_from_slice(&[0x03, 0x03]); // legacy version TLS 1.2
-    let random: [u8; 32] = rand::random();
-    body.extend_from_slice(&random);
-    body.push(0x20); // session_id_len = 32
-    let session_id: [u8; 32] = rand::random();
-    body.extend_from_slice(&session_id);
-    // Cipher suites (GREASE + 3 TLS1.3 + 4 TLS1.2 ECDHE = 8 suites = 16 bytes)
-    body.extend_from_slice(&[0x00, 0x10]);
-    body.extend_from_slice(&grease_bytes);
-    body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
-    body.extend_from_slice(&[0x13, 0x02]); // TLS_AES_256_GCM_SHA384
-    body.extend_from_slice(&[0x13, 0x03]); // TLS_CHACHA20_POLY1305_SHA256
-    body.extend_from_slice(&[0xc0, 0x2b]); // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-    body.extend_from_slice(&[0xc0, 0x2f]); // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-    body.extend_from_slice(&[0xc0, 0x2c]); // TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-    body.extend_from_slice(&[0xc0, 0x30]); // TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-    // Compression
-    body.extend_from_slice(&[0x01, 0x00]);
-
-    // 18. padding (0x0015) - pad to 512-byte boundary
-    let body_without_ext = body.len();
-    let current_total = body_without_ext + 2 + extensions.len();
-    let target_len = 512usize;
-    if current_total < target_len {
-        let pad_data_len = target_len - current_total - 4; // -4 for ext_type(2) + ext_len(2)
-        if pad_data_len > 0 {
-            extensions.extend_from_slice(&[0x00, 0x15]);
-            extensions.extend_from_slice(&(pad_data_len as u16).to_be_bytes());
-            extensions.resize(extensions.len() + pad_data_len, 0x00);
-        }
-    }
-
-    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
-    body.extend_from_slice(&extensions);
-
-    wrap_tls_handshake(0x01, &body, [0x03, 0x01])
-}
-
-pub(crate) fn build_tls_server_hello(client_session_id: Option<&[u8]>) -> Vec<u8> {
-    // TLS 1.3 ServerHello: legacy_version=0x0303, negotiated version in supported_versions ext
-    let mut body = Vec::with_capacity(128);
-    body.extend_from_slice(&[0x03, 0x03]); // legacy_version (always 0x0303 in TLS 1.3)
-    let random: [u8; 32] = rand::random();
-    body.extend_from_slice(&random);
-    // Echo client session_id (TLS 1.3 compatibility mode)
-    if let Some(sid) = client_session_id {
-        body.push(sid.len() as u8);
-        body.extend_from_slice(sid);
-    } else {
-        body.push(0x20);
-        let session_id: [u8; 32] = rand::random();
-        body.extend_from_slice(&session_id);
-    }
-    body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
-    body.push(0x00); // compression: null
-
-    // TLS 1.3 ServerHello extensions
-    let mut extensions = Vec::new();
-    // supported_versions (0x002b) - negotiated TLS 1.3
-    extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
-    // key_share (0x0033) - server's x25519 public key (fake)
-    let server_pubkey: [u8; 32] = rand::random();
-    extensions.extend_from_slice(&[0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]);
-    extensions.extend_from_slice(&server_pubkey);
-    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
-    body.extend_from_slice(&extensions);
-
-    wrap_tls_handshake(0x02, &body, [0x03, 0x03])
-}
+// Protocol builders are in super::disguise_protocol
 
 // --- TLS Application Data record IO adapters ---
-// Wraps all post-handshake data in TLS Application Data records (0x17 0x03 0x03)
-// so DPI sees continuous TLS traffic after the handshake.
 
-const TLS_RECORD_HEADER_SIZE: usize = 5;
-const TLS_MAX_PLAINTEXT: usize = 16384;
+const TLS_RECORD_HEADER_SIZE: usize = disguise_protocol::TLS_RECORD_HEADER_SIZE;
+const TLS_MAX_PLAINTEXT: usize = disguise_protocol::TLS_MAX_PLAINTEXT;
 
 struct TlsRecordWriter<W> {
     inner: W,
@@ -995,40 +737,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
     }
 }
 
-// Fake TLS 1.3 post-handshake messages to complete the handshake appearance.
-// In real TLS 1.3: ServerHello is followed by CCS + encrypted handshake records
-// (EncryptedExtensions, Certificate, CertificateVerify, Finished).
-fn build_fake_server_encrypted_handshake() -> Vec<u8> {
-    let mut out = Vec::with_capacity(4096);
-    // ChangeCipherSpec (required for TLS 1.3 middlebox compatibility)
-    out.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
-    // Fake encrypted handshake records (appear as Application Data to DPI).
-    // Randomize sizes to avoid a fixed statistical fingerprint.
-    let r1_len = 1300 + (rand::random::<u16>() % 400) as usize;
-    let r2_len = 1000 + (rand::random::<u16>() % 400) as usize;
-    let fake_r1: Vec<u8> = (0..r1_len).map(|_| rand::random::<u8>()).collect();
-    let fake_r2: Vec<u8> = (0..r2_len).map(|_| rand::random::<u8>()).collect();
-    out.extend_from_slice(&[0x17, 0x03, 0x03]);
-    out.extend_from_slice(&(r1_len as u16).to_be_bytes());
-    out.extend_from_slice(&fake_r1);
-    out.extend_from_slice(&[0x17, 0x03, 0x03]);
-    out.extend_from_slice(&(r2_len as u16).to_be_bytes());
-    out.extend_from_slice(&fake_r2);
-    out
-}
-
-fn build_fake_client_finished() -> Vec<u8> {
-    let mut out = Vec::with_capacity(80);
-    // Client ChangeCipherSpec
-    out.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
-    // Client Finished (encrypted, appears as Application Data)
-    let finished_len = 36 + (rand::random::<u8>() % 20) as usize;
-    out.extend_from_slice(&[0x17, 0x03, 0x03]);
-    out.extend_from_slice(&(finished_len as u16).to_be_bytes());
-    let fake_finished: Vec<u8> = (0..finished_len).map(|_| rand::random::<u8>()).collect();
-    out.extend_from_slice(&fake_finished);
-    out
-}
 
 // --- Handshake logic ---
 
@@ -1152,18 +860,6 @@ async fn server_handle_http(stream: &mut TcpStream) -> Result<(), TunnelError> {
     Ok(())
 }
 
-fn extract_ws_key(headers: &[u8]) -> Option<&str> {
-    let text = std::str::from_utf8(headers).ok()?;
-    for line in text.split("\r\n") {
-        if let Some(colon_pos) = line.find(':') {
-            let name = &line[..colon_pos];
-            if name.eq_ignore_ascii_case("Sec-WebSocket-Key") {
-                return Some(line[colon_pos + 1..].trim());
-            }
-        }
-    }
-    None
-}
 
 async fn server_handle_tls(stream: &mut TcpStream) -> Result<(), TunnelError> {
     // Read 5-byte TLS record header to get payload length
@@ -1492,6 +1188,8 @@ impl super::TunnelConnector for FakeHttpTunnelConnector {
 
 #[cfg(test)]
 mod tests {
+    use base64::prelude::{BASE64_STANDARD, Engine as _};
+
     use crate::tunnel::{
         TunnelConnector,
         common::tests::{_tunnel_bench, _tunnel_pingpong},

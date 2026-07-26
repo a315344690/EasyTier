@@ -50,55 +50,18 @@ use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU16, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
 };
 use tokio::sync::broadcast;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, info, trace, warn};
 
 const MPMC_BUFFER_LEN: usize = 4096;
-const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
+const MAX_UNACKED_LEN: u32 = u32::MAX / 2;
 const DEFAULT_WINDOW: u32 = 0x3400000; // ~54.5 MB
 const WINDOW_SCALE: u8 = 14;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PaddingMode {
-    Off,
-    Fixed(u8),
-    Random,
-}
 
-impl PaddingMode {
-    pub fn max_padding(self) -> usize {
-        match self {
-            PaddingMode::Off => 0,
-            PaddingMode::Fixed(n) => n as usize,
-            PaddingMode::Random => 10,
-        }
-    }
-}
-
-pub fn compute_padding_len(seq: u32, ack: u32, mode: PaddingMode) -> usize {
-    match mode {
-        PaddingMode::Off => 0,
-        PaddingMode::Fixed(n) => n as usize,
-        PaddingMode::Random => (seq.wrapping_add(ack) % 11) as usize,
-    }
-}
-
-pub fn parse_padding_mode(s: &str) -> PaddingMode {
-    let s = s.trim();
-    if s.is_empty() || s == "off" {
-        PaddingMode::Off
-    } else if s == "random" {
-        PaddingMode::Random
-    } else if let Some(n_str) = s.strip_prefix("fixed:") {
-        let n: u8 = n_str.parse().unwrap_or(0).min(16);
-        PaddingMode::Fixed(n)
-    } else {
-        PaddingMode::Off
-    }
-}
 
 
 pub(super) fn system_boot_instant() -> std::time::Instant {
@@ -216,13 +179,13 @@ pub struct Socket {
     seq: AtomicU32,
     ack: AtomicU32,
     last_ack: AtomicU32,
+    seq_calibrated: AtomicBool,
     ts_base: std::time::Instant,
     ts_offset: u32,
     remote_tsval: AtomicU32,
     ip_id: AtomicU16,
     state: AtomicCell<State>,
     recv_window: AtomicU32,
-    padding_mode: PaddingMode,
 }
 
 /// A socket that represents a unique TCP connection between a server and client.
@@ -243,10 +206,10 @@ impl Socket {
         remote_mac: Option<MacAddr>,
         seq: u32,
         ack: u32,
+        seq_calibrated: bool,
         ts_offset: u32,
         initial_remote_tsval: u32,
         state: State,
-        padding_mode: PaddingMode,
     ) -> (Socket, flume::Sender<DispatchItem>) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
 
@@ -262,13 +225,13 @@ impl Socket {
                 seq: AtomicU32::new(seq),
                 ack: AtomicU32::new(ack),
                 last_ack: AtomicU32::new(ack),
+                seq_calibrated: AtomicBool::new(seq_calibrated),
                 ts_base: system_boot_instant(),
                 ts_offset,
                 remote_tsval: AtomicU32::new(initial_remote_tsval),
                 ip_id: AtomicU16::new(rand::random()),
                 state: AtomicCell::new(state),
                 recv_window: AtomicU32::new(DEFAULT_WINDOW),
-                padding_mode,
             },
             incoming_tx,
         )
@@ -316,18 +279,19 @@ impl Socket {
     pub fn build_packet(&self, payload: &[u8]) -> Option<Bytes> {
         match self.state.load() {
             State::Established => {
-                let current_seq = self.seq.load(Ordering::Relaxed);
+                if !self.seq_calibrated.load(Ordering::Acquire) {
+                    return None;
+                }
                 let ack = self.ack.load(Ordering::Relaxed);
-                let padding_len = compute_padding_len(current_seq, ack, self.padding_mode);
                 let seq = self
                     .seq
-                    .fetch_add((payload.len() + padding_len) as u32, Ordering::Relaxed);
+                    .fetch_add(payload.len() as u32, Ordering::Relaxed);
                 let buf = self.build_tcp_packet_inner(
                     tcp::TcpFlags::ACK | tcp::TcpFlags::PSH,
                     Some(payload),
                     seq,
                     ack,
-                    padding_len,
+                    0,
                 );
                 Some(buf)
             }
@@ -340,6 +304,9 @@ impl Socket {
     }
 
     pub fn send_ack(&self) {
+        if !self.seq_calibrated.load(Ordering::Acquire) {
+            return;
+        }
         let ack = self.ack.load(Ordering::Relaxed);
         let last = self.last_ack.load(Ordering::Relaxed);
         if ack == last {
@@ -352,6 +319,10 @@ impl Socket {
 
     pub fn close(&self) {
         if self.state.load() != State::Idle {
+            if !self.seq_calibrated.load(Ordering::Acquire) {
+                self.state.store(State::Idle);
+                return;
+            }
             let buf = self.build_tcp_packet(tcp::TcpFlags::RST, None);
             let _ = self.tun.try_send(&buf);
             self.state.store(State::Idle);
@@ -409,18 +380,21 @@ impl Socket {
                         },
                     );
 
+                    if !self.seq_calibrated.load(Ordering::Acquire)
+                        && (meta.flags & tcp::TcpFlags::ACK) != 0
+                        && meta.ack != 0
+                    {
+                        self.seq.store(meta.ack, Ordering::Relaxed);
+                        self.seq_calibrated.store(true, Ordering::Release);
+                        tracing::info!(
+                            seq = meta.ack,
+                            "faketcp: SEQ calibrated from peer ACK"
+                        );
+                    }
+
                     if meta.payload_len == 0 {
                         continue;
                     }
-
-                    // Strip padding
-                    let padding_len =
-                        compute_padding_len(meta.seq, meta.ack, self.padding_mode);
-                    if meta.payload_len <= padding_len {
-                        warn!("truncated frame or padding mismatch, dropping");
-                        continue;
-                    }
-                    let real_len = meta.payload_len - padding_len;
 
                     // Dynamic window management (single consumer, no CAS needed)
                     let current_window = self
@@ -436,10 +410,10 @@ impl Socket {
                     }
 
                     buf.extend_from_slice(
-                        &frame[meta.payload_offset..meta.payload_offset + real_len],
+                        &frame[meta.payload_offset..meta.payload_offset + meta.payload_len],
                     );
 
-                    return Some(real_len);
+                    return Some(meta.payload_len);
                 }
                 _ => unreachable!(),
             }
@@ -452,6 +426,14 @@ impl Socket {
 
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
+    }
+
+    pub fn current_seq(&self) -> u32 {
+        self.seq.load(Ordering::Relaxed)
+    }
+
+    pub fn current_ack(&self) -> u32 {
+        self.ack.load(Ordering::Relaxed)
     }
 }
 
@@ -473,6 +455,11 @@ impl Drop for Socket {
         }
         // purge cache
         let _ = self.shared.tuples_purge.send(tuple);
+
+        if !self.seq_calibrated.load(Ordering::Relaxed) {
+            info!("Fake TCP connection to {} closed (SEQ uncalibrated, skipping RST)", self);
+            return;
+        }
 
         let buf = build_tcp_packet(
             self.local_mac,
@@ -562,11 +549,11 @@ impl Stack {
         remote_addr: SocketAddr,
         initial_seq: u32,
         initial_ack: u32,
+        seq_calibrated: bool,
         ts_offset: u32,
         remote_mac: Option<MacAddr>,
         initial_remote_tsval: u32,
         state: State,
-        padding_mode: PaddingMode,
     ) -> Option<Socket> {
         let tuple = AddrTuple::new(local_addr, remote_addr);
         let mut stack_state = self.shared.state.write().unwrap();
@@ -587,10 +574,10 @@ impl Stack {
             remote_mac,
             initial_seq,
             initial_ack,
+            seq_calibrated,
             ts_offset,
             initial_remote_tsval,
             state,
-            padding_mode,
         );
         assert!(stack_state.tuples.insert(tuple, incoming).is_none());
         Some(sock)
@@ -798,11 +785,11 @@ mod tests {
                 SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 20_000),
                 0,
                 0,
+                true,
                 0,
                 None,
                 0,
                 State::Established,
-                PaddingMode::Off,
             )
             .expect("socket allocation should succeed before tun failure");
 
@@ -825,11 +812,11 @@ mod tests {
             SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 20_001),
             0,
             0,
+            true,
             0,
             None,
             0,
             State::Established,
-            PaddingMode::Off,
         );
         assert!(new_socket.is_none());
 

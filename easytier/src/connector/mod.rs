@@ -266,9 +266,9 @@ pub async fn create_connector_by_url(
                 }
                 #[cfg(feature = "faketcp")]
                 IpScheme::FakeTcp => {
-                    let padding = &global_ctx.config.get_flags().faketcp_padding;
+                    let flags = global_ctx.config.get_flags();
                     let mut c = tunnel::fake_tcp::FakeTcpTunnelConnector::new(url);
-                    c.set_padding_mode(tunnel::fake_tcp::parse_padding_mode(padding));
+                    c.set_disguise_mode(tunnel::fake_tcp::parse_disguise_mode(&flags.fakehttp_hosts));
                     c.boxed()
                 }
                 #[cfg(feature = "fakehttp")]

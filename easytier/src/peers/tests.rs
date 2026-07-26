@@ -275,6 +275,7 @@ async fn relay_peer_map_secure_session_decrypt() {
         algo.clone(),
         algo.clone(),
         None,
+        128,
     ));
     let key = SessionKey::new(ctx.get_network_identity().network_name, 20);
     store.insert_session(key.clone(), session.clone());
@@ -820,6 +821,7 @@ async fn relay_peer_map_remove_peer() {
         "aes-256-gcm".to_string(),
         "aes-256-gcm".to_string(),
         None,
+        128,
     ));
     let key = SessionKey::new(ctx.get_network_name(), peer_1);
     store.insert_session(key.clone(), session);

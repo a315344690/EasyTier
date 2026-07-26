@@ -372,7 +372,7 @@ impl DirectConnectorManagerData {
                                 "udp public ipv4 listener punch failed, falling back to direct connect"
                             );
                             timeout(
-                                std::time::Duration::from_secs(3),
+                                std::time::Duration::from_secs(5),
                                 self.peer_manager.try_direct_connect_with_peer_id_hint(
                                     connector,
                                     Some(dst_peer_id),
@@ -384,7 +384,7 @@ impl DirectConnectorManagerData {
                 }
                 _ => {
                     timeout(
-                        std::time::Duration::from_secs(3),
+                        std::time::Duration::from_secs(5),
                         self.peer_manager
                             .try_direct_connect_with_peer_id_hint(connector, Some(dst_peer_id)),
                     )
@@ -393,7 +393,7 @@ impl DirectConnectorManagerData {
             }
         } else {
             timeout(
-                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(5),
                 self.peer_manager
                     .try_direct_connect_with_peer_id_hint(connector, Some(dst_peer_id)),
             )
@@ -676,22 +676,28 @@ impl DirectConnectorManagerData {
                 available_listeners.pop();
             }
 
-            let ret = tasks.join_all().await;
+            while let Some(ret) = tasks.join_next().await {
+                tracing::debug!(
+                    ?ret,
+                    ?dst_peer_id,
+                    ?cur_scheme,
+                    "one task finished for current scheme"
+                );
+                if self.peer_manager.has_directly_connected_conn(dst_peer_id) {
+                    tasks.abort_all();
+                    tracing::info!(
+                        "direct connect to peer {} success, aborting remaining tasks",
+                        dst_peer_id
+                    );
+                    return Ok(());
+                }
+            }
             tracing::debug!(
-                ?ret,
                 ?dst_peer_id,
                 ?cur_scheme,
                 ?listener_list,
-                "all tasks finished for current scheme"
+                "all tasks finished for current scheme, no direct conn established"
             );
-
-            if self.peer_manager.has_directly_connected_conn(dst_peer_id) {
-                tracing::info!(
-                    "direct connect to peer {} success, has direct conn",
-                    dst_peer_id
-                );
-                return Ok(());
-            }
         }
 
         Ok(())

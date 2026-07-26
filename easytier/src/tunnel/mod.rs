@@ -21,11 +21,14 @@ pub mod common;
 pub mod filter;
 pub mod mpsc;
 pub mod packet_def;
+pub mod padding;
 pub mod ring;
 pub mod stats;
 pub mod tcp;
 pub mod udp;
 pub(crate) mod udp_src;
+
+pub(crate) mod disguise_protocol;
 
 #[cfg(feature = "faketcp")]
 pub mod fake_tcp;

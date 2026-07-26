@@ -242,7 +242,10 @@ impl PeerManager {
             global_ctx.clone(),
             my_peer_id,
         ));
-        let peer_session_store = Arc::new(PeerSessionStore::new());
+        let padding_max = crate::tunnel::padding::effective_padding_max(
+            global_ctx.get_flags().padding_max,
+        );
+        let peer_session_store = Arc::new(PeerSessionStore::with_padding_max(padding_max));
 
         let encryptor = if global_ctx.get_flags().enable_encryption {
             // 只有在启用加密时才使用工厂函数选择算法
@@ -251,6 +254,7 @@ impl PeerManager {
                 algorithm,
                 global_ctx.get_128_key(),
                 global_ctx.get_256_key(),
+                padding_max,
             )
         } else {
             // disable_encryption = true 时使用 NullCipher

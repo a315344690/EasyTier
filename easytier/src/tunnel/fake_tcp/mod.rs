@@ -1,10 +1,15 @@
+pub mod disguise;
 mod netfilter;
 #[cfg(target_os = "linux")]
 mod netfilter_guard;
+#[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+mod pf_guard;
+#[cfg(all(windows, any(target_arch = "x86_64", target_arch = "x86")))]
+mod windivert_guard;
 mod packet;
 mod stack;
 
-pub use stack::{PaddingMode, parse_padding_mode};
+pub use disguise::{DisguiseMode, parse_disguise_mode};
 
 use bytes::{Bytes, BytesMut};
 use futures::{Sink, Stream};
@@ -88,12 +93,10 @@ async fn create_tun_off_runtime(
 pub struct FakeTcpTunnelListener {
     addr: url::Url,
     os_listener: Option<TcpListener>,
-    // interface_name -> fake tcp stack
     stack_map: DashMap<String, Arc<stack::Stack>>,
-    // a cache from ip addr to interface name
     ip_to_ifname: IpToIfNameCache,
     socket_mark: Option<u32>,
-    padding_mode: stack::PaddingMode,
+    disguise_mode: DisguiseMode,
 }
 
 impl FakeTcpTunnelListener {
@@ -104,12 +107,12 @@ impl FakeTcpTunnelListener {
             stack_map: DashMap::new(),
             ip_to_ifname: IpToIfNameCache::new(),
             socket_mark: None,
-            padding_mode: stack::PaddingMode::Off,
+            disguise_mode: DisguiseMode::Off,
         }
     }
 
-    pub fn set_padding_mode(&mut self, mode: stack::PaddingMode) {
-        self.padding_mode = mode;
+    pub fn set_disguise_mode(&mut self, mode: DisguiseMode) {
+        self.disguise_mode = mode;
     }
 
     pub fn set_socket_mark(&mut self, socket_mark: Option<u32>) {
@@ -404,6 +407,30 @@ fn get_tcp_seq_ack(_socket: &TcpStream) -> std::io::Result<(u32, u32, u32)> {
     Ok((0, 0, 0))
 }
 
+#[cfg(not(target_os = "linux"))]
+fn estimate_ts_offset() -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        let mut ts = nix::libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe {
+            nix::libc::clock_gettime(nix::libc::CLOCK_MONOTONIC, &mut ts);
+        }
+        let kernel_ms = (ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000) as u32;
+        let our_ms = stack::system_boot_instant().elapsed().as_millis() as u32;
+        kernel_ms.wrapping_sub(our_ms)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let our_ms = stack::system_boot_instant().elapsed().as_millis() as u32;
+        // On Windows/other, approximate with process uptime (ts_offset=0 effectively)
+        let _ = our_ms;
+        0
+    }
+}
+
 #[derive(Debug)]
 struct AcceptResult {
     socket: TcpStream,
@@ -453,16 +480,17 @@ impl TunnelListener for FakeTcpTunnelListener {
             );
 
             let stack = self.get_stack(&res).await?;
+            let seq_calibrated = cfg!(target_os = "linux") || (seq != 0 || ack != 0);
             let socket = stack.try_alloc_established_socket(
                 res.local_addr,
                 res.remote_addr,
                 seq,
                 ack,
+                seq_calibrated,
                 ts_offset,
                 None,
                 0,
                 stack::State::Established,
-                self.padding_mode,
             );
             let Some(socket) = socket else {
                 tracing::warn!(
@@ -506,15 +534,35 @@ impl TunnelListener for FakeTcpTunnelListener {
         };
 
         let socket = Arc::new(socket);
-        let reader = FakeTcpStream::new(socket.clone());
-        let writer = FakeTcpSink::new(socket, self.padding_mode);
+
+        // Perform disguise handshake before creating Stream/Sink
+        if !matches!(self.disguise_mode, DisguiseMode::Off) {
+            disguise::perform_server_handshake(&socket, &self.disguise_mode).await?;
+        }
+
+        let reader = FakeTcpStream::new(socket.clone(), self.disguise_mode.clone());
+        let writer = FakeTcpSink::new(socket, self.disguise_mode.clone(), true);
 
         #[cfg(target_os = "linux")]
         let associate_data: Box<dyn std::any::Any + Send> = Box::new((
             build_os_socket_reader_task(res.socket),
             nft_guard,
         ));
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+        let associate_data: Box<dyn std::any::Any + Send> = Box::new((
+            build_os_socket_reader_task(res.socket),
+            pf_guard::PfGuard::new(res.local_addr, res.remote_addr),
+        ));
+        #[cfg(all(windows, any(target_arch = "x86_64", target_arch = "x86")))]
+        let associate_data: Box<dyn std::any::Any + Send> = Box::new((
+            build_os_socket_reader_task(res.socket),
+            windivert_guard::WinDivertGuard::new(res.local_addr, res.remote_addr).ok(),
+        ));
+        #[cfg(not(any(
+            target_os = "linux",
+            all(target_os = "macos", not(feature = "macos-ne")),
+            all(windows, any(target_arch = "x86_64", target_arch = "x86"))
+        )))]
         let associate_data: Box<dyn std::any::Any + Send> =
             Box::new(build_os_socket_reader_task(res.socket));
 
@@ -536,7 +584,7 @@ pub struct FakeTcpTunnelConnector {
     ip_to_if_name: IpToIfNameCache,
     resolved_addr: Option<SocketAddr>,
     socket_mark: Option<u32>,
-    padding_mode: stack::PaddingMode,
+    disguise_mode: DisguiseMode,
 }
 
 impl FakeTcpTunnelConnector {
@@ -546,12 +594,12 @@ impl FakeTcpTunnelConnector {
             ip_to_if_name: IpToIfNameCache::new(),
             resolved_addr: None,
             socket_mark: None,
-            padding_mode: stack::PaddingMode::Off,
+            disguise_mode: DisguiseMode::Off,
         }
     }
 
-    pub fn set_padding_mode(&mut self, mode: stack::PaddingMode) {
-        self.padding_mode = mode;
+    pub fn set_disguise_mode(&mut self, mode: DisguiseMode) {
+        self.disguise_mode = mode;
     }
 }
 
@@ -643,17 +691,17 @@ impl TunnelConnector for FakeTcpTunnelConnector {
 
         let os_stream = os_socket.connect(remote_addr).await?;
 
-        // Learn the next-hop MAC address (and, if available, the remote TCP timestamp).
+        // Learn the next-hop MAC address, remote TCP timestamp, and (on non-Linux)
+        // derive SEQ/ACK from the captured SYN-ACK.
         //
         // Fast path: the SYN-ACK the kernel just received during connect() is also captured
-        // by the BPF tun, and carries both the next-hop MAC (Ethernet source) and the remote
-        // TSval. A short timeout keeps us from stalling if the frame was missed.
+        // by the BPF tun, and carries the next-hop MAC (Ethernet source), the remote TSval,
+        // and the sequence/ack numbers needed to reconstruct the TCP state.
         //
         // Fallback: if the SYN-ACK isn't captured in time, look up the next-hop MAC from the
-        // kernel neighbour table via netlink (the entry is guaranteed present after a
-        // successful connect). This path cannot recover the remote TSval, so it stays 0 and
-        // is learned later from the first inbound packet in Socket::recv().
-        let (remote_mac, remote_tsval) = match tokio::time::timeout(
+        // kernel neighbour table via netlink (Linux only). On non-Linux without the SYN-ACK,
+        // SEQ/ACK remain 0 and will be calibrated from the first inbound packet.
+        let (remote_mac, remote_tsval, synack_seq, synack_ack) = match tokio::time::timeout(
             std::time::Duration::from_millis(200),
             tun.recv(),
         )
@@ -662,7 +710,7 @@ impl TunnelConnector for FakeTcpTunnelConnector {
             Ok(Ok(frame)) => match packet::parse_ip_packet(&frame) {
                 Some((src_mac, _, _, tcp_pkt)) => {
                     use pnet::packet::Packet as _;
-                    use pnet::packet::tcp::TcpOptionNumbers;
+                    use pnet::packet::tcp::{TcpFlags, TcpOptionNumbers};
                     let tsval = tcp_pkt
                         .get_options_iter()
                         .find(|opt| {
@@ -673,17 +721,48 @@ impl TunnelConnector for FakeTcpTunnelConnector {
                             u32::from_be_bytes(opt.payload()[0..4].try_into().unwrap())
                         })
                         .unwrap_or(0);
-                    tracing::info!(?src_mac, tsval, "faketcp connector: captured SYN-ACK");
-                    (Some(src_mac), tsval)
+                    let flags = tcp_pkt.get_flags();
+                    let is_synack = (flags & (TcpFlags::SYN | TcpFlags::ACK | TcpFlags::RST))
+                        == (TcpFlags::SYN | TcpFlags::ACK);
+                    let (sa_seq, sa_ack) = if is_synack {
+                        (
+                            Some(tcp_pkt.get_acknowledgement()),
+                            Some(tcp_pkt.get_sequence().wrapping_add(1)),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    tracing::info!(?src_mac, tsval, ?sa_seq, ?sa_ack, is_synack, "faketcp connector: captured packet");
+                    (Some(src_mac), tsval, sa_seq, sa_ack)
                 }
-                None => (next_hop_mac_fallback(remote_addr.ip()).await, 0),
+                None => (next_hop_mac_fallback(remote_addr.ip()).await, 0, None, None),
             },
-            _ => (next_hop_mac_fallback(remote_addr.ip()).await, 0),
+            _ => (next_hop_mac_fallback(remote_addr.ip()).await, 0, None, None),
         };
+
+        #[cfg(target_os = "linux")]
+        let _ = (synack_seq, synack_ack);
 
         let (seq, ack, ts_offset) = get_tcp_seq_ack(&os_stream).map_err(|e| {
             TunnelError::InternalError(format!("faketcp: get_tcp_seq_ack failed: {e}"))
         })?;
+
+        // On non-Linux, TCP_REPAIR is unavailable so get_tcp_seq_ack returns (0, 0, 0).
+        // Use values derived from the captured SYN-ACK instead.
+        #[cfg(not(target_os = "linux"))]
+        let (seq, ack, ts_offset) = {
+            let final_seq = synack_seq.unwrap_or(seq);
+            let final_ack = synack_ack.unwrap_or(ack);
+            let final_ts_offset = if final_seq != 0 || final_ack != 0 {
+                estimate_ts_offset()
+            } else {
+                ts_offset
+            };
+            if final_seq == 0 && final_ack == 0 {
+                tracing::warn!("faketcp connector: SYN-ACK not captured, SEQ/ACK will be calibrated from first inbound packet");
+            }
+            (final_seq, final_ack, final_ts_offset)
+        };
 
         #[cfg(target_os = "linux")]
         let nft_guard = netfilter_guard::NftGuard::new(local_addr, remote_addr);
@@ -692,17 +771,18 @@ impl TunnelConnector for FakeTcpTunnelConnector {
         let stack = stack::Stack::new(tun, local_ip, local_ip6, mac);
         let driver_type = stack.driver_type();
 
+        let seq_calibrated = cfg!(target_os = "linux") || seq != 0 || ack != 0;
         let socket = stack
             .try_alloc_established_socket(
                 local_addr,
                 remote_addr,
                 seq,
                 ack,
+                seq_calibrated,
                 ts_offset,
                 remote_mac,
                 remote_tsval,
                 stack::State::Established,
-                self.padding_mode,
             )
             .ok_or(TunnelError::InternalError(
                 "FakeTCP stack closed while allocating socket".into(),
@@ -727,8 +807,14 @@ impl TunnelConnector for FakeTcpTunnelConnector {
         };
 
         let socket = Arc::new(socket);
-        let reader = FakeTcpStream::new(socket.clone());
-        let writer = FakeTcpSink::new(socket.clone(), self.padding_mode);
+
+        // Perform disguise handshake before creating Stream/Sink
+        if !matches!(self.disguise_mode, DisguiseMode::Off) {
+            disguise::perform_client_handshake(&socket, &self.disguise_mode).await?;
+        }
+
+        let reader = FakeTcpStream::new(socket.clone(), self.disguise_mode.clone());
+        let writer = FakeTcpSink::new(socket.clone(), self.disguise_mode.clone(), false);
 
         #[cfg(target_os = "linux")]
         let associate_data: Box<dyn std::any::Any + Send> = Box::new((
@@ -736,7 +822,23 @@ impl TunnelConnector for FakeTcpTunnelConnector {
             stack,
             nft_guard,
         ));
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+        let associate_data: Box<dyn std::any::Any + Send> = Box::new((
+            build_os_socket_reader_task(os_stream),
+            stack,
+            pf_guard::PfGuard::new(local_addr, remote_addr),
+        ));
+        #[cfg(all(windows, any(target_arch = "x86_64", target_arch = "x86")))]
+        let associate_data: Box<dyn std::any::Any + Send> = Box::new((
+            build_os_socket_reader_task(os_stream),
+            stack,
+            windivert_guard::WinDivertGuard::new(local_addr, remote_addr).ok(),
+        ));
+        #[cfg(not(any(
+            target_os = "linux",
+            all(target_os = "macos", not(feature = "macos-ne")),
+            all(windows, any(target_arch = "x86_64", target_arch = "x86"))
+        )))]
         let associate_data: Box<dyn std::any::Any + Send> =
             Box::new((build_os_socket_reader_task(os_stream), stack));
 
@@ -772,11 +874,12 @@ enum FakeTcpStreamState {
 struct FakeTcpStream {
     socket: Arc<stack::Socket>,
     state: FakeTcpStreamState,
+    disguise_mode: DisguiseMode,
     _ack_task: AbortOnDropHandle<()>,
 }
 
 impl FakeTcpStream {
-    fn new(socket: Arc<stack::Socket>) -> Self {
+    fn new(socket: Arc<stack::Socket>, disguise_mode: DisguiseMode) -> Self {
         let ack_socket = socket.clone();
         let ack_task = AbortOnDropHandle::new(tokio::spawn(async move {
             loop {
@@ -788,6 +891,7 @@ impl FakeTcpStream {
         Self {
             socket,
             state: FakeTcpStreamState::ConsumingBuf(BytesMut::new()),
+            disguise_mode,
             _ack_task: ack_task,
         }
     }
@@ -840,6 +944,21 @@ impl Stream for FakeTcpStream {
                 }
                 FakeTcpStreamState::PollFuture(mut fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Some((buf, _sz))) => {
+                        let buf = if matches!(s.disguise_mode, DisguiseMode::Off) {
+                            buf
+                        } else {
+                            match disguise::unwrap_payload(
+                                &s.disguise_mode,
+                                &buf,
+                            ) {
+                                Some(data) => BytesMut::from(data.as_slice()),
+                                None => {
+                                    tracing::warn!("faketcp: failed to unwrap disguise frame, dropping");
+                                    s.state = FakeTcpStreamState::ConsumingBuf(BytesMut::new());
+                                    continue;
+                                }
+                            }
+                        };
                         s.state = FakeTcpStreamState::ConsumingBuf(buf);
                     }
                     Poll::Ready(None) => {
@@ -866,16 +985,21 @@ struct FakeTcpSink {
     raw_pending: BytesMut,
     pending: Vec<Bytes>,
     max_payload: usize,
+    disguise_mode: DisguiseMode,
+    is_server: bool,
 }
 
 impl FakeTcpSink {
-    fn new(socket: Arc<stack::Socket>, padding_mode: stack::PaddingMode) -> Self {
-        let max_payload = MAX_COALESCED_PAYLOAD - padding_mode.max_padding();
+    fn new(socket: Arc<stack::Socket>, disguise_mode: DisguiseMode, is_server: bool) -> Self {
+        let overhead = disguise_mode.max_overhead(!is_server);
+        let max_payload = MAX_COALESCED_PAYLOAD.saturating_sub(overhead);
         Self {
             socket,
             raw_pending: BytesMut::with_capacity(max_payload),
             pending: Vec::with_capacity(FAKE_TCP_SINK_BATCH_SIZE),
             max_payload,
+            disguise_mode,
+            is_server,
         }
     }
 
@@ -883,7 +1007,21 @@ impl FakeTcpSink {
         if self.raw_pending.is_empty() {
             return;
         }
-        if let Some(frame) = self.socket.build_packet(&self.raw_pending) {
+        let payload = match &self.disguise_mode {
+            DisguiseMode::Off => {
+                // No disguise: send raw_pending directly
+                if let Some(frame) = self.socket.build_packet(&self.raw_pending) {
+                    self.pending.push(frame);
+                }
+                self.raw_pending.clear();
+                return;
+            }
+            mode => {
+                let is_client = !self.is_server;
+                disguise::wrap_payload(mode, &self.raw_pending, is_client)
+            }
+        };
+        if let Some(frame) = self.socket.build_packet(&payload) {
             self.pending.push(frame);
         }
         self.raw_pending.clear();

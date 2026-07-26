@@ -93,7 +93,12 @@ message FlagsInConfig {
   // LAN routes, and throw routes for private/multicast bypassing.
   bool default_route = 45;
 
-  string faketcp_padding = 46;
+  reserved 46;
+
+  // Maximum random padding bytes appended to each encrypted packet.
+  // Actual padding per packet is uniform random in [0, padding_max].
+  // Default 0 means use built-in default (128 bytes).
+  uint32 padding_max = 47;
 }
 
 message RpcDescriptor {
