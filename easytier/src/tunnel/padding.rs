@@ -2,7 +2,7 @@ use std::cell::RefCell;
 
 use rand::{RngCore, SeedableRng, rngs::SmallRng};
 
-use crate::tunnel::packet_def::ZCPacket;
+use easytier_core::packet::ZCPacket;
 
 pub const PADDING_LEN_SUFFIX_SIZE: usize = 2;
 pub const DEFAULT_PADDING_MAX: u32 = 128;
@@ -52,10 +52,10 @@ pub fn add_padding(pkt: &mut ZCPacket, max_padding: u32) {
     });
 }
 
-pub fn remove_padding(pkt: &mut ZCPacket) -> Result<(), crate::peers::encrypt::Error> {
+pub fn remove_padding(pkt: &mut ZCPacket) -> Result<(), easytier_core::tunnel::encrypt::Error> {
     let payload_len = pkt.payload_len();
     if payload_len < PADDING_LEN_SUFFIX_SIZE {
-        return Err(crate::peers::encrypt::Error::PacketTooShort(payload_len));
+        return Err(easytier_core::tunnel::encrypt::Error::PacketTooShort(payload_len));
     }
 
     let buf_len = pkt.buf_len();
@@ -64,7 +64,7 @@ pub fn remove_padding(pkt: &mut ZCPacket) -> Result<(), crate::peers::encrypt::E
 
     let total_overhead = padding_len + PADDING_LEN_SUFFIX_SIZE;
     if payload_len < total_overhead {
-        return Err(crate::peers::encrypt::Error::PacketTooShort(payload_len));
+        return Err(easytier_core::tunnel::encrypt::Error::PacketTooShort(payload_len));
     }
 
     inner.truncate(buf_len - total_overhead);
