@@ -978,7 +978,9 @@ impl Stream for FakeTcpStream {
 }
 
 const FAKE_TCP_SINK_BATCH_SIZE: usize = 64;
-const MAX_COALESCED_PAYLOAD: usize = 1400;
+// Max TCP payload that fits in common path MTU 1400:
+// 1400 - IP(20) - TCP+TS(32) = 1348
+const MAX_COALESCED_PAYLOAD: usize = 1348;
 
 struct FakeTcpSink {
     socket: Arc<stack::Socket>,
@@ -1066,6 +1068,26 @@ impl Sink<SinkItem> for FakeTcpSink {
         if self.raw_pending.len() + data.len() > self.max_payload {
             self.seal_current_frame();
         }
+
+        if data.len() > self.max_payload {
+            let payload = match &self.disguise_mode {
+                DisguiseMode::Off => {
+                    if let Some(frame) = self.socket.build_packet(&data) {
+                        self.pending.push(frame);
+                    }
+                    return Ok(());
+                }
+                mode => {
+                    let is_client = !self.is_server;
+                    disguise::wrap_payload(mode, &data, is_client)
+                }
+            };
+            if let Some(frame) = self.socket.build_packet(&payload) {
+                self.pending.push(frame);
+            }
+            return Ok(());
+        }
+
         self.raw_pending.extend_from_slice(&data);
 
         Ok(())

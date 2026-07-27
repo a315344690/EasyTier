@@ -41,7 +41,7 @@ pub fn gen_default_flags() -> Flags {
         // (e.g. 1400). FakeTCP runs a userspace stack that sends DF-set packets
         // but cannot process the resulting ICMP "fragmentation needed", so an
         // oversized packet would be silently blackholed with no PMTUD recovery.
-        mtu: 1300,
+        mtu: 1260,
         latency_first: false,
         enable_exit_node: false,
         proxy_forward_by_system: false,
