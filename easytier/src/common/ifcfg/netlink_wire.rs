@@ -41,12 +41,8 @@ const RTA_PRIORITY: u16 = 6;
 const RTA_TABLE: u16 = 15;
 
 const NDA_DST: u16 = 1;
-const NDA_LLADDR: u16 = 2;
 const NTF_PROXY: u8 = 0x08;
-pub(crate) const NUD_INCOMPLETE: u16 = 0x01;
-pub(crate) const NUD_FAILED: u16 = 0x20;
 const NUD_PERMANENT: u16 = 0x80;
-pub(crate) const NUD_NONE: u16 = 0x00;
 
 fn align4(len: usize) -> Option<usize> {
     len.checked_add(3).map(|len| len & !3)
@@ -379,9 +375,6 @@ impl RouteMessage {
         self.oif
     }
 
-    pub(crate) fn gateway(&self) -> Option<&IpAddr> {
-        self.gateway.as_ref()
-    }
 }
 
 impl RouteMessage {
@@ -579,24 +572,6 @@ impl NeighborMessage {
         self.destination.as_ref()
     }
 
-    pub(crate) fn state(&self) -> u16 {
-        self.state
-    }
-
-    pub(crate) fn lladdr(&self) -> Option<&[u8]> {
-        self.attributes
-            .iter()
-            .find(|a| a.kind & NLA_TYPE_MASK == NDA_LLADDR)
-            .map(|a| a.value.as_slice())
-    }
-
-    pub(crate) fn dump_header(family: u8) -> Vec<u8> {
-        let mut bytes = vec![family, 0, 0, 0];
-        bytes.extend_from_slice(&0_u32.to_ne_bytes());
-        bytes.extend_from_slice(&0_u16.to_ne_bytes());
-        bytes.extend_from_slice(&[0, 0]);
-        bytes
-    }
 }
 
 impl NetlinkDecode for NeighborMessage {

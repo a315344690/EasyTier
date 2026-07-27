@@ -161,7 +161,6 @@ where
     if external_factory.is_some_and(|factory| factory.supports_scheme("unix")) {
         schemes = schemes.support("unix", ListenerKind::External);
     }
-    schemes = schemes.disable_ipv6_shadow("faketcp");
 
     let plan = plan_listeners(config.request(self_id), &schemes);
     let mut transports = Vec::new();

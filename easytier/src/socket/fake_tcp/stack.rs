@@ -59,6 +59,25 @@ use tokio::time;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, info, trace, warn};
 
+fn system_boot_instant() -> Instant {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts = nix::libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe {
+            nix::libc::clock_gettime(nix::libc::CLOCK_MONOTONIC, &mut ts);
+        }
+        let since_boot = std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+        Instant::now() - since_boot
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Instant::now()
+    }
+}
+
 const TIMEOUT: time::Duration = time::Duration::from_secs(1);
 const MPMC_BUFFER_LEN: usize = 4096;
 const MAX_UNACKED_LEN: u32 = u32::MAX / 2;
@@ -178,7 +197,6 @@ impl Socket {
         state: State,
     ) -> (Socket, flume::Sender<Bytes>) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
-        let is_established = state == State::Established;
 
         (
             Socket {
@@ -193,8 +211,8 @@ impl Socket {
                 ack: AtomicU32::new(ack.unwrap_or(0)),
                 last_ack: AtomicU32::new(ack.unwrap_or(0)),
                 state: AtomicCell::new(state),
-                seq_calibrated: AtomicBool::new(is_established),
-                ts_base: Instant::now(),
+                seq_calibrated: AtomicBool::new(false),
+                ts_base: system_boot_instant(),
                 ts_offset: 0,
                 remote_tsval: AtomicU32::new(0),
                 ip_id: AtomicU16::new(rand::random()),
@@ -282,33 +300,6 @@ impl Socket {
         let _ = self.tun.try_send(&buf);
         self.last_send_time_secs
             .store(now_secs, Ordering::Relaxed);
-    }
-
-    /// Sends a datagram to the other end.
-    ///
-    /// A return of `None` means the Tun socket returned an error
-    /// and this socket must be closed.
-    pub fn try_send(&self, payload: &[u8]) -> Option<()> {
-        match self.state.load() {
-            State::Established => {
-                if !self.seq_calibrated.load(Ordering::Acquire) {
-                    return None;
-                }
-                let ack = self.ack.load(Ordering::Relaxed);
-                let seq = self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
-                let buf = self.build_tcp_packet_inner(
-                    tcp::TcpFlags::ACK | tcp::TcpFlags::PSH,
-                    Some(payload),
-                    seq,
-                    ack,
-                    0,
-                );
-                self.last_send_time_secs
-                    .store(self.ts_base.elapsed().as_secs() as u32, Ordering::Relaxed);
-                self.tun.try_send(&buf).ok().and(Some(()))
-            }
-            _ => unreachable!(),
-        }
     }
 
     pub fn close(&self) {
@@ -492,6 +483,17 @@ impl Socket {
                         self.ack
                             .store(tcp_packet.get_sequence() + 1, Ordering::Relaxed);
                         self.remote_mac.store(Some(src_mac));
+                        for opt in tcp_packet.get_options_iter() {
+                            if opt.get_number() == TcpOptionNumbers::TIMESTAMPS {
+                                let data = opt.payload();
+                                if data.len() >= 4 {
+                                    let tsval =
+                                        u32::from_be_bytes(data[0..4].try_into().unwrap());
+                                    self.remote_tsval.store(tsval, Ordering::Relaxed);
+                                }
+                                break;
+                            }
+                        }
                         self.seq_calibrated.store(true, Ordering::Release);
                         self.state.store(State::Established);
                         return Some(0);
@@ -663,8 +665,8 @@ impl Stack {
 
                             let tuple = AddrTuple::new(local_addr, remote_addr);
                             if let Some(c) = tuples.get(&tuple) {
-                                if c.send_async(buf).await.is_err() {
-                                    trace!("Cache hit, but receiver already closed, dropping packet");
+                                if c.try_send(buf).is_err() {
+                                    trace!("fake_tcp dispatch: channel full or closed, dropping packet");
                                 }
 
                                 continue;
@@ -681,7 +683,7 @@ impl Stack {
                                 if let Some(c) = sender {
                                     trace!("Storing connection information into local tuples");
                                     tuples.insert(tuple, c.clone());
-                                    if let Err(e) = c.send_async(buf).await {
+                                    if let Err(e) = c.try_send(buf) {
                                         trace!("Error sending packet to connection: {:?}", e);
                                     }
                                     continue;

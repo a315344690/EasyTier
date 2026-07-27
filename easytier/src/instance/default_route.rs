@@ -135,7 +135,14 @@ impl DefaultRouteManager {
         };
 
         for prio in RULE_PRIO_FROM_PHY..=RULE_PRIO_BYPASS_DEFAULT {
-            let _ = run_shell_cmd(&format!("ip rule del prio {prio}")).await;
+            loop {
+                if run_shell_cmd(&format!("ip rule del prio {prio}"))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
         }
 
         let _ = run_shell_cmd(&format!("ip route flush table {VPN_TABLE}")).await;
@@ -158,7 +165,9 @@ impl DefaultRouteManager {
     fn generate_cleanup_script(&self) -> String {
         let mut script = String::new();
         for prio in RULE_PRIO_FROM_PHY..=RULE_PRIO_BYPASS_DEFAULT {
-            script.push_str(&format!("ip rule del prio {prio} 2>/dev/null;"));
+            script.push_str(&format!(
+                "while ip rule del prio {prio} 2>/dev/null; do :; done;"
+            ));
         }
         script.push_str(&format!("ip route flush table {VPN_TABLE} 2>/dev/null"));
         script

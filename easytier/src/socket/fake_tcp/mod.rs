@@ -265,6 +265,8 @@ impl FakeTcpSocket {
         let data = self.raw_pending.split().freeze();
         if let Some(frame) = self.socket.build_packet(&data) {
             self.pending_frames.push(frame);
+        } else {
+            self.raw_pending = BytesMut::from(data.as_ref());
         }
     }
 

@@ -42,6 +42,8 @@ const SOL_PACKET: i32 = 263;
 const PACKET_STATISTICS: i32 = 6;
 
 const DEFAULT_RCVBUF_BYTES: i32 = 32 * 1024 * 1024;
+const RECV_BATCH_SIZE: usize = 64;
+const SEND_BATCH_MAX: usize = 64;
 
 fn stmt(code: u16, k: u32) -> libc::sock_filter {
     libc::sock_filter {
@@ -371,7 +373,7 @@ pub struct LinuxBpfTun {
     ifindex: i32,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
-    recv_queue: Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    recv_queue: Mutex<tokio::sync::mpsc::Receiver<Bytes>>,
 }
 
 impl LinuxBpfTun {
@@ -451,27 +453,50 @@ impl LinuxBpfTun {
         };
 
         let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
         let stop_clone = stop.clone();
         let read_fd = fd.as_ref().as_raw_fd();
         let fd_guard = fd.clone();
         let interface_name_for_worker = interface_name.to_string();
 
         let worker = std::thread::spawn(move || {
-            // Keep the packet socket alive until the detached worker actually exits.
             let _fd_guard = fd_guard;
-            let mut buf = vec![0u8; 65536];
             let mut stats_enabled = true;
             let mut total_packets: u64 = 0;
             let mut total_drops: u64 = 0;
             let mut total_bytes: u64 = 0;
             let mut dropped_by_queue_full: u64 = 0;
             let mut last_stats_log = Instant::now();
+
+            let mut bufs = vec![[0u8; 2048]; RECV_BATCH_SIZE];
+            let mut iovecs: Vec<libc::iovec> = bufs
+                .iter_mut()
+                .map(|b| libc::iovec {
+                    iov_base: b.as_mut_ptr() as *mut libc::c_void,
+                    iov_len: b.len(),
+                })
+                .collect();
+            let mut msgvec: Vec<libc::mmsghdr> = iovecs
+                .iter_mut()
+                .map(|iov| {
+                    let mut hdr: libc::mmsghdr = unsafe { mem::zeroed() };
+                    hdr.msg_hdr.msg_iov = iov as *mut libc::iovec;
+                    hdr.msg_hdr.msg_iovlen = 1;
+                    hdr
+                })
+                .collect();
+
             while !stop_clone.load(AtomicOrdering::Relaxed) {
-                let n = unsafe {
-                    libc::recv(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+                let count = unsafe {
+                    libc::recvmmsg(
+                        read_fd,
+                        msgvec.as_mut_ptr(),
+                        RECV_BATCH_SIZE as libc::c_uint,
+                        libc::MSG_WAITFORONE,
+                        std::ptr::null_mut(),
+                    )
                 };
-                if n < 0 {
+                if count < 0 {
                     let err = io::Error::last_os_error();
                     if matches!(
                         err.kind(),
@@ -481,17 +506,20 @@ impl LinuxBpfTun {
                     }
                     break;
                 }
-                if n == 0 {
-                    continue;
-                }
-                let data = buf[..(n as usize)].to_vec();
-                total_bytes = total_bytes.wrapping_add(n as u64);
-                match tx.try_send(data) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        dropped_by_queue_full = dropped_by_queue_full.wrapping_add(1);
+                for i in 0..(count as usize) {
+                    let len = msgvec[i].msg_len as usize;
+                    if len == 0 {
+                        continue;
                     }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    total_bytes = total_bytes.wrapping_add(len as u64);
+                    let data = Bytes::copy_from_slice(&bufs[i][..len]);
+                    match tx.try_send(data) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            dropped_by_queue_full = dropped_by_queue_full.wrapping_add(1);
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                    }
                 }
 
                 if last_stats_log.elapsed() >= Duration::from_secs(1) {
@@ -580,8 +608,9 @@ impl stack::Tun for LinuxBpfTun {
         let mut rx = self.recv_queue.lock().await;
         match rx.recv().await {
             Some(data) => {
+                let len = data.len();
                 packet.extend_from_slice(&data);
-                Ok(data.len())
+                Ok(len)
             }
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -619,6 +648,60 @@ impl stack::Tun for LinuxBpfTun {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    fn try_send_batch(&self, packets: &[Bytes]) -> Result<usize, std::io::Error> {
+        if packets.is_empty() {
+            return Ok(0);
+        }
+        let limit = packets.len().min(SEND_BATCH_MAX);
+        let mut iovecs: [libc::iovec; SEND_BATCH_MAX] = unsafe { mem::zeroed() };
+        let mut addrs: [libc::sockaddr_ll; SEND_BATCH_MAX] = unsafe { mem::zeroed() };
+        let mut msgvec: [libc::mmsghdr; SEND_BATCH_MAX] = unsafe { mem::zeroed() };
+
+        let mut valid = 0usize;
+        for i in 0..limit {
+            let pkt = &packets[i];
+            if pkt.len() < 6 {
+                continue;
+            }
+            iovecs[valid] = libc::iovec {
+                iov_base: pkt.as_ptr() as *mut libc::c_void,
+                iov_len: pkt.len(),
+            };
+            addrs[valid].sll_family = libc::AF_PACKET as u16;
+            addrs[valid].sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+            addrs[valid].sll_ifindex = self.ifindex;
+            addrs[valid].sll_halen = 6;
+            addrs[valid].sll_addr[..6].copy_from_slice(&pkt[..6]);
+
+            msgvec[valid].msg_hdr.msg_name = &mut addrs[valid] as *mut _ as *mut libc::c_void;
+            msgvec[valid].msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_ll>() as u32;
+            msgvec[valid].msg_hdr.msg_iov = &mut iovecs[valid] as *mut libc::iovec;
+            msgvec[valid].msg_hdr.msg_iovlen = 1;
+            valid += 1;
+        }
+
+        if valid == 0 {
+            return Ok(0);
+        }
+
+        let ret = unsafe {
+            libc::sendmmsg(
+                self.fd.as_ref().as_raw_fd(),
+                msgvec.as_mut_ptr(),
+                valid as u32,
+                0,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(0);
+            }
+            return Err(err);
+        }
+        Ok(ret as usize)
     }
 
     fn driver_type(&self) -> &'static str {

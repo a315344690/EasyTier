@@ -29,10 +29,10 @@ use super::{
     Error, IfConfiguerTrait,
     netlink_wire::{
         AddressMessage, MessageBuilder, MessageIter, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP,
-        NLM_F_DUMP_INTR, NLM_F_EXCL, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NUD_FAILED,
-        NUD_INCOMPLETE, NUD_NONE, NeighborMessage, NetlinkDecode, NetlinkEncode, RTM_DELADDR,
-        RTM_DELNEIGH, RTM_DELROUTE, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWNEIGH,
-        RTM_NEWROUTE, RouteMessage, RouteMessageBuilder, RouteType, netlink_error_code,
+        NLM_F_DUMP_INTR, NLM_F_EXCL, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NeighborMessage,
+        NetlinkDecode, NetlinkEncode, RTM_DELADDR, RTM_DELNEIGH, RTM_DELROUTE, RTM_GETNEIGH,
+        RTM_GETROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE, RouteMessage,
+        RouteMessageBuilder, RouteType, netlink_error_code,
     },
 };
 
@@ -296,83 +296,6 @@ impl NetlinkIfConfiger {
         Self::list_route_messages(libc::AF_INET6 as u8)
     }
 
-    fn route_get(dest: IpAddr) -> Result<(IpAddr, Option<u32>), Error> {
-        let (family, prefix_len) = match dest {
-            IpAddr::V4(_) => (libc::AF_INET as u8, 32u8),
-            IpAddr::V6(_) => (libc::AF_INET6 as u8, 128u8),
-        };
-
-        let route_msg = RouteMessageBuilder::new(family)
-            .destination(dest, prefix_len)
-            .build();
-
-        let builder = message_request(RTM_GETROUTE, NLM_F_REQUEST, &route_msg)?;
-        let socket = send_netlink_req(builder)?;
-
-        loop {
-            let (response, _) = socket.recv_from_full()?;
-            for frame in MessageIter::new(&response) {
-                let (header, payload) = frame?;
-                if header.message_type == NLMSG_ERROR {
-                    let code = netlink_error_code(payload)?;
-                    if code == 0 {
-                        continue;
-                    }
-                    return Err(std::io::Error::from_raw_os_error(code.abs()).into());
-                }
-                if header.message_type == NLMSG_DONE {
-                    return Err(anyhow::anyhow!("no route to {dest}").into());
-                }
-                if header.message_type == RTM_NEWROUTE {
-                    let msg = RouteMessage::from_bytes(payload)?;
-                    let gateway = msg.gateway().copied();
-                    let ifindex = msg.oif();
-                    return Ok((gateway.unwrap_or(dest), ifindex));
-                }
-            }
-        }
-    }
-
-    fn dump_neighbours(family: u8) -> Result<Vec<NeighborMessage>, Error> {
-        dump_netlink_messages::<NeighborMessage>(
-            RTM_GETNEIGH,
-            &NeighborMessage::dump_header(family),
-        )
-    }
-
-    pub(crate) fn get_next_hop_mac(dest: IpAddr) -> Result<Option<[u8; 6]>, Error> {
-        let (next_hop, oif) = Self::route_get(dest)?;
-        let family = match next_hop {
-            IpAddr::V4(_) => libc::AF_INET as u8,
-            IpAddr::V6(_) => libc::AF_INET6 as u8,
-        };
-
-        for msg in Self::dump_neighbours(family)? {
-            if let Some(oif) = oif {
-                if msg.ifindex() != oif {
-                    continue;
-                }
-            }
-
-            let state = msg.state();
-            if state == NUD_INCOMPLETE || state == NUD_FAILED || state == NUD_NONE {
-                continue;
-            }
-
-            if msg.destination() == Some(&next_hop) {
-                if let Some(lladdr) = msg.lladdr() {
-                    if lladdr.len() == 6 {
-                        return Ok(Some([
-                            lladdr[0], lladdr[1], lladdr[2],
-                            lladdr[3], lladdr[4], lladdr[5],
-                        ]));
-                    }
-                }
-            }
-        }
-
-        Ok(None)
-    }
 
     fn ipv6_ndp_proxy_message(name: &str, address: Ipv6Addr) -> Result<NeighborMessage, Error> {
         Ok(NeighborMessage::proxy(

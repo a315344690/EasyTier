@@ -41,8 +41,10 @@ use tokio_util::task::AbortOnDropHandle;
 async fn activate_default_route(
     global_ctx: &ArcGlobalCtx,
     ifname: &str,
-    packet_plane: &Arc<CorePacketPlane>,
-    cancel: &CancellationToken,
+    #[cfg(target_os = "macos")] packet_plane: &Arc<CorePacketPlane>,
+    #[cfg(not(target_os = "macos"))] _packet_plane: &Arc<CorePacketPlane>,
+    #[cfg(target_os = "macos")] cancel: &CancellationToken,
+    #[cfg(not(target_os = "macos"))] _cancel: &CancellationToken,
 ) -> Option<Box<dyn Any + Send>> {
     if !global_ctx.config.get_flags().default_route {
         return None;
