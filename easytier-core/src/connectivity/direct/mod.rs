@@ -62,7 +62,7 @@ mod udp;
 
 const DIRECT_CONNECTOR_BLACKLIST_TIMEOUT: Duration = Duration::from_secs(300);
 const INVALID_SERVICE_BLACKLIST_TIMEOUT: Duration = Duration::from_secs(3600);
-const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRECT_TASK_LOOP_INTERVAL_MS: u64 = 5000;
 const MAX_IPV6_HOLE_PUNCH_CONNECTOR_ADDRS: usize = 16;
 const MAX_UDP_HOLE_PUNCH_CONNECTOR_ADDRS: usize = 16;
@@ -508,9 +508,11 @@ where
                 self.spawn_direct_connect_tasks(dst_peer_id, &ip_list, &listener, &mut tasks)
                     .await;
             }
-            let _ = tasks.join_all().await;
-            if self.peer_manager.has_directly_connected_conn(dst_peer_id) {
-                return Ok(());
+            while let Some(_) = tasks.join_next().await {
+                if self.peer_manager.has_directly_connected_conn(dst_peer_id) {
+                    tasks.abort_all();
+                    return Ok(());
+                }
             }
         }
         Ok(())

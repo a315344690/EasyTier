@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
 
 use crossbeam::atomic::AtomicCell;
 use dashmap::{DashMap, DashSet};
@@ -43,6 +46,8 @@ pub struct Peer {
     peer_public_key: Arc<RwLock<Option<Vec<u8>>>>,
     #[allow(dead_code)]
     default_conn_id_clear_task: AbortOnDropHandle<()>,
+
+    send_seq: AtomicU32,
 }
 
 impl Peer {
@@ -109,10 +114,40 @@ impl Peer {
         let default_conn_id_copy = default_conn_id.clone();
         let default_conn_id_clear_task = AbortOnDropHandle::new(tokio::spawn(async move {
             loop {
-                crate::foundation::time::sleep(std::time::Duration::from_secs(5)).await;
-                if conns_copy.len() > 1 {
-                    default_conn_id_copy.store(PeerConnId::default());
+                crate::foundation::time::sleep(std::time::Duration::from_secs(2)).await;
+                if conns_copy.len() <= 1 {
+                    continue;
                 }
+
+                let mut best_score = u64::MAX;
+                let mut best_id = None;
+                for conn in conns_copy.iter() {
+                    let latency_us = conn.value().get_latency_us();
+                    let loss = conn.value().get_loss_rate_percent() as u64;
+                    if latency_us == 0 || loss >= 100 {
+                        continue;
+                    }
+                    let score = latency_us * 100 / (100 - loss);
+                    if score < best_score {
+                        best_score = score;
+                        best_id = Some(conn.get_conn_id());
+                    }
+                }
+                let Some(best_id) = best_id else { continue };
+
+                let current_id = default_conn_id_copy.load();
+                if let Some(current_conn) = conns_copy.get(&current_id) {
+                    let latency_us = current_conn.get_latency_us();
+                    let loss = current_conn.get_loss_rate_percent() as u64;
+                    if latency_us > 0 && loss < 100 {
+                        let current_score = latency_us * 100 / (100 - loss);
+                        if current_score * 5 <= best_score * 6 {
+                            continue;
+                        }
+                    }
+                }
+
+                default_conn_id_copy.store(best_id);
             }
         }));
 
@@ -130,6 +165,8 @@ impl Peer {
             peer_identity_type,
             peer_public_key,
             default_conn_id_clear_task,
+
+            send_seq: AtomicU32::new(rand::random()),
         }
     }
 
@@ -186,28 +223,46 @@ impl Peer {
         Ok(())
     }
 
+    fn calc_conn_score(conn: &PeerConn) -> Option<u64> {
+        let latency_us = conn.get_latency_us();
+        let loss = conn.get_loss_rate_percent() as u64;
+        if latency_us == 0 || loss >= 100 {
+            return None;
+        }
+        Some(latency_us * 100 / (100 - loss))
+    }
+
     async fn select_conn(&self) -> Option<ArcPeerConn> {
         let default_conn_id = self.default_conn_id.load();
         if let Some(conn) = self.conns.get(&default_conn_id) {
             return Some(conn.clone());
         }
 
-        // find a conn with the smallest latency
-        let mut min_latency = u64::MAX;
+        let mut best_score = u64::MAX;
+        let mut best_id = None;
         for conn in self.conns.iter() {
-            let latency = conn.value().get_stats().latency_us;
-            if latency < min_latency {
-                min_latency = latency;
-                self.default_conn_id.store(conn.get_conn_id());
+            if let Some(score) = Self::calc_conn_score(conn.value()) {
+                if score < best_score {
+                    best_score = score;
+                    best_id = Some(conn.get_conn_id());
+                }
             }
         }
+        let best_id = best_id
+            .or_else(|| self.conns.iter().next().map(|conn| conn.get_conn_id()))?;
 
-        self.conns
-            .get(&self.default_conn_id.load())
-            .map(|conn| conn.clone())
+        self.default_conn_id.store(best_id);
+        self.conns.get(&best_id).map(|conn| conn.clone())
     }
 
-    pub async fn send_msg(&self, msg: ZCPacket) -> Result<(), Error> {
+    pub async fn send_msg(&self, mut msg: ZCPacket) -> Result<(), Error> {
+        if let Some(hdr) = msg.mut_peer_manager_header() {
+            if super::super::traffic_metrics::traffic_kind(hdr.packet_type)
+                == super::super::traffic_metrics::TrafficKind::Data
+            {
+                hdr.seq.set(self.send_seq.fetch_add(1, Ordering::Relaxed));
+            }
+        }
         let Some(conn) = self.select_conn().await else {
             return Err(Error::PeerNoConnectionError(self.peer_node_id));
         };

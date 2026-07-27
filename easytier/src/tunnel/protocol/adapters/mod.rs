@@ -4,6 +4,8 @@ use easytier_core::connectivity::protocol::{ClientProtocolUpgrader, ServerProtoc
 
 use crate::{common::global_ctx::ArcGlobalCtx, socket::tcp::RuntimeTcpSocket};
 
+#[cfg(feature = "fakehttp")]
+mod fakehttp;
 #[cfg(feature = "quic")]
 mod quic;
 #[cfg(feature = "websocket")]
@@ -17,6 +19,8 @@ pub(super) type ServerAdapter = Arc<dyn ServerProtocolUpgrader<RuntimeTcpSocket>
 pub(super) fn client_adapters(global_ctx: &ArcGlobalCtx) -> Vec<ClientAdapter> {
     let _ = global_ctx;
     [
+        #[cfg(feature = "fakehttp")]
+        fakehttp::client_adapter(global_ctx),
         #[cfg(feature = "websocket")]
         websocket::client_adapter(global_ctx),
         #[cfg(feature = "wireguard")]
@@ -31,6 +35,8 @@ pub(super) fn client_adapters(global_ctx: &ArcGlobalCtx) -> Vec<ClientAdapter> {
 pub(super) fn server_adapters(global_ctx: &ArcGlobalCtx) -> Vec<ServerAdapter> {
     let _ = global_ctx;
     [
+        #[cfg(feature = "fakehttp")]
+        fakehttp::server_adapter(global_ctx),
         #[cfg(feature = "websocket")]
         websocket::server_adapter(global_ctx),
         #[cfg(feature = "wireguard")]

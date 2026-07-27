@@ -8,6 +8,7 @@ use crate::{
     gateway::proxy::cidr_monitor::{ProxyCidrDiff, collect_proxy_cidr_diff},
     host::packet::HostPacket,
     peers::peer_manager::PeerManagerCore,
+    proto::core_peer::peer::PeerConnInfo,
 };
 
 #[cfg(feature = "proxy-packet")]
@@ -72,6 +73,15 @@ impl CorePacketPlane {
             collect_proxy_cidr_diff(self.peer_manager.as_ref(), &self.runtime_config, previous)
                 .await,
         )
+    }
+
+    pub async fn list_peer_conns(&self) -> Vec<PeerConnInfo> {
+        self.peer_manager
+            .list_peer_snapshots()
+            .await
+            .into_iter()
+            .flat_map(|s| s.conns)
+            .collect()
     }
 
     pub async fn public_ipv6_routes(&self) -> BTreeSet<cidr::Ipv6Inet> {

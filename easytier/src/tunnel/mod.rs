@@ -11,11 +11,9 @@ use strum::{Display, EnumString, IntoStaticStr, VariantArray};
 pub mod common;
 pub(crate) mod protocol;
 
-// TODO: padding, disguise_protocol and fakehttp need adaptation to new socket-layer architecture
-// pub mod padding;
-// pub(crate) mod disguise_protocol;
-// #[cfg(feature = "fakehttp")]
-// pub mod fakehttp;
+pub(crate) mod disguise_protocol;
+#[cfg(feature = "fakehttp")]
+pub(crate) mod fakehttp;
 
 #[cfg(feature = "wireguard")]
 pub mod wireguard;
@@ -152,31 +150,14 @@ pub enum IpScheme {
 impl IpScheme {
     pub fn port_offset(self) -> u16 {
         let scheme: &'static str = self.into();
-        match easytier_core::connectivity::protocol::protocol_port_offset(scheme) {
-            Some(offset) => offset,
-            None => {
-                // FakeHttp and other native-only schemes not registered in core
-                match self {
-                    #[cfg(feature = "fakehttp")]
-                    Self::FakeHttp => 4,
-                    _ => panic!("IpScheme must have core protocol metadata: {}", scheme),
-                }
-            }
-        }
+        easytier_core::connectivity::protocol::protocol_port_offset(scheme)
+            .unwrap_or_else(|| panic!("IpScheme must have core protocol metadata: {}", scheme))
     }
 
     pub fn default_port(self) -> u16 {
         let scheme: &'static str = self.into();
-        match easytier_core::connectivity::protocol::protocol_default_port(scheme) {
-            Some(port) => port,
-            None => {
-                match self {
-                    #[cfg(feature = "fakehttp")]
-                    Self::FakeHttp => 11010 + self.port_offset(),
-                    _ => panic!("IpScheme must have core protocol metadata: {}", scheme),
-                }
-            }
-        }
+        easytier_core::connectivity::protocol::protocol_default_port(scheme)
+            .unwrap_or_else(|| panic!("IpScheme must have core protocol metadata: {}", scheme))
     }
 }
 

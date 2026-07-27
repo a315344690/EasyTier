@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{any::Any, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use cidr::Ipv4Inet;
@@ -23,6 +23,129 @@ use crate::{
     },
     instance::virtual_nic::NicCtx,
 };
+
+#[cfg(target_os = "linux")]
+use crate::instance::default_route::DefaultRouteManager;
+
+#[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+use crate::instance::default_route_macos::{
+    DefaultRouteManager, extract_ipv4_from_url, extract_ipv4_from_url_str,
+};
+#[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+use tokio_util::task::AbortOnDropHandle;
+
+/// Activate the default route manager if configured. Returns a guard that
+/// cleans up routing rules when dropped. The guard should be stored alongside
+/// the NIC context so its lifetime matches the TUN device.
+#[cfg(any(target_os = "linux", all(target_os = "macos", not(feature = "macos-ne"))))]
+async fn activate_default_route(
+    global_ctx: &ArcGlobalCtx,
+    ifname: &str,
+    packet_plane: &Arc<CorePacketPlane>,
+    cancel: &CancellationToken,
+) -> Option<Box<dyn Any + Send>> {
+    if !global_ctx.config.get_flags().default_route {
+        return None;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let socket_mark = global_ctx.config.get_flags().socket_mark.unwrap_or(0x6846);
+        let mut mgr = DefaultRouteManager::new(ifname.to_owned(), socket_mark);
+        match mgr.activate().await {
+            Ok(()) => Some(Box::new(mgr)),
+            Err(e) => {
+                tracing::error!(?e, "failed to activate default route");
+                None
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+    {
+        use crate::proto::api::instance::PeerConnInfo;
+
+        fn peer_ipv4(info: &PeerConnInfo) -> Option<std::net::Ipv4Addr> {
+            info.tunnel
+                .as_ref()
+                .and_then(|t| t.effective_remote_addr())
+                .and_then(|u| extract_ipv4_from_url_str(&u.url))
+        }
+
+        let mut mgr = DefaultRouteManager::new(ifname.to_owned());
+        let config_ips = global_ctx
+            .config
+            .get_peers()
+            .iter()
+            .filter_map(|p| extract_ipv4_from_url(&p.uri))
+            .collect::<Vec<_>>();
+        let active_ips = packet_plane
+            .list_peer_conns()
+            .await
+            .iter()
+            .filter_map(|conn| {
+                conn.tunnel
+                    .as_ref()
+                    .and_then(|t| t.effective_remote_addr())
+                    .and_then(|u| extract_ipv4_from_url_str(&u.url))
+            })
+            .collect::<Vec<_>>();
+        let initial_ips: Vec<_> = config_ips
+            .into_iter()
+            .chain(active_ips.into_iter())
+            .collect();
+
+        match mgr.activate(initial_ips).await {
+            Ok(()) => {
+                let mgr = Arc::new(tokio::sync::Mutex::new(mgr));
+                let task = {
+                    let mgr = mgr.clone();
+                    let mut subscriber = global_ctx.subscribe();
+                    let cancel = cancel.clone();
+                    AbortOnDropHandle::new(tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                event = subscriber.recv() => {
+                                    match event {
+                                        Ok(GlobalCtxEvent::PeerConnAdded(info)) => {
+                                            if let Some(addr) = peer_ipv4(&info) {
+                                                let _ = mgr.lock().await.add_peer_route(addr).await;
+                                            }
+                                        }
+                                        Ok(GlobalCtxEvent::PeerConnRemoved(info)) => {
+                                            if let Some(addr) = peer_ipv4(&info) {
+                                                let _ = mgr.lock().await.remove_peer_route(addr).await;
+                                            }
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }))
+                };
+                Some(Box::new((task, mgr)) as Box<dyn Any + Send>)
+            }
+            Err(e) => {
+                tracing::error!(?e, "failed to activate default route (macOS)");
+                None
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", not(feature = "macos-ne")))))]
+async fn activate_default_route(
+    _global_ctx: &ArcGlobalCtx,
+    _ifname: &str,
+    _packet_plane: &Arc<CorePacketPlane>,
+    _cancel: &CancellationToken,
+) -> Option<Box<dyn Any + Send>> {
+    None
+}
 
 pub(super) struct NativeTunRuntime {
     global_ctx: ArcGlobalCtx,
@@ -104,17 +227,22 @@ impl NativeTunRuntime {
                     continue;
                 }
 
+                let ifname = nic.ifname().await.unwrap_or_default();
+                let default_route_guard = activate_default_route(
+                    &global_ctx, &ifname, &packet_plane, &cancel,
+                ).await;
+
                 let magic_dns = if let Some(ip) = ipv4 {
                     MagicDnsRuntime::start(
                         global_ctx.clone(),
                         packet_plane.clone(),
-                        nic.ifname().await,
+                        Some(ifname),
                         ip,
                     )
                 } else {
                     MagicDnsRuntime::default()
                 };
-                nic_state.install(nic, magic_dns).await;
+                nic_state.install(nic, magic_dns, default_route_guard).await;
                 if let Some(output) = output.take() {
                     let _ = output.send(Ok(()));
                 }
@@ -210,13 +338,17 @@ impl NativeDhcpIpv4Host {
             _ = self.cancel.cancelled() => anyhow::bail!("instance is closing; DHCP update cancelled"),
             result = nic.run(Some(ip), self.global_ctx.get_ipv6()) => result?,
         }
+        let ifname = nic.ifname().await.unwrap_or_default();
+        let default_route_guard = activate_default_route(
+            &self.global_ctx, &ifname, &self.packet_plane, &self.cancel,
+        ).await;
         let magic_dns = MagicDnsRuntime::start(
             self.global_ctx.clone(),
             self.packet_plane.clone(),
-            nic.ifname().await,
+            Some(ifname),
             ip,
         );
-        self.nic.install(nic, magic_dns).await;
+        self.nic.install(nic, magic_dns, default_route_guard).await;
         self.global_ctx.set_ipv4(Some(ip));
         Ok(Some(ip))
     }

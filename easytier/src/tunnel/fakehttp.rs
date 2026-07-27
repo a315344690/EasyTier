@@ -1,33 +1,29 @@
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
-use async_trait::async_trait;
-use futures::stream::FuturesUnordered;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::time::{Duration, timeout};
-
-use super::{
-    FromUrl, IpVersion, Tunnel, TunnelError, TunnelListener,
-    common::{FramedReader, FramedWriter, TunnelWrapper, bind, wait_for_connect_futures},
-    disguise_protocol::{
-        self, build_fake_client_finished, build_fake_server_encrypted_handshake,
-        build_http_request, build_http_response, build_tls_client_hello, build_tls_server_hello,
-        compute_ws_accept, extract_ws_key,
-    },
+use easytier_core::{
+    socket::tcp::VirtualTcpSocket,
+    tunnel::{Tunnel, TunnelError, framed::{FramedReader, FramedWriter}, wrapper::TunnelWrapper},
 };
-use crate::tunnel::TunnelInfo;
-use crate::tunnel::common::apply_socket_mark;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+use super::disguise_protocol::{
+    self, build_fake_client_finished, build_fake_server_encrypted_handshake, build_http_request,
+    build_http_response, build_tls_client_hello, build_tls_server_hello, compute_ws_accept,
+    extract_ws_key,
+};
+use crate::proto::common::TunnelInfo;
 
 const TCP_MTU_BYTES: usize = 2000;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 // --- Payload types ---
 
 #[derive(Debug, Clone)]
-enum FakeHttpPayload {
+pub(crate) enum FakeHttpPayload {
     Http { host: String },
     Https { host: String },
 }
@@ -44,7 +40,7 @@ impl FakeHttpPayload {
     }
 }
 
-fn parse_payloads(hosts: Vec<String>) -> Vec<FakeHttpPayload> {
+pub(crate) fn parse_payloads(hosts: Vec<String>) -> Vec<FakeHttpPayload> {
     let mut payloads = Vec::new();
     for entry in hosts {
         if let Some(host) = entry.strip_prefix("http://") {
@@ -62,8 +58,6 @@ fn parse_payloads(hosts: Vec<String>) -> Vec<FakeHttpPayload> {
     payloads
 }
 
-// Protocol builders are in super::disguise_protocol
-
 // --- TLS Application Data record IO adapters ---
 
 const TLS_RECORD_HEADER_SIZE: usize = disguise_protocol::TLS_RECORD_HEADER_SIZE;
@@ -73,7 +67,7 @@ struct TlsRecordWriter<W> {
     inner: W,
     send_buf: Vec<u8>,
     send_pos: usize,
-    payload_len: usize, // how many payload bytes are in current send_buf
+    payload_len: usize,
 }
 
 impl<W> TlsRecordWriter<W> {
@@ -95,7 +89,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for TlsRecordWriter<W> {
     ) -> Poll<std::io::Result<usize>> {
         let me = &mut *self;
 
-        // If we have a pending record, flush it
         if !me.send_buf.is_empty() {
             while me.send_pos < me.send_buf.len() {
                 match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_pos..]) {
@@ -110,7 +103,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for TlsRecordWriter<W> {
                     Poll::Pending => return Poll::Pending,
                 }
             }
-            // Fully flushed — report how many payload bytes we consumed
             let n = me.payload_len;
             me.send_buf.clear();
             me.send_pos = 0;
@@ -122,7 +114,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for TlsRecordWriter<W> {
             return Poll::Ready(Ok(0));
         }
 
-        // Build a new TLS Application Data record
         let chunk_len = buf.len().min(TLS_MAX_PLAINTEXT);
         me.send_buf.reserve(TLS_RECORD_HEADER_SIZE + chunk_len);
         me.send_buf
@@ -131,7 +122,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for TlsRecordWriter<W> {
         me.send_pos = 0;
         me.payload_len = chunk_len;
 
-        // Try to write it all out
         while me.send_pos < me.send_buf.len() {
             match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_pos..]) {
                 Poll::Ready(Ok(0)) => {
@@ -208,7 +198,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
     ) -> Poll<std::io::Result<()>> {
         let me = &mut *self;
 
-        // 1. Serve residual data from a previous partial delivery
         if me.residual_pos < me.residual.len() {
             let to_copy = (me.residual.len() - me.residual_pos).min(buf.remaining());
             buf.put_slice(&me.residual[me.residual_pos..me.residual_pos + to_copy]);
@@ -220,7 +209,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
             return Poll::Ready(Ok(()));
         }
 
-        // 2. If mid-record, read payload into local buf then copy to caller
         if me.remaining_in_record > 0 {
             let to_read = me.remaining_in_record.min(buf.remaining());
             if to_read == 0 {
@@ -247,20 +235,18 @@ impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
             }
         }
 
-        // 3. Read raw data from socket
         let mut raw = [0u8; 4096];
         let mut raw_buf = ReadBuf::new(&mut raw);
         match Pin::new(&mut me.inner).poll_read(cx, &mut raw_buf) {
             Poll::Ready(Ok(())) => {
                 let n = raw_buf.filled().len();
                 if n == 0 {
-                    return Poll::Ready(Ok(())); // EOF
+                    return Poll::Ready(Ok(()));
                 }
 
                 let data = &raw[..n];
                 let mut i = 0;
 
-                // Complete a partial header from the previous read
                 if me.hdr_len > 0 {
                     let need = TLS_RECORD_HEADER_SIZE - me.hdr_len;
                     let avail = data.len().min(need);
@@ -270,12 +256,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
                     i = avail;
 
                     if me.hdr_len < TLS_RECORD_HEADER_SIZE {
-                        // Still not enough for a full header
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
                     }
 
-                    // Header now complete
                     if me.hdr_buf[0] == 0x17 && me.hdr_buf[1] == 0x03 {
                         me.remaining_in_record =
                             u16::from_be_bytes([me.hdr_buf[3], me.hdr_buf[4]]) as usize;
@@ -286,7 +270,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
                     me.hdr_len = 0;
                 }
 
-                // Process the rest of the buffer
                 while i < data.len() {
                     if me.remaining_in_record > 0 {
                         let take = me.remaining_in_record.min(data.len() - i);
@@ -303,7 +286,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
                             i = data.len();
                         }
                     } else {
-                        // Partial header at buffer boundary — stash it
                         let partial = data.len() - i;
                         me.hdr_buf[..partial].copy_from_slice(&data[i..]);
                         me.hdr_len = partial;
@@ -311,7 +293,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
                     }
                 }
 
-                // Deliver decoded payload
                 if !me.residual.is_empty() {
                     let to_copy = me.residual.len().min(buf.remaining());
                     buf.put_slice(&me.residual[..to_copy]);
@@ -342,7 +323,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
                         Poll::Pending => Poll::Pending,
                     }
                 } else {
-                    // Rare: all data was just headers — retry
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
@@ -353,17 +333,14 @@ impl<R: AsyncRead + Unpin> AsyncRead for TlsRecordReader<R> {
     }
 }
 
-
-
 // --- WebSocket Frame Writer/Reader ---
-// Wraps data in RFC 6455 binary frames so post-101 traffic passes DPI frame checks.
 
 struct WsFrameWriter<W> {
     inner: W,
     is_client: bool,
     send_buf: Vec<u8>,
     send_offset: usize,
-    pending_payload_len: usize, // payload len of frame currently in send_buf
+    pending_payload_len: usize,
 }
 
 impl<W> WsFrameWriter<W> {
@@ -390,7 +367,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for WsFrameWriter<W> {
     ) -> Poll<std::io::Result<usize>> {
         let me = &mut *self;
 
-        // If we have a pending frame, finish sending it first
         if me.has_pending() {
             loop {
                 match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_offset..]) {
@@ -420,7 +396,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for WsFrameWriter<W> {
             return Poll::Ready(Ok(0));
         }
 
-        // Build WS binary frame into send_buf
         me.send_buf.clear();
         me.send_offset = 0;
 
@@ -464,7 +439,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for WsFrameWriter<W> {
 
         me.pending_payload_len = payload_len;
 
-        // Try to write the entire frame
         loop {
             match Pin::new(&mut me.inner).poll_write(cx, &me.send_buf[me.send_offset..]) {
                 Poll::Ready(Ok(0)) => {
@@ -569,7 +543,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
         loop {
             match me.state {
                 WsReadState::ReadingHeader => {
-                    // Read header bytes incrementally
                     while me.hdr_read < me.hdr_len {
                         let mut tmp = ReadBuf::new(&mut me.hdr_buf[me.hdr_read..me.hdr_len]);
                         match Pin::new(&mut me.inner).poll_read(cx, &mut tmp) {
@@ -577,7 +550,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
                                 let n = tmp.filled().len();
                                 if n == 0 {
                                     return if me.hdr_read == 0 {
-                                        Poll::Ready(Ok(())) // clean EOF
+                                        Poll::Ready(Ok(()))
                                     } else {
                                         Poll::Ready(Err(std::io::Error::new(
                                             std::io::ErrorKind::UnexpectedEof,
@@ -591,7 +564,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
                             Poll::Pending => return Poll::Pending,
                         }
 
-                        // After reading base 2 bytes, determine full header size
                         if me.hdr_read >= 2 && me.hdr_len == 2 {
                             let mask_bit = (me.hdr_buf[1] & 0x80) != 0;
                             let len_code = (me.hdr_buf[1] & 0x7F) as usize;
@@ -602,11 +574,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
                             };
                             let mask_len = if mask_bit { 4 } else { 0 };
                             me.hdr_len = 2 + ext_len + mask_len;
-                            // hdr_len now correct, loop continues reading remaining bytes
                         }
                     }
 
-                    // Full header read — parse it
                     let mask_bit = (me.hdr_buf[1] & 0x80) != 0;
                     let len_code = (me.hdr_buf[1] & 0x7F) as usize;
                     let payload_len = match len_code {
@@ -630,14 +600,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
                     me.remaining_payload = payload_len;
                     me.mask_offset = 0;
 
-                    // Control frames (opcode >= 0x08): skip payload, read next frame
                     let opcode = me.hdr_buf[0] & 0x0F;
                     if opcode >= 0x08 {
                         if me.remaining_payload == 0 {
                             me.reset_for_next_frame();
                             continue;
                         }
-                        // Drain control frame payload (max 125 bytes per RFC 6455)
                         let mut discard = [0u8; 125];
                         let to_drain = me.remaining_payload.min(125);
                         let mut tmp = ReadBuf::new(&mut discard[..to_drain]);
@@ -664,13 +632,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
                     }
 
                     if payload_len == 0 {
-                        // Empty data frame — read next
                         me.reset_for_next_frame();
                         continue;
                     }
 
                     me.state = WsReadState::ReadingPayload;
-                    // Fall through to payload reading
                 }
                 WsReadState::ReadingPayload => {
                     if me.remaining_payload == 0 {
@@ -684,7 +650,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
                     }
 
                     if !me.has_mask {
-                        // No mask: read directly into caller's buffer (zero-copy)
                         let before = buf.filled().len();
                         let dst = buf.initialize_unfilled_to(to_read);
                         let mut tmp_buf = ReadBuf::new(&mut dst[..to_read]);
@@ -699,7 +664,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
                                 }
                                 me.remaining_payload -= n;
                                 me.mask_offset += n;
-                                // Advance caller's buf by what we read
                                 buf.set_filled(before + n);
                                 return Poll::Ready(Ok(()));
                             }
@@ -707,7 +671,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
                             Poll::Pending => return Poll::Pending,
                         }
                     } else {
-                        // Masked: read into internal buffer, unmask, then copy
                         let read_len = to_read.min(me.read_buf.len());
                         let mut tmp_buf = ReadBuf::new(&mut me.read_buf[..read_len]);
                         match Pin::new(&mut me.inner).poll_read(cx, &mut tmp_buf) {
@@ -737,10 +700,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for WsFrameReader<R> {
     }
 }
 
-
 // --- Handshake logic ---
 
-async fn drain_tls_records(stream: &mut TcpStream, count: usize) -> Result<(), TunnelError> {
+async fn drain_tls_records<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    count: usize,
+) -> Result<(), TunnelError> {
     let mut hdr = [0u8; 5];
     for _ in 0..count {
         stream.read_exact(&mut hdr).await?;
@@ -750,8 +715,6 @@ async fn drain_tls_records(stream: &mut TcpStream, count: usize) -> Result<(), T
                 "fakehttp: TLS record too large during handshake drain".to_string(),
             ));
         }
-        // CCS records have content_type 0x14 and are only 1 byte payload
-        // but we still read via the length field for uniformity
         let mut body = vec![0u8; record_len];
         stream.read_exact(&mut body).await?;
     }
@@ -763,17 +726,19 @@ enum HandshakeResult {
     TlsWrapped,
 }
 
-async fn perform_client_handshake(
-    stream: &mut TcpStream,
+async fn perform_client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     payload: &FakeHttpPayload,
 ) -> Result<HandshakeResult, TunnelError> {
     let (data, ws_key) = payload.client_bytes();
     stream.write_all(&data).await?;
+    stream.flush().await?;
 
     match payload {
         FakeHttpPayload::Https { .. } => {
             drain_tls_records(stream, 4).await?;
             stream.write_all(&build_fake_client_finished()).await?;
+            stream.flush().await?;
             Ok(HandshakeResult::TlsWrapped)
         }
         FakeHttpPayload::Http { .. } => {
@@ -808,31 +773,21 @@ async fn perform_client_handshake(
     }
 }
 
-async fn perform_server_handshake(stream: &mut TcpStream) -> Result<HandshakeResult, TunnelError> {
-    let mut peek_buf = [0u8; 4];
-    let n = stream.peek(&mut peek_buf).await?;
-    if n == 0 {
-        return Err(TunnelError::InternalError(
-            "fakehttp handshake: client closed connection".to_string(),
-        ));
-    }
-
-    if (n >= 3 && &peek_buf[..3] == b"GET") || (n >= 4 && &peek_buf[..4] == b"POST") {
-        server_handle_http(stream).await?;
-        Ok(HandshakeResult::Plain)
-    } else if n >= 2 && peek_buf[0] == 0x16 && peek_buf[1] == 0x03 {
-        server_handle_tls(stream).await?;
-        Ok(HandshakeResult::TlsWrapped)
-    } else {
-        Err(TunnelError::InternalError(
-            "fakehttp: unrecognized protocol (expected HTTP or TLS)".to_string(),
-        ))
-    }
-}
-
-async fn server_handle_http(stream: &mut TcpStream) -> Result<(), TunnelError> {
+async fn server_handle_http<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    first_bytes: &[u8],
+) -> Result<(), TunnelError> {
     let mut buf = Vec::with_capacity(1024);
+    buf.extend_from_slice(first_bytes);
     let mut search_from: usize = 0;
+    if buf[search_from..].windows(4).any(|w| w == b"\r\n\r\n") {
+        let ws_accept = extract_ws_key(&buf)
+            .map(|key| compute_ws_accept(key))
+            .unwrap_or_default();
+        stream.write_all(&build_http_response(&ws_accept)).await?;
+        stream.flush().await?;
+        return Ok(());
+    }
     loop {
         let mut tmp = [0u8; 1024];
         let nr = stream.read(&mut tmp).await?;
@@ -857,21 +812,29 @@ async fn server_handle_http(stream: &mut TcpStream) -> Result<(), TunnelError> {
         .map(|key| compute_ws_accept(key))
         .unwrap_or_default();
     stream.write_all(&build_http_response(&ws_accept)).await?;
+    stream.flush().await?;
     Ok(())
 }
 
-
-async fn server_handle_tls(stream: &mut TcpStream) -> Result<(), TunnelError> {
-    // Read 5-byte TLS record header to get payload length
+async fn server_handle_tls<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    first_bytes: &[u8],
+) -> Result<(), TunnelError> {
+    // We already have the first bytes of the TLS record header.
+    // Read the remaining header byte(s) to complete the 5-byte TLS record header.
     let mut header = [0u8; 5];
-    stream.read_exact(&mut header).await?;
+    header[..first_bytes.len()].copy_from_slice(first_bytes);
+    if first_bytes.len() < 5 {
+        stream
+            .read_exact(&mut header[first_bytes.len()..])
+            .await?;
+    }
     let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
     if record_len > 16384 {
         return Err(TunnelError::InternalError(
             "fakehttp: TLS record too large".to_string(),
         ));
     }
-    // Read the full record body to extract session_id
     let mut record_body = vec![0u8; record_len];
     stream.read_exact(&mut record_body).await?;
 
@@ -888,314 +851,122 @@ async fn server_handle_tls(stream: &mut TcpStream) -> Result<(), TunnelError> {
         None
     };
 
-    // Send ServerHello + fake encrypted handshake (CCS + encrypted records)
     let server_hello = build_tls_server_hello(session_id);
     let fake_hs = build_fake_server_encrypted_handshake();
     let mut combined = Vec::with_capacity(server_hello.len() + fake_hs.len());
     combined.extend_from_slice(&server_hello);
     combined.extend_from_slice(&fake_hs);
     stream.write_all(&combined).await?;
+    stream.flush().await?;
 
-    // Read client's CCS + fake Finished (2 TLS records, variable size)
     drain_tls_records(stream, 2).await?;
 
     Ok(())
 }
 
+// --- Public upgrade functions ---
 
-// --- Shared TCP connection helper ---
+pub(crate) async fn upgrade_accepted<S: VirtualTcpSocket>(
+    mut socket: S,
+    local_url: url::Url,
+) -> Result<Box<dyn Tunnel>, TunnelError> {
+    let peer_addr = socket.peer_addr()?;
 
-async fn tcp_connect(
-    addr: SocketAddr,
-    socket_mark: Option<u32>,
-) -> Result<TcpStream, TunnelError> {
-    if socket_mark.is_some() {
-        let socket = if addr.is_ipv4() {
-            TcpSocket::new_v4()?
-        } else {
-            TcpSocket::new_v6()?
-        };
-        apply_socket_mark(&socket2::SockRef::from(&socket), socket_mark)?;
-        Ok(socket.connect(addr).await?)
+    // Read first 4 bytes to detect protocol (replaces peek)
+    let mut first_bytes = [0u8; 4];
+    socket.read_exact(&mut first_bytes).await?;
+
+    let hs_result = if (first_bytes[..3] == *b"GET") || (first_bytes[..4] == *b"POST") {
+        server_handle_http(&mut socket, &first_bytes).await?;
+        HandshakeResult::Plain
+    } else if first_bytes[0] == 0x16 && first_bytes[1] == 0x03 {
+        server_handle_tls(&mut socket, &first_bytes).await?;
+        HandshakeResult::TlsWrapped
     } else {
-        Ok(TcpStream::connect(addr).await?)
+        return Err(TunnelError::InternalError(
+            "fakehttp: unrecognized protocol (expected HTTP or TLS)".to_string(),
+        ));
+    };
+
+    let info = TunnelInfo {
+        tunnel_type: "fakehttp".to_owned(),
+        local_addr: Some(local_url.into()),
+        remote_addr: Some(
+            super::build_url_from_socket_addr(&peer_addr.to_string(), "fakehttp").into(),
+        ),
+        resolved_remote_addr: Some(
+            super::build_url_from_socket_addr(&peer_addr.to_string(), "fakehttp").into(),
+        ),
+    };
+
+    let (r, w) = socket.into_split();
+    match hs_result {
+        HandshakeResult::TlsWrapped => Ok(Box::new(TunnelWrapper::new(
+            FramedReader::new(TlsRecordReader::new(r), TCP_MTU_BYTES),
+            FramedWriter::new(TlsRecordWriter::new(w)),
+            Some(info),
+        ))),
+        HandshakeResult::Plain => Ok(Box::new(TunnelWrapper::new(
+            FramedReader::new(WsFrameReader::new(r), TCP_MTU_BYTES),
+            FramedWriter::new(WsFrameWriter::new(w, false)),
+            Some(info),
+        ))),
     }
 }
 
-fn build_tunnel_info(stream: &TcpStream, remote_url: &url::Url) -> Result<TunnelInfo, TunnelError> {
-    Ok(TunnelInfo {
+pub(crate) async fn upgrade_connected<S: VirtualTcpSocket>(
+    mut socket: S,
+    requested_url: url::Url,
+    payloads: &[FakeHttpPayload],
+    counter: &AtomicUsize,
+) -> Result<Box<dyn Tunnel>, TunnelError> {
+    if payloads.is_empty() {
+        return Err(TunnelError::InternalError(
+            "no valid fakehttp payload configured".to_string(),
+        ));
+    }
+
+    let local_addr = socket.local_addr()?;
+    let peer_addr = socket.peer_addr()?;
+
+    let idx = counter.fetch_add(1, Ordering::Relaxed) % payloads.len();
+    let payload = &payloads[idx];
+
+    let hs_result = perform_client_handshake(&mut socket, payload).await?;
+
+    let info = TunnelInfo {
         tunnel_type: "fakehttp".to_owned(),
         local_addr: Some(
-            super::build_url_from_socket_addr(&stream.local_addr()?.to_string(), "fakehttp").into(),
+            super::build_url_from_socket_addr(&local_addr.to_string(), "fakehttp").into(),
         ),
-        remote_addr: Some(remote_url.clone().into()),
+        remote_addr: Some(requested_url.into()),
         resolved_remote_addr: Some(
-            super::build_url_from_socket_addr(&stream.peer_addr()?.to_string(), "fakehttp").into(),
+            super::build_url_from_socket_addr(&peer_addr.to_string(), "fakehttp").into(),
         ),
-    })
-}
+    };
 
-// --- Listener ---
-
-#[derive(Debug)]
-pub struct FakeHttpTunnelListener {
-    addr: url::Url,
-    listener: Option<TcpListener>,
-    socket_mark: Option<u32>,
-    #[allow(dead_code)]
-    payloads: Vec<FakeHttpPayload>,
-}
-
-impl FakeHttpTunnelListener {
-    pub fn new(addr: url::Url, hosts: Vec<String>) -> Self {
-        let payloads = parse_payloads(hosts);
-        if payloads.is_empty() {
-            tracing::warn!("fakehttp listener created with no valid payloads; will still accept connections");
-        }
-        FakeHttpTunnelListener {
-            addr,
-            listener: None,
-            socket_mark: None,
-            payloads,
-        }
-    }
-
-    pub fn set_socket_mark(&mut self, socket_mark: Option<u32>) {
-        self.socket_mark = socket_mark;
-    }
-
-    async fn do_accept(&self) -> Result<Box<dyn Tunnel>, TunnelError> {
-        let listener = self.listener.as_ref().unwrap();
-        let (mut stream, _) = listener.accept().await?;
-
-        if let Err(e) = stream.set_nodelay(true) {
-            tracing::warn!(?e, "fakehttp: set_nodelay fail in accept");
-        }
-
-        let hs_result = timeout(HANDSHAKE_TIMEOUT, perform_server_handshake(&mut stream))
-            .await
-            .map_err(|_| {
-                TunnelError::InternalError("fakehttp handshake timed out".to_string())
-            })??;
-
-        let local_url = self.local_url();
-        let info = TunnelInfo {
-            tunnel_type: "fakehttp".to_owned(),
-            local_addr: Some(local_url.into()),
-            remote_addr: Some(
-                super::build_url_from_socket_addr(
-                    &stream.peer_addr()?.to_string(),
-                    "fakehttp",
-                )
-                .into(),
-            ),
-            resolved_remote_addr: Some(
-                super::build_url_from_socket_addr(
-                    &stream.peer_addr()?.to_string(),
-                    "fakehttp",
-                )
-                .into(),
-            ),
-        };
-
-        let (r, w) = stream.into_split();
-        match hs_result {
-            HandshakeResult::TlsWrapped => Ok(Box::new(TunnelWrapper::new(
-                FramedReader::new(TlsRecordReader::new(r), TCP_MTU_BYTES),
-                FramedWriter::new(TlsRecordWriter::new(w)),
-                Some(info),
-            ))),
-            HandshakeResult::Plain => Ok(Box::new(TunnelWrapper::new(
-                FramedReader::new(WsFrameReader::new(r), TCP_MTU_BYTES),
-                FramedWriter::new(WsFrameWriter::new(w, false)),
-                Some(info),
-            ))),
-        }
-    }
-}
-
-#[async_trait]
-impl TunnelListener for FakeHttpTunnelListener {
-    async fn listen(&mut self) -> Result<(), TunnelError> {
-        self.listener = None;
-        let addr = SocketAddr::from_url(self.addr.clone(), IpVersion::Both).await?;
-        let listener = bind::<TcpListener>()
-            .addr(addr)
-            .only_v6(true)
-            .maybe_socket_mark(self.socket_mark)
-            .call()?;
-        self.addr
-            .set_port(Some(listener.local_addr()?.port()))
-            .unwrap();
-        self.listener = Some(listener);
-        Ok(())
-    }
-
-    async fn accept(&mut self) -> Result<Box<dyn Tunnel>, TunnelError> {
-        loop {
-            match self.do_accept().await {
-                Ok(ret) => return Ok(ret),
-                Err(e) => {
-                    let is_io_retryable = if let TunnelError::IOError(io) = &e {
-                        matches!(
-                            io.kind(),
-                            std::io::ErrorKind::NotConnected
-                            | std::io::ErrorKind::ConnectionAborted
-                            | std::io::ErrorKind::ConnectionRefused
-                            | std::io::ErrorKind::ConnectionReset
-                        )
-                    } else {
-                        false
-                    };
-                    let should_retry =
-                        is_io_retryable || matches!(&e, TunnelError::InternalError(_));
-                    if should_retry {
-                        tracing::warn!(?e, "fakehttp accept: retryable error");
-                        continue;
-                    }
-                    tracing::warn!(?e, "fakehttp accept fail");
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    fn local_url(&self) -> url::Url {
-        self.addr.clone()
-    }
-}
-
-// --- Connector ---
-
-#[derive(Debug)]
-pub struct FakeHttpTunnelConnector {
-    addr: url::Url,
-    bind_addrs: Vec<SocketAddr>,
-    ip_version: IpVersion,
-    resolved_addr: Option<SocketAddr>,
-    socket_mark: Option<u32>,
-    payloads: Vec<FakeHttpPayload>,
-    counter: AtomicUsize,
-}
-
-impl FakeHttpTunnelConnector {
-    pub fn new(addr: url::Url, hosts: Vec<String>) -> Self {
-        let payloads = parse_payloads(hosts);
-        FakeHttpTunnelConnector {
-            addr,
-            bind_addrs: vec![],
-            ip_version: IpVersion::Both,
-            resolved_addr: None,
-            socket_mark: None,
-            payloads,
-            counter: AtomicUsize::new(0),
-        }
-    }
-
-    fn next_payload(&self) -> &FakeHttpPayload {
-        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.payloads.len();
-        &self.payloads[idx]
-    }
-}
-
-#[async_trait]
-impl super::TunnelConnector for FakeHttpTunnelConnector {
-    async fn connect(&mut self) -> Result<Box<dyn Tunnel>, TunnelError> {
-        if self.payloads.is_empty() {
-            return Err(TunnelError::InternalError(
-                "no valid fakehttp payload configured".to_string(),
-            ));
-        }
-
-        let addr = match self.resolved_addr {
-            Some(addr) => addr,
-            None => SocketAddr::from_url(self.addr.clone(), self.ip_version).await?,
-        };
-
-        tracing::info!(url = ?self.addr, ?addr, "fakehttp connect start");
-
-        let mut stream = if self.bind_addrs.is_empty() {
-            tcp_connect(addr, self.socket_mark).await?
-        } else {
-            let futures = FuturesUnordered::new();
-            for bind_addr in &self.bind_addrs {
-                match bind::<TcpSocket>()
-                    .addr(*bind_addr)
-                    .only_v6(true)
-                    .maybe_socket_mark(self.socket_mark)
-                    .call()
-                {
-                    Ok(socket) => futures.push(socket.connect(addr)),
-                    Err(e) => {
-                        tracing::error!(?bind_addr, ?addr, ?e, "fakehttp bind fail");
-                    }
-                }
-            }
-            wait_for_connect_futures(futures).await?
-        };
-
-        if let Err(e) = stream.set_nodelay(true) {
-            tracing::warn!(?e, "fakehttp: set_nodelay fail");
-        }
-
-        let payload = self.next_payload();
-        let hs_result = timeout(HANDSHAKE_TIMEOUT, perform_client_handshake(&mut stream, payload))
-            .await
-            .map_err(|_| {
-                TunnelError::InternalError(
-                    "fakehttp handshake timed out, remote may not support fakehttp".to_string(),
-                )
-            })??;
-
-        tracing::info!(url = ?self.addr, ?addr, "fakehttp connect success");
-
-        let info = build_tunnel_info(&stream, &self.addr)?;
-        let (r, w) = stream.into_split();
-        match hs_result {
-            HandshakeResult::TlsWrapped => Ok(Box::new(TunnelWrapper::new(
-                FramedReader::new(TlsRecordReader::new(r), TCP_MTU_BYTES),
-                FramedWriter::new(TlsRecordWriter::new(w)),
-                Some(info),
-            ))),
-            HandshakeResult::Plain => Ok(Box::new(TunnelWrapper::new(
-                FramedReader::new(WsFrameReader::new(r), TCP_MTU_BYTES),
-                FramedWriter::new(WsFrameWriter::new(w, true)),
-                Some(info),
-            ))),
-        }
-    }
-
-    fn remote_url(&self) -> url::Url {
-        self.addr.clone()
-    }
-
-    fn set_bind_addrs(&mut self, addrs: Vec<SocketAddr>) {
-        self.bind_addrs = addrs;
-    }
-
-    fn set_ip_version(&mut self, ip_version: IpVersion) {
-        self.ip_version = ip_version;
-    }
-
-    fn set_resolved_addr(&mut self, addr: SocketAddr) {
-        self.resolved_addr = Some(addr);
-    }
-
-    fn set_socket_mark(&mut self, socket_mark: Option<u32>) {
-        self.socket_mark = socket_mark;
+    let (r, w) = socket.into_split();
+    match hs_result {
+        HandshakeResult::TlsWrapped => Ok(Box::new(TunnelWrapper::new(
+            FramedReader::new(TlsRecordReader::new(r), TCP_MTU_BYTES),
+            FramedWriter::new(TlsRecordWriter::new(w)),
+            Some(info),
+        ))),
+        HandshakeResult::Plain => Ok(Box::new(TunnelWrapper::new(
+            FramedReader::new(WsFrameReader::new(r), TCP_MTU_BYTES),
+            FramedWriter::new(WsFrameWriter::new(w, true)),
+            Some(info),
+        ))),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use base64::prelude::{BASE64_STANDARD, Engine as _};
-
-    use crate::tunnel::{
-        TunnelConnector,
-        common::tests::{_tunnel_bench, _tunnel_pingpong},
-    };
-
     use super::*;
+    use base64::prelude::{BASE64_STANDARD, Engine as _};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::socket::tcp::RuntimeTcpSocket;
 
     fn http_hosts() -> Vec<String> {
         vec!["http://www.example.com".to_string()]
@@ -1205,59 +976,84 @@ mod tests {
         vec!["https://www.example.com".to_string()]
     }
 
+    async fn test_pingpong(hosts: Vec<String>, port: u16) {
+        let payloads = parse_payloads(hosts);
+        let counter = AtomicUsize::new(0);
+
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        let local_url: url::Url = format!("fakehttp://127.0.0.1:{}", listener.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+
+        let server_url = local_url.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let socket = RuntimeTcpSocket::new(stream);
+            upgrade_accepted(socket, server_url).await.unwrap()
+        });
+
+        let client_url = local_url.clone();
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", local_url.port().unwrap()))
+            .await
+            .unwrap();
+        let socket = RuntimeTcpSocket::new(stream);
+        let client_tunnel = upgrade_connected(socket, client_url, &payloads, &counter)
+            .await
+            .unwrap();
+
+        let server_tunnel = server.await.unwrap();
+
+        use easytier_core::packet::ZCPacket;
+        use futures::{SinkExt, StreamExt};
+
+        let (mut c_recv, mut c_send) = client_tunnel.split();
+        let (mut s_recv, mut s_send) = server_tunnel.split();
+
+        let data = b"hello fakehttp";
+        let pkt = ZCPacket::new_with_payload(data);
+        c_send.send(pkt).await.unwrap();
+
+        let received = s_recv.next().await.unwrap().unwrap();
+        assert_eq!(received.payload(), data);
+
+        let reply = ZCPacket::new_with_payload(b"reply");
+        s_send.send(reply).await.unwrap();
+
+        let received = c_recv.next().await.unwrap().unwrap();
+        assert_eq!(received.payload(), b"reply");
+    }
+
     #[tokio::test]
     async fn fakehttp_http_pingpong() {
-        let listener =
-            FakeHttpTunnelListener::new("fakehttp://0.0.0.0:41011".parse().unwrap(), http_hosts());
-        let connector = FakeHttpTunnelConnector::new(
-            "fakehttp://127.0.0.1:41011".parse().unwrap(),
-            http_hosts(),
-        );
-        _tunnel_pingpong(listener, connector).await
+        test_pingpong(http_hosts(), 0).await;
     }
 
     #[tokio::test]
     async fn fakehttp_https_pingpong() {
-        let listener = FakeHttpTunnelListener::new(
-            "fakehttp://0.0.0.0:41012".parse().unwrap(),
-            https_hosts(),
-        );
-        let connector = FakeHttpTunnelConnector::new(
-            "fakehttp://127.0.0.1:41012".parse().unwrap(),
-            https_hosts(),
-        );
-        _tunnel_pingpong(listener, connector).await
+        test_pingpong(https_hosts(), 0).await;
     }
 
     #[tokio::test]
-    async fn fakehttp_http_bench() {
-        let listener =
-            FakeHttpTunnelListener::new("fakehttp://0.0.0.0:41013".parse().unwrap(), http_hosts());
-        let connector = FakeHttpTunnelConnector::new(
-            "fakehttp://127.0.0.1:41013".parse().unwrap(),
-            http_hosts(),
-        );
-        _tunnel_bench(listener, connector).await
-    }
+    async fn fakehttp_no_payload_fails() {
+        let payloads = parse_payloads(vec!["invalid_entry".to_string()]);
+        let counter = AtomicUsize::new(0);
 
-    #[tokio::test]
-    async fn fakehttp_ipv6_pingpong() {
-        let listener =
-            FakeHttpTunnelListener::new("fakehttp://[::1]:41014".parse().unwrap(), http_hosts());
-        let connector = FakeHttpTunnelConnector::new(
-            "fakehttp://[::1]:41014".parse().unwrap(),
-            http_hosts(),
-        );
-        _tunnel_pingpong(listener, connector).await
-    }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
 
-    #[tokio::test]
-    async fn fakehttp_no_payload_connector_fails() {
-        let mut connector = FakeHttpTunnelConnector::new(
-            "fakehttp://127.0.0.1:41015".parse().unwrap(),
-            vec!["invalid_entry".to_string()],
-        );
-        let result = connector.connect().await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        let socket = RuntimeTcpSocket::new(stream);
+        let result = upgrade_connected(
+            socket,
+            format!("fakehttp://127.0.0.1:{}", port).parse().unwrap(),
+            &payloads,
+            &counter,
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("no valid fakehttp payload"));
@@ -1338,6 +1134,7 @@ mod tests {
             .sum()
     }
 
+    #[allow(dead_code)]
     struct ClientHelloFields<'a> {
         version: [u8; 2],
         random: &'a [u8],
@@ -1359,7 +1156,6 @@ mod tests {
         let session_id = &body[35..35 + sid_len];
         let mut offset = 35 + sid_len;
 
-        // cipher suites
         if offset + 2 > body.len() {
             return None;
         }
@@ -1375,14 +1171,12 @@ mod tests {
         }
         offset += cs_len;
 
-        // compression
         if offset + 1 > body.len() {
             return None;
         }
         let comp_len = body[offset] as usize;
         offset += 1 + comp_len;
 
-        // extensions
         if offset + 2 > body.len() {
             return None;
         }
@@ -1436,18 +1230,9 @@ mod tests {
             ch.cipher_suites.iter().any(|&cs| is_grease(cs)),
             "should contain GREASE cipher suite"
         );
-        assert!(
-            ch.cipher_suites.contains(&0x1301),
-            "should contain TLS_AES_128_GCM"
-        );
-        assert!(
-            ch.cipher_suites.contains(&0x1302),
-            "should contain TLS_AES_256_GCM"
-        );
-        assert!(
-            ch.cipher_suites.contains(&0x1303),
-            "should contain TLS_CHACHA20"
-        );
+        assert!(ch.cipher_suites.contains(&0x1301), "should contain TLS_AES_128_GCM");
+        assert!(ch.cipher_suites.contains(&0x1302), "should contain TLS_AES_256_GCM");
+        assert!(ch.cipher_suites.contains(&0x1303), "should contain TLS_CHACHA20");
     }
 
     #[test]
@@ -1459,35 +1244,23 @@ mod tests {
         let ch = parse_client_hello(body).unwrap();
         let ext = ch.extensions_raw;
 
-        // SNI
         let sni = find_extension(ext, 0x0000).expect("should have SNI extension");
         let sni_str = std::str::from_utf8(&sni[5..]).unwrap_or("");
         assert_eq!(sni_str, host, "SNI hostname should match");
-
-        // key_share
         assert!(find_extension(ext, 0x0033).is_some(), "should have key_share");
-
-        // supported_versions
         assert!(find_extension(ext, 0x002b).is_some(), "should have supported_versions");
 
-        // ALPN
         let alpn = find_extension(ext, 0x0010).expect("should have ALPN");
         let alpn_str = String::from_utf8_lossy(alpn);
         assert!(alpn_str.contains("h2"), "ALPN should contain h2");
-
-        // session_ticket
         assert!(find_extension(ext, 0x0023).is_some(), "should have session_ticket");
-
-        // status_request
         assert!(find_extension(ext, 0x0005).is_some(), "should have status_request");
 
-        // GREASE extension
         let mut has_grease_ext = false;
         let mut offset = 0;
         while offset + 4 <= ext.len() {
             let ext_type = u16::from_be_bytes([ext[offset], ext[offset + 1]]);
-            let ext_len =
-                u16::from_be_bytes([ext[offset + 2], ext[offset + 3]]) as usize;
+            let ext_len = u16::from_be_bytes([ext[offset + 2], ext[offset + 3]]) as usize;
             if is_grease(ext_type) {
                 has_grease_ext = true;
                 break;
@@ -1500,18 +1273,10 @@ mod tests {
     #[test]
     fn test_dpi_tls_hello_length() {
         let data = build_tls_client_hello("www.example.com");
-        assert!(
-            data.len() >= 517,
-            "ClientHello record should be >= 517 bytes (got {})",
-            data.len()
-        );
+        assert!(data.len() >= 517, "ClientHello record should be >= 517 bytes (got {})", data.len());
         let (_, _, payload) = parse_tls_record(&data).unwrap();
         let (_, body) = parse_handshake(payload).unwrap();
-        assert!(
-            body.len() >= 512,
-            "ClientHello body should be >= 512 bytes (got {})",
-            body.len()
-        );
+        assert!(body.len() >= 512, "ClientHello body should be >= 512 bytes (got {})", body.len());
     }
 
     #[test]
@@ -1521,29 +1286,20 @@ mod tests {
         let (_, _, payload) = parse_tls_record(&server_data).unwrap();
         let (_, body) = parse_handshake(payload).unwrap();
 
-        // Parse ServerHello: version(2) + random(32) + sid_len(1) + sid + cipher(2) + comp(1) + ext
         assert!(body.len() > 70, "ServerHello body too short");
         let sid_len = body[34] as usize;
         assert_eq!(sid_len, 32);
         let server_sid = &body[35..35 + sid_len];
         assert_eq!(server_sid, &client_sid, "ServerHello should echo client session_id");
 
-        // Check extensions exist
-        // ServerHello body: version(2) + random(32) + sid_len(1) + sid(32) + cipher(2) + comp(1)
         let offset = 2 + 32 + 1 + sid_len + 2 + 1;
         assert!(body.len() > offset + 2, "ServerHello should have extensions");
         let ext_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
         assert!(ext_len > 0, "ServerHello extensions should not be empty");
 
         let ext_data = &body[offset + 2..offset + 2 + ext_len];
-        assert!(
-            find_extension(ext_data, 0x002b).is_some(),
-            "should have supported_versions extension"
-        );
-        assert!(
-            find_extension(ext_data, 0x0033).is_some(),
-            "should have key_share extension"
-        );
+        assert!(find_extension(ext_data, 0x002b).is_some(), "should have supported_versions extension");
+        assert!(find_extension(ext_data, 0x0033).is_some(), "should have key_share extension");
     }
 
     #[test]
@@ -1556,13 +1312,8 @@ mod tests {
         let (_, b1) = parse_handshake(p1).unwrap();
         let (_, b2) = parse_handshake(p2).unwrap();
 
-        let random1 = &b1[2..34];
-        let random2 = &b2[2..34];
-        assert_ne!(random1, random2, "random should differ between calls");
-
-        let sid1 = &b1[35..67];
-        let sid2 = &b2[35..67];
-        assert_ne!(sid1, sid2, "session_id should differ between calls");
+        assert_ne!(&b1[2..34], &b2[2..34], "random should differ between calls");
+        assert_ne!(&b1[35..67], &b2[35..67], "session_id should differ between calls");
     }
 
     #[test]
@@ -1573,20 +1324,11 @@ mod tests {
 
         let random = &body[2..34];
         let entropy = shannon_entropy(random);
-        assert!(
-            entropy > 3.5,
-            "random field entropy should be reasonable (got {:.2})",
-            entropy
-        );
+        assert!(entropy > 3.5, "random field entropy should be reasonable (got {:.2})", entropy);
 
-        // Test with simulated encrypted payload
         let encrypted: Vec<u8> = (0..1400).map(|_| rand::random::<u8>()).collect();
         let entropy = shannon_entropy(&encrypted);
-        assert!(
-            entropy > 7.8,
-            "AES-like random data should have high entropy (got {:.2})",
-            entropy
-        );
+        assert!(entropy > 7.8, "AES-like random data should have high entropy (got {:.2})", entropy);
     }
 
     #[test]
@@ -1600,24 +1342,13 @@ mod tests {
         assert!(req_str.contains(&format!("Host: {}", host)), "should have Host header");
         assert!(req_str.contains("Connection: Upgrade"), "should have Connection: Upgrade");
         assert!(req_str.contains("Upgrade: websocket"), "should have Upgrade: websocket");
-        assert!(
-            req_str.contains("Sec-WebSocket-Version: 13"),
-            "should have WS version"
-        );
+        assert!(req_str.contains("Sec-WebSocket-Version: 13"), "should have WS version");
         assert!(req_str.contains("Sec-WebSocket-Key: "), "should have WS key");
-        assert!(
-            req_str.contains(&format!("Origin: http://{}", host)),
-            "should have Origin"
-        );
-        assert!(
-            req_str.contains("Sec-WebSocket-Extensions: permessage-deflate"),
-            "should have WS extensions"
-        );
+        assert!(req_str.contains(&format!("Origin: http://{}", host)), "should have Origin");
+        assert!(req_str.contains("Sec-WebSocket-Extensions: permessage-deflate"), "should have WS extensions");
         assert!(req_str.contains("Chrome/"), "should have Chrome User-Agent");
         assert!(req_str.contains("Pragma: no-cache"), "should have Pragma");
         assert!(req_str.contains("Cache-Control: no-cache"), "should have Cache-Control");
-
-        // Validate returned key matches the one in the request
         assert_eq!(ws_key.len(), 24, "WS key should be 24 chars base64");
         assert!(req_str.contains(&ws_key), "returned key should match request");
     }
@@ -1628,17 +1359,11 @@ mod tests {
         let resp = build_http_response(&ws_accept);
         let resp_str = String::from_utf8_lossy(&resp);
 
-        assert!(
-            resp_str.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
-            "should be 101 response"
-        );
+        assert!(resp_str.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "should be 101 response");
         assert!(resp_str.ends_with("\r\n\r\n"), "should end with double CRLF");
         assert!(resp_str.contains("Connection: Upgrade"), "should have Connection: Upgrade");
         assert!(resp_str.contains("Upgrade: websocket"), "should have Upgrade: websocket");
-        assert!(
-            resp_str.contains(&format!("Sec-WebSocket-Accept: {}", ws_accept)),
-            "should have computed WS Accept"
-        );
+        assert!(resp_str.contains(&format!("Sec-WebSocket-Accept: {}", ws_accept)), "should have computed WS Accept");
         assert!(resp_str.contains("Date:"), "should have Date header");
     }
 
@@ -1649,8 +1374,149 @@ mod tests {
         let accept = compute_ws_accept(&key_b64);
         assert!(!accept.is_empty());
         assert_ne!(accept, key_b64);
-        // Verify deterministic
         assert_eq!(accept, compute_ws_accept(&key_b64));
+    }
+
+    #[tokio::test]
+    async fn fakehttp_large_payload_transfer() {
+        let payloads = parse_payloads(https_hosts());
+        let counter = AtomicUsize::new(0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_url: url::Url =
+            format!("fakehttp://127.0.0.1:{}", listener.local_addr().unwrap().port())
+                .parse()
+                .unwrap();
+
+        let server_url = local_url.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let socket = RuntimeTcpSocket::new(stream);
+            upgrade_accepted(socket, server_url).await.unwrap()
+        });
+
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", local_url.port().unwrap()))
+            .await
+            .unwrap();
+        let socket = RuntimeTcpSocket::new(stream);
+        let client_tunnel =
+            upgrade_connected(socket, local_url, &payloads, &counter).await.unwrap();
+        let server_tunnel = server.await.unwrap();
+
+        use easytier_core::packet::ZCPacket;
+        use futures::{SinkExt, StreamExt};
+
+        let (mut c_recv, mut c_send) = client_tunnel.split();
+        let (mut s_recv, mut s_send) = server_tunnel.split();
+
+        // Send multiple packets of varying sizes
+        let sizes = [1, 100, 500, 1000, 1500, TCP_MTU_BYTES - 100];
+        for &size in &sizes {
+            let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+            c_send.send(ZCPacket::new_with_payload(&data)).await.unwrap();
+            let received = s_recv.next().await.unwrap().unwrap();
+            assert_eq!(received.payload(), data.as_slice(), "size={size}");
+        }
+
+        // Send in reverse direction
+        for &size in &sizes {
+            let data: Vec<u8> = (0..size).map(|i| (255 - i % 256) as u8).collect();
+            s_send.send(ZCPacket::new_with_payload(&data)).await.unwrap();
+            let received = c_recv.next().await.unwrap().unwrap();
+            assert_eq!(received.payload(), data.as_slice(), "reverse size={size}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fakehttp_multiple_packets_streaming() {
+        let payloads = parse_payloads(http_hosts());
+        let counter = AtomicUsize::new(0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_url: url::Url =
+            format!("fakehttp://127.0.0.1:{}", listener.local_addr().unwrap().port())
+                .parse()
+                .unwrap();
+
+        let server_url = local_url.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let socket = RuntimeTcpSocket::new(stream);
+            upgrade_accepted(socket, server_url).await.unwrap()
+        });
+
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", local_url.port().unwrap()))
+            .await
+            .unwrap();
+        let socket = RuntimeTcpSocket::new(stream);
+        let client_tunnel =
+            upgrade_connected(socket, local_url, &payloads, &counter).await.unwrap();
+        let server_tunnel = server.await.unwrap();
+
+        use easytier_core::packet::ZCPacket;
+        use futures::{SinkExt, StreamExt};
+
+        let (_c_recv, mut c_send) = client_tunnel.split();
+        let (mut s_recv, _) = server_tunnel.split();
+
+        let packet_count = 50;
+        for i in 0..packet_count {
+            let data = format!("packet-{i:04}");
+            c_send
+                .send(ZCPacket::new_with_payload(data.as_bytes()))
+                .await
+                .unwrap();
+        }
+
+        for i in 0..packet_count {
+            let received = s_recv.next().await.unwrap().unwrap();
+            let expected = format!("packet-{i:04}");
+            assert_eq!(received.payload(), expected.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn fakehttp_payload_round_robin() {
+        let hosts = vec![
+            "http://a.example.com".to_string(),
+            "https://b.example.com".to_string(),
+            "http://c.example.com".to_string(),
+        ];
+        let payloads = parse_payloads(hosts);
+        assert_eq!(payloads.len(), 3);
+
+        let counter = AtomicUsize::new(0);
+        // Verify round-robin cycles
+        for round in 0..2 {
+            for i in 0..3 {
+                let idx = counter.fetch_add(1, Ordering::Relaxed) % payloads.len();
+                assert_eq!(idx, i, "round={round} i={i}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fakehttp_server_rejects_garbage() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let local_url: url::Url = format!("fakehttp://127.0.0.1:{port}").parse().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let socket = RuntimeTcpSocket::new(stream);
+            upgrade_accepted(socket, local_url).await
+        });
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        // Send garbage that's neither HTTP nor TLS
+        stream.write_all(b"\x00\x00\x00\x00extra").await.unwrap();
+
+        let result = server.await.unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unrecognized protocol"));
     }
 
     #[test]

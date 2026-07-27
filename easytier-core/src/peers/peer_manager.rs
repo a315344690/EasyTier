@@ -2385,15 +2385,16 @@ impl PeerOutboundPacketRouter {
     }
 
     fn is_all_peers_broadcast_ipv4(&self, ipv4_addr: &Ipv4Addr) -> bool {
-        let network_length = self
-            .context
-            .ipv4()
-            .map(|x| x.network_length())
-            .unwrap_or(24);
-        let ipv4_inet = cidr::Ipv4Inet::new(*ipv4_addr, network_length).unwrap();
-        ipv4_addr.is_broadcast()
-            || ipv4_addr.is_multicast()
-            || *ipv4_addr == ipv4_inet.last_address()
+        if ipv4_addr.is_broadcast() || ipv4_addr.is_multicast() {
+            return true;
+        }
+        if let Some(my_ipv4) = self.context.ipv4() {
+            let my_network =
+                cidr::Ipv4Cidr::new(my_ipv4.first_address(), my_ipv4.network_length()).unwrap();
+            my_network.contains(ipv4_addr) && *ipv4_addr == my_ipv4.last_address()
+        } else {
+            false
+        }
     }
 
     fn is_all_peers_broadcast_ipv6(&self, ipv6_addr: &Ipv6Addr) -> bool {
@@ -2643,6 +2644,9 @@ pub(crate) struct PeerPacketRouter {
     traffic_metrics: Arc<TrafficMetricRecorder>,
     stats_mgr: Arc<StatsManager>,
     counters: PeerPacketRouterCounters,
+    replay_windows: std::collections::HashMap<PeerId, super::replay_window::ReplayWindow<8192>>,
+    replay_pkt_counter: u32,
+    forward_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl PeerPacketRouter {
@@ -2712,6 +2716,9 @@ impl PeerPacketRouter {
                 compress_rx_bytes_after: stats_mgr
                     .get_counter(MetricName::CompressionBytesRxAfter, label_set),
             },
+            replay_windows: std::collections::HashMap::new(),
+            replay_pkt_counter: 0,
+            forward_semaphore: Arc::new(tokio::sync::Semaphore::new(256)),
         }
     }
 
@@ -2737,7 +2744,7 @@ impl PeerPacketRouter {
         panic!("done_peer_recv");
     }
 
-    async fn handle_packet(&self, mut ret: ZCPacket, disable_relay_data: bool) {
+    async fn handle_packet(&mut self, mut ret: ZCPacket, disable_relay_data: bool) {
         let buf_len = ret.buf_len();
         let is_relay_data_packet = is_relay_data_zc_packet(&ret);
         let Some(hdr) = ret.mut_peer_manager_header() else {
@@ -2749,6 +2756,8 @@ impl PeerPacketRouter {
         let from_peer_id = hdr.from_peer_id.get();
         let to_peer_id = hdr.to_peer_id.get();
         let packet_type = hdr.packet_type;
+        let forward_counter = hdr.forward_counter;
+        let pkt_seq = hdr.seq.get();
         let is_encrypted = hdr.is_encrypted();
         if to_peer_id != self.my_peer_id {
             if disable_relay_data && is_relay_data_packet {
@@ -2819,6 +2828,17 @@ impl PeerPacketRouter {
             }
 
             tracing::trace!(?to_peer_id, my_peer_id = ?self.my_peer_id, "need forward");
+            let _permit = if from_peer_id != self.my_peer_id {
+                match self.forward_semaphore.try_acquire() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        tracing::debug!("forward semaphore full, dropping packet");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let tx_metrics = if from_peer_id == self.my_peer_id {
                 Some(&self.traffic_metrics)
             } else {
@@ -2860,6 +2880,22 @@ impl PeerPacketRouter {
                         return;
                     }
                 }
+            }
+
+            if traffic_kind(packet_type) == TrafficKind::Data
+                && forward_counter == 1
+            {
+                let window = self.replay_windows.entry(from_peer_id)
+                    .or_default();
+                if !window.accept(pkt_seq as u64) {
+                    tracing::trace!(?from_peer_id, pkt_seq, "replay window rejected packet");
+                    return;
+                }
+            }
+            self.replay_pkt_counter = self.replay_pkt_counter.wrapping_add(1);
+            if self.replay_pkt_counter % 65536 == 0 {
+                let peers = &self.peers;
+                self.replay_windows.retain(|peer_id, _| peers.has_peer(*peer_id));
             }
 
             self.counters.self_rx_bytes.add(buf_len as u64);

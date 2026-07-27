@@ -10,14 +10,16 @@ use super::MagicDnsRuntime;
 use crate::instance::virtual_nic::NicCtx;
 
 struct NicCtxContainer {
+    _extra: Option<Box<dyn Any + Send>>,
     _nic_ctx: Option<Box<dyn Any + Send>>,
     magic_dns: MagicDnsRuntime,
 }
 
 impl NicCtxContainer {
-    fn new(nic_ctx: NicCtx, magic_dns: MagicDnsRuntime) -> Self {
+    fn new(nic_ctx: NicCtx, magic_dns: MagicDnsRuntime, extra: Option<Box<dyn Any + Send>>) -> Self {
         Self {
             _nic_ctx: Some(Box::new(nic_ctx)),
+            _extra: extra,
             magic_dns,
         }
     }
@@ -25,6 +27,7 @@ impl NicCtxContainer {
     fn packet_drain(tasks: JoinSet<()>) -> Self {
         Self {
             _nic_ctx: Some(Box::new(tasks)),
+            _extra: None,
             magic_dns: MagicDnsRuntime::default(),
         }
     }
@@ -81,11 +84,16 @@ impl TunNicState {
             .replace(NicCtxContainer::packet_drain(tasks));
     }
 
-    pub(super) async fn install(&self, nic: NicCtx, magic_dns: MagicDnsRuntime) {
+    pub(super) async fn install(
+        &self,
+        nic: NicCtx,
+        magic_dns: MagicDnsRuntime,
+        extra: Option<Box<dyn Any + Send>>,
+    ) {
         self.stop().await;
         self.nic_ctx
             .lock()
             .await
-            .replace(NicCtxContainer::new(nic, magic_dns));
+            .replace(NicCtxContainer::new(nic, magic_dns, extra));
     }
 }

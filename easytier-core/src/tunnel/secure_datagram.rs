@@ -842,6 +842,18 @@ mod tests {
         assert_eq!(pkt2.payload(), plaintext2);
     }
 
+    #[cfg(all(
+        any(
+            feature = "aes-gcm",
+            feature = "openssl-crypto",
+            feature = "ring-crypto"
+        ),
+        any(
+            feature = "chacha20",
+            feature = "openssl-crypto",
+            feature = "ring-crypto"
+        )
+    ))]
     #[test]
     fn secure_datagram_padding_roundtrip() {
         let root_key = SecureDatagramSession::new_root_key();

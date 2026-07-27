@@ -2,7 +2,7 @@ mod netfilter;
 mod packet;
 mod stack;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use network_interface::NetworkInterfaceConfig;
 use pnet::util::MacAddr;
 use std::{
@@ -220,10 +220,16 @@ enum FakeTcpReadState {
     Closed,
 }
 
+const MAX_COALESCED_PAYLOAD: usize = 1348;
+const BATCH_SIZE: usize = 64;
+
 pub(crate) struct FakeTcpSocket {
     socket: Arc<stack::Socket>,
     read_state: FakeTcpReadState,
     transport_label: String,
+    raw_pending: BytesMut,
+    pending_frames: Vec<Bytes>,
+    _ack_task: tokio_util::task::AbortOnDropHandle<()>,
     _lifetime_guard: Box<dyn Send + Sync>,
 }
 
@@ -232,11 +238,45 @@ impl FakeTcpSocket {
     where
         T: Send + Sync + 'static,
     {
+        let socket = Arc::new(socket);
+        let ack_socket = socket.clone();
+        let ack_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            loop {
+                let jitter = rand::random::<u64>() % 100;
+                tokio::time::sleep(std::time::Duration::from_millis(150 + jitter)).await;
+                ack_socket.send_ack();
+            }
+        }));
         Self {
-            socket: Arc::new(socket),
+            socket,
             read_state: FakeTcpReadState::Buffered(BytesMut::new()),
             transport_label,
+            raw_pending: BytesMut::new(),
+            pending_frames: Vec::new(),
+            _ack_task: ack_task,
             _lifetime_guard: Box::new(lifetime_guard),
+        }
+    }
+
+    fn seal_current_frame(&mut self) {
+        if self.raw_pending.is_empty() {
+            return;
+        }
+        let data = self.raw_pending.split().freeze();
+        if let Some(frame) = self.socket.build_packet(&data) {
+            self.pending_frames.push(frame);
+        }
+    }
+
+    fn do_flush(&mut self) {
+        if self.pending_frames.is_empty() {
+            return;
+        }
+        let sent = self.socket.flush_batch(&self.pending_frames);
+        if sent >= self.pending_frames.len() {
+            self.pending_frames.clear();
+        } else if sent > 0 {
+            self.pending_frames.drain(..sent);
         }
     }
 }
@@ -289,24 +329,29 @@ impl AsyncWrite for FakeTcpSocket {
         _context: &mut TaskContext<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.socket.try_send(buffer).is_none() {
-            // Preserve FakeTCP's existing lossy send behavior. A temporary
-            // driver lock conflict is indistinguishable from a closed stack
-            // here, and the former must not tear down the peer connection.
-            tracing::trace!(
-                len = buffer.len(),
-                "FakeTCP socket dropped an outgoing frame"
-            );
+        let this = self.get_mut();
+        if this.raw_pending.len() + buffer.len() > MAX_COALESCED_PAYLOAD {
+            this.seal_current_frame();
         }
+        if this.pending_frames.len() >= BATCH_SIZE {
+            this.do_flush();
+        }
+        this.raw_pending.extend_from_slice(buffer);
         Poll::Ready(Ok(buffer.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        this.seal_current_frame();
+        this.do_flush();
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        self.socket.close();
+        let this = self.get_mut();
+        this.seal_current_frame();
+        this.do_flush();
+        this.socket.close();
         Poll::Ready(Ok(()))
     }
 }

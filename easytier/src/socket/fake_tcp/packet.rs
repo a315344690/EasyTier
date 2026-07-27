@@ -1,7 +1,9 @@
 use bytes::{Bytes, BytesMut};
+use pnet::packet::MutablePacket;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::{ip, ipv4, ipv6, tcp};
 use pnet::util::MacAddr;
+use rand::RngCore;
 use std::convert::TryInto;
 use std::net::{IpAddr, SocketAddr};
 
@@ -42,14 +44,24 @@ pub fn build_tcp_packet(
     ack: u32,
     flags: u8,
     payload: Option<&[u8]>,
+    timestamps: Option<(u32, u32)>,
+    ip_id: u16,
+    window: u16,
+    padding_len: usize,
 ) -> Bytes {
     let ip_header_len = match local_addr {
         SocketAddr::V4(_) => IPV4_HEADER_LEN,
         SocketAddr::V6(_) => IPV6_HEADER_LEN,
     };
-    let wscale = (flags & tcp::TcpFlags::SYN) != 0;
-    let tcp_header_len = TCP_HEADER_LEN + if wscale { 4 } else { 0 }; // nop + wscale
-    let tcp_total_len = tcp_header_len + payload.map_or(0, |payload| payload.len());
+    let is_syn = (flags & tcp::TcpFlags::SYN) != 0;
+    // SYN options: MSS(4) + NOP + NOP + SACK_PERM(2) + NOP + WScale(3) = 12 bytes
+    // Timestamp option: NOP + NOP + TS(10) = 12 bytes
+    let syn_opts_len = if is_syn { 12 } else { 0 };
+    let ts_opts_len = if timestamps.is_some() { 12 } else { 0 };
+    let tcp_opts_len = syn_opts_len + ts_opts_len;
+    let tcp_header_len = TCP_HEADER_LEN + tcp_opts_len;
+    let payload_len = payload.map_or(0, |p| p.len());
+    let tcp_total_len = tcp_header_len + payload_len + padding_len;
     let total_len = ip_header_len + tcp_total_len;
     let mut buf = BytesMut::zeroed(ETH_HDR_LEN + total_len);
 
@@ -58,21 +70,43 @@ pub fn build_tcp_packet(
     let mut tcp_buf = buf.split_to(tcp_total_len);
     assert_eq!(0, buf.len());
 
-    let mut tcp = tcp::MutableTcpPacket::new(&mut tcp_buf).unwrap();
-    tcp.set_window(0xffff);
-    tcp.set_source(local_addr.port());
-    tcp.set_destination(remote_addr.port());
-    tcp.set_sequence(seq);
-    tcp.set_acknowledgement(ack);
-    tcp.set_flags(flags);
-    tcp.set_data_offset(TCP_HEADER_LEN as u8 / 4 + if wscale { 1 } else { 0 });
-    if wscale {
-        let wscale = tcp::TcpOption::wscale(14);
-        tcp.set_options(&[tcp::TcpOption::nop(), wscale]);
+    let mut tcp_pkt = tcp::MutableTcpPacket::new(&mut tcp_buf).unwrap();
+    tcp_pkt.set_window(window);
+    tcp_pkt.set_source(local_addr.port());
+    tcp_pkt.set_destination(remote_addr.port());
+    tcp_pkt.set_sequence(seq);
+    tcp_pkt.set_acknowledgement(ack);
+    tcp_pkt.set_flags(flags);
+    tcp_pkt.set_data_offset((tcp_header_len / 4) as u8);
+
+    {
+        let mut opts: Vec<tcp::TcpOption> = Vec::new();
+        if is_syn {
+            opts.push(tcp::TcpOption::mss(1400));
+            opts.push(tcp::TcpOption::nop());
+            opts.push(tcp::TcpOption::nop());
+            opts.push(tcp::TcpOption::sack_perm());
+            opts.push(tcp::TcpOption::nop());
+            opts.push(tcp::TcpOption::wscale(14));
+        }
+        if let Some((tsval, tsecr)) = timestamps {
+            opts.push(tcp::TcpOption::nop());
+            opts.push(tcp::TcpOption::nop());
+            opts.push(tcp::TcpOption::timestamp(tsval, tsecr));
+        }
+        if !opts.is_empty() {
+            tcp_pkt.set_options(&opts);
+        }
     }
 
     if let Some(payload) = payload {
-        tcp.set_payload(payload);
+        let p = tcp_pkt.payload_mut();
+        p[..payload.len()].copy_from_slice(payload);
+    }
+    if padding_len > 0 {
+        let p = tcp_pkt.payload_mut();
+        let start = payload_len;
+        rand::thread_rng().fill_bytes(&mut p[start..start + padding_len]);
     }
 
     let mut ethernet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
@@ -90,13 +124,14 @@ pub fn build_tcp_packet(
             v4.set_header_length(IPV4_HEADER_LEN as u8 / 4);
             v4.set_next_level_protocol(ip::IpNextHeaderProtocols::Tcp);
             v4.set_ttl(64);
+            v4.set_identification(ip_id);
             v4.set_source(*local.ip());
             v4.set_destination(*remote.ip());
             v4.set_total_length(total_len.try_into().unwrap());
             v4.set_flags(ipv4::Ipv4Flags::DontFragment);
 
-            tcp.set_checksum(tcp::ipv4_checksum(
-                &tcp.to_immutable(),
+            tcp_pkt.set_checksum(tcp::ipv4_checksum(
+                &tcp_pkt.to_immutable(),
                 &v4.get_source(),
                 &v4.get_destination(),
             ));
@@ -112,8 +147,8 @@ pub fn build_tcp_packet(
             v6.set_source(*local.ip());
             v6.set_destination(*remote.ip());
 
-            tcp.set_checksum(tcp::ipv6_checksum(
-                &tcp.to_immutable(),
+            tcp_pkt.set_checksum(tcp::ipv6_checksum(
+                &tcp_pkt.to_immutable(),
                 &v6.get_source(),
                 &v6.get_destination(),
             ));
@@ -188,6 +223,10 @@ mod tests {
             20,
             tcp::TcpFlags::ACK,
             Some(payload),
+            None,
+            0,
+            0xffff,
+            0,
         );
 
         let (parsed_src_mac, parsed_dst_mac, ip_packet, tcp_packet) =
@@ -219,6 +258,10 @@ mod tests {
             40,
             tcp::TcpFlags::ACK,
             Some(payload),
+            None,
+            0,
+            0xffff,
+            0,
         );
 
         let ethernet = EthernetPacket::new(packet.as_ref()).unwrap();
@@ -253,6 +296,10 @@ mod tests {
             2,
             tcp::TcpFlags::ACK,
             None,
+            None,
+            0,
+            0xffff,
+            0,
         );
         let truncated = Bytes::copy_from_slice(&packet[..ETH_HDR_LEN + IPV4_HEADER_LEN + 10]);
 
@@ -270,6 +317,10 @@ mod tests {
             2,
             tcp::TcpFlags::ACK,
             None,
+            None,
+            0,
+            0xffff,
+            0,
         );
         let truncated = Bytes::copy_from_slice(&packet[..ETH_HDR_LEN + IPV6_HEADER_LEN - 1]);
 

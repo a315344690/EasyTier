@@ -51,20 +51,35 @@ use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
 };
+use std::time::Instant;
 use tokio::sync::broadcast;
 use tokio::time;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, info, trace, warn};
 
 const TIMEOUT: time::Duration = time::Duration::from_secs(1);
-const MPMC_BUFFER_LEN: usize = 512;
+const MPMC_BUFFER_LEN: usize = 4096;
+const MAX_UNACKED_LEN: u32 = u32::MAX / 2;
+const DEFAULT_WINDOW: u32 = 0x3400000;
+const WINDOW_SCALE: u8 = 14;
+const KEEPALIVE_INTERVAL_SECS: u32 = 20;
 
 #[async_trait::async_trait]
 pub trait Tun: Send + Sync + 'static {
     async fn recv(&self, packet: &mut BytesMut) -> Result<usize, std::io::Error>;
     fn try_send(&self, packet: &Bytes) -> Result<(), std::io::Error>;
+    fn try_send_batch(&self, packets: &[Bytes]) -> Result<usize, std::io::Error> {
+        let mut sent = 0;
+        for p in packets {
+            if self.try_send(p).is_err() {
+                break;
+            }
+            sent += 1;
+        }
+        Ok(sent)
+    }
     fn driver_type(&self) -> &'static str;
 }
 
@@ -134,6 +149,13 @@ pub struct Socket {
     ack: AtomicU32,
     last_ack: AtomicU32,
     state: AtomicCell<State>,
+    seq_calibrated: AtomicBool,
+    ts_base: Instant,
+    ts_offset: u32,
+    remote_tsval: AtomicU32,
+    ip_id: AtomicU16,
+    recv_window: AtomicU32,
+    last_send_time_secs: AtomicU32,
 }
 
 /// A socket that represents a unique TCP connection between a server and client.
@@ -156,6 +178,7 @@ impl Socket {
         state: State,
     ) -> (Socket, flume::Sender<Bytes>) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
+        let is_established = state == State::Established;
 
         (
             Socket {
@@ -170,39 +193,118 @@ impl Socket {
                 ack: AtomicU32::new(ack.unwrap_or(0)),
                 last_ack: AtomicU32::new(ack.unwrap_or(0)),
                 state: AtomicCell::new(state),
+                seq_calibrated: AtomicBool::new(is_established),
+                ts_base: Instant::now(),
+                ts_offset: 0,
+                remote_tsval: AtomicU32::new(0),
+                ip_id: AtomicU16::new(rand::random()),
+                recv_window: AtomicU32::new(DEFAULT_WINDOW),
+                last_send_time_secs: AtomicU32::new(0),
             },
             incoming_tx,
         )
     }
 
-    fn build_tcp_packet(&self, flags: u8, payload: Option<&[u8]>) -> Bytes {
-        let ack = self.ack.load(Ordering::Relaxed);
+    fn build_tcp_packet_inner(
+        &self,
+        flags: u8,
+        payload: Option<&[u8]>,
+        seq: u32,
+        ack: u32,
+        padding_len: usize,
+    ) -> Bytes {
         self.last_ack.store(ack, Ordering::Relaxed);
+        let tsval = (self.ts_base.elapsed().as_millis() as u32).wrapping_add(self.ts_offset);
+        let tsecr = self.remote_tsval.load(Ordering::Relaxed);
+        let ip_id = self.ip_id.fetch_add(1, Ordering::Relaxed);
+        let raw_window = self.recv_window.load(Ordering::Relaxed);
+        let window = ((raw_window >> WINDOW_SCALE) as u16).min(0xFFFF);
 
         build_tcp_packet(
             self.local_mac,
             self.remote_mac.load().unwrap_or(MacAddr::zero()),
             self.local_addr,
             self.remote_addr,
-            self.seq.load(Ordering::Relaxed),
+            seq,
             ack,
             flags,
             payload,
+            Some((tsval, tsecr)),
+            ip_id,
+            window,
+            padding_len,
         )
     }
 
+    /// Builds a TCP packet with the given payload but does not send it.
+    /// Returns `None` if the socket is not established or SEQ is not yet calibrated.
+    pub fn build_packet(&self, payload: &[u8]) -> Option<Bytes> {
+        if !matches!(self.state.load(), State::Established) {
+            return None;
+        }
+        if !self.seq_calibrated.load(Ordering::Acquire) {
+            return None;
+        }
+        let ack = self.ack.load(Ordering::Relaxed);
+        let seq = self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
+        let buf = self.build_tcp_packet_inner(
+            tcp::TcpFlags::ACK | tcp::TcpFlags::PSH,
+            Some(payload),
+            seq,
+            ack,
+            0,
+        );
+        self.last_send_time_secs
+            .store(self.ts_base.elapsed().as_secs() as u32, Ordering::Relaxed);
+        Some(buf)
+    }
+
+    /// Sends multiple pre-built TCP frames to the TUN device in a batch.
+    pub fn flush_batch(&self, packets: &[Bytes]) -> usize {
+        self.tun.try_send_batch(packets).unwrap_or(0)
+    }
+
+    /// Sends an ACK if the peer's ACK has advanced or keepalive is needed.
+    pub fn send_ack(&self) {
+        if !self.seq_calibrated.load(Ordering::Acquire) {
+            return;
+        }
+        let ack = self.ack.load(Ordering::Relaxed);
+        let last = self.last_ack.load(Ordering::Relaxed);
+        let now_secs = self.ts_base.elapsed().as_secs() as u32;
+        let last_send_secs = self.last_send_time_secs.load(Ordering::Relaxed);
+        let force_keepalive = now_secs.wrapping_sub(last_send_secs) >= KEEPALIVE_INTERVAL_SECS;
+        if ack == last && !force_keepalive {
+            return;
+        }
+        let seq = self.seq.load(Ordering::Relaxed);
+        let buf = self.build_tcp_packet_inner(tcp::TcpFlags::ACK, None, seq, ack, 0);
+        let _ = self.tun.try_send(&buf);
+        self.last_send_time_secs
+            .store(now_secs, Ordering::Relaxed);
+    }
+
     /// Sends a datagram to the other end.
-    ///
-    /// This method takes `&self`, and it can be called safely by multiple threads
-    /// at the same time.
     ///
     /// A return of `None` means the Tun socket returned an error
     /// and this socket must be closed.
     pub fn try_send(&self, payload: &[u8]) -> Option<()> {
         match self.state.load() {
             State::Established => {
-                let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, Some(payload));
-                self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
+                if !self.seq_calibrated.load(Ordering::Acquire) {
+                    return None;
+                }
+                let ack = self.ack.load(Ordering::Relaxed);
+                let seq = self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
+                let buf = self.build_tcp_packet_inner(
+                    tcp::TcpFlags::ACK | tcp::TcpFlags::PSH,
+                    Some(payload),
+                    seq,
+                    ack,
+                    0,
+                );
+                self.last_send_time_secs
+                    .store(self.ts_base.elapsed().as_secs() as u32, Ordering::Relaxed);
                 self.tun.try_send(&buf).ok().and(Some(()))
             }
             _ => unreachable!(),
@@ -211,7 +313,8 @@ impl Socket {
 
     pub fn close(&self) {
         if self.state.load() != State::Idle {
-            let buf = self.build_tcp_packet(tcp::TcpFlags::RST, None);
+            let seq = self.seq.load(Ordering::Relaxed);
+            let buf = self.build_tcp_packet_inner(tcp::TcpFlags::RST, None, seq, 0, 0);
             let _ = self.tun.try_send(&buf);
             self.state.store(State::Idle);
         }
@@ -261,17 +364,50 @@ impl Socket {
                         return None;
                     }
 
-                    if (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0
-                        && tcp_packet.payload().is_empty()
-                    {
-                        self.seq
-                            .store(tcp_packet.get_acknowledgement(), Ordering::Relaxed);
+                    // Extract TCP timestamp from options
+                    if (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0 {
+                        for opt in tcp_packet.get_options_iter() {
+                            if opt.get_number() == TcpOptionNumbers::TIMESTAMPS {
+                                let data = opt.payload();
+                                if data.len() >= 4 {
+                                    let tsval =
+                                        u32::from_be_bytes(data[0..4].try_into().unwrap());
+                                    self.remote_tsval.store(tsval, Ordering::Relaxed);
+                                }
+                                break;
+                            }
+                        }
                     }
 
                     let payload = tcp_packet.payload();
 
+                    // ACK advancement (only forward, within MAX_UNACKED_LEN window)
                     let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
-                    self.ack.store(new_ack, Ordering::Relaxed);
+                    let _ = self.ack.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |current| {
+                            if current == 0 {
+                                return Some(new_ack);
+                            }
+                            let diff = new_ack.wrapping_sub(current);
+                            if diff > 0 && diff < MAX_UNACKED_LEN {
+                                Some(new_ack)
+                            } else {
+                                None
+                            }
+                        },
+                    );
+
+                    // SEQ calibration from peer's ACK (one-time only)
+                    if !self.seq_calibrated.load(Ordering::Acquire)
+                        && (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0
+                        && tcp_packet.get_acknowledgement() != 0
+                    {
+                        self.seq
+                            .store(tcp_packet.get_acknowledgement(), Ordering::Relaxed);
+                        self.seq_calibrated.store(true, Ordering::Release);
+                    }
 
                     for opt in tcp_packet.get_options_iter() {
                         if opt.get_number() == TcpOptionNumbers::SACK {
@@ -292,16 +428,14 @@ impl Socket {
 
                                 let send_len = std::cmp::min(len, 1400) as usize;
                                 let data = vec![0u8; send_len];
+                                let ack_val = self.ack.load(Ordering::Relaxed);
 
-                                let buf = build_tcp_packet(
-                                    self.local_mac,
-                                    self.remote_mac.load().unwrap_or(MacAddr::zero()),
-                                    self.local_addr,
-                                    self.remote_addr,
-                                    left,
-                                    self.ack.load(Ordering::Relaxed),
+                                let buf = self.build_tcp_packet_inner(
                                     tcp::TcpFlags::ACK,
                                     Some(&data),
+                                    left,
+                                    ack_val,
+                                    0,
                                 );
 
                                 if let Err(e) = self.tun.try_send(&buf) {
@@ -314,6 +448,19 @@ impl Socket {
 
                     if payload.is_empty() {
                         continue;
+                    }
+
+                    // Dynamic receive window management
+                    let current_window = self
+                        .recv_window
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(payload.len() as u32);
+                    self.recv_window.store(current_window, Ordering::Relaxed);
+                    let threshold = DEFAULT_WINDOW / 4
+                        + (tcp_packet.get_sequence() % (DEFAULT_WINDOW / 4));
+                    if current_window < threshold {
+                        self.recv_window.store(DEFAULT_WINDOW, Ordering::Relaxed);
+                        self.send_ack();
                     }
 
                     buf.extend_from_slice(payload);
@@ -345,6 +492,7 @@ impl Socket {
                         self.ack
                             .store(tcp_packet.get_sequence() + 1, Ordering::Relaxed);
                         self.remote_mac.store(Some(src_mac));
+                        self.seq_calibrated.store(true, Ordering::Release);
                         self.state.store(State::Established);
                         return Some(0);
                     }
@@ -383,16 +531,8 @@ impl Drop for Socket {
         // purge cache
         let _ = self.shared.tuples_purge.send(tuple);
 
-        let buf = build_tcp_packet(
-            self.local_mac,
-            self.remote_mac.load().unwrap_or(MacAddr::zero()),
-            self.local_addr,
-            self.remote_addr,
-            self.seq.load(Ordering::Relaxed),
-            0,
-            tcp::TcpFlags::RST,
-            None,
-        );
+        let seq = self.seq.load(Ordering::Relaxed);
+        let buf = self.build_tcp_packet_inner(tcp::TcpFlags::RST, None, seq, 0, 0);
         if let Err(e) = self.tun.try_send(&buf) {
             warn!("Unable to send RST to remote end: {}", e);
         }

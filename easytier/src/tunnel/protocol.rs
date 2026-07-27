@@ -41,10 +41,13 @@ fn runtime_server_protocol_adapter(global_ctx: &ArcGlobalCtx) -> RuntimeServerPr
 pub(crate) fn runtime_client_protocol_upgrader(
     global_ctx: ArcGlobalCtx,
 ) -> Arc<dyn ClientProtocolUpgrader<RuntimeTcpSocket>> {
+    let faketcp_disguised =
+        cfg!(feature = "fakehttp") && !global_ctx.config.get_flags().fakehttp_hosts.is_empty();
     Arc::new(CoreClientProtocolUpgrader::with_external(
         CoreClientProtocolConfig {
             unix: cfg!(unix),
             faketcp: cfg!(feature = "faketcp"),
+            faketcp_disguised,
         },
         Arc::new(runtime_client_protocol_adapter(&global_ctx)),
     ))
@@ -53,10 +56,13 @@ pub(crate) fn runtime_client_protocol_upgrader(
 pub(crate) fn runtime_server_protocol_upgrader(
     global_ctx: ArcGlobalCtx,
 ) -> Arc<dyn ServerProtocolUpgrader<RuntimeTcpSocket>> {
+    let faketcp_disguised =
+        cfg!(feature = "fakehttp") && !global_ctx.config.get_flags().fakehttp_hosts.is_empty();
     Arc::new(CoreServerProtocolUpgrader::with_external(
         CoreServerProtocolConfig {
             unix: cfg!(unix),
             faketcp: cfg!(feature = "faketcp"),
+            faketcp_disguised,
         },
         Arc::new(runtime_server_protocol_adapter(&global_ctx)),
     ))
@@ -177,6 +183,10 @@ mod tests {
         assert_eq!(external.supports_scheme("wss"), cfg!(feature = "websocket"));
         assert_eq!(external.supports_scheme("wg"), cfg!(feature = "wireguard"));
         assert_eq!(external.supports_scheme("quic"), cfg!(feature = "quic"));
+        assert_eq!(
+            external.supports_scheme("fakehttp"),
+            cfg!(feature = "fakehttp")
+        );
 
         let upgrader = runtime_client_protocol_upgrader(global_ctx.clone());
 
@@ -188,6 +198,10 @@ mod tests {
         assert_eq!(upgrader.supports_scheme("wss"), cfg!(feature = "websocket"));
         assert_eq!(upgrader.supports_scheme("wg"), cfg!(feature = "wireguard"));
         assert_eq!(upgrader.supports_scheme("quic"), cfg!(feature = "quic"));
+        assert_eq!(
+            upgrader.supports_scheme("fakehttp"),
+            cfg!(feature = "fakehttp")
+        );
         assert_eq!(
             upgrader.supports_scheme("faketcp"),
             cfg!(feature = "faketcp")
@@ -213,6 +227,10 @@ mod tests {
             server_external.supports_scheme("quic"),
             cfg!(feature = "quic")
         );
+        assert_eq!(
+            server_external.supports_scheme("fakehttp"),
+            cfg!(feature = "fakehttp")
+        );
 
         let server = runtime_server_protocol_upgrader(global_ctx);
         assert!(server.supports_scheme("tcp"));
@@ -222,6 +240,10 @@ mod tests {
         assert_eq!(server.supports_scheme("ws"), cfg!(feature = "websocket"));
         assert_eq!(server.supports_scheme("wg"), cfg!(feature = "wireguard"));
         assert_eq!(server.supports_scheme("quic"), cfg!(feature = "quic"));
+        assert_eq!(
+            server.supports_scheme("fakehttp"),
+            cfg!(feature = "fakehttp")
+        );
     }
 
     #[cfg(feature = "websocket")]
@@ -473,6 +495,65 @@ mod tests {
             let packet = recv.next().await.unwrap().unwrap();
             assert_eq!(packet.payload(), b"runtime QUIC seam".as_slice());
             let _ = send.close().await;
+            server_task.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(feature = "fakehttp")]
+    #[tokio::test]
+    async fn runtime_fakehttp_upgraders_share_one_native_engine() {
+        use easytier_core::packet::ZCPacket;
+        use futures::{SinkExt, StreamExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url: url::Url = format!("fakehttp://{addr}").parse().unwrap();
+
+        let global_ctx = get_mock_global_ctx();
+        {
+            let mut flags = global_ctx.config.get_flags();
+            flags.fakehttp_hosts = vec!["https://www.example.com".to_string()];
+            global_ctx.config.set_flags(flags);
+        }
+
+        let server = runtime_server_protocol_upgrader(global_ctx.clone());
+        let client = runtime_client_protocol_upgrader(global_ctx);
+
+        assert_eq!(
+            client.connect_timeout("fakehttp"),
+            Some(crate::tunnel::fakehttp::CONNECT_TIMEOUT)
+        );
+
+        let server_url = url.clone();
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let ServerProtocolUpgrade::Tunnel(tunnel) = server
+                .upgrade_tcp(RuntimeTcpSocket::new(socket), server_url)
+                .await
+                .unwrap()
+            else {
+                panic!("FakeHTTP must upgrade directly to a tunnel");
+            };
+            crate::tunnel::common::tests::_tunnel_echo_server(tunnel, true).await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let tunnel = client
+                .upgrade_client(ConnectedTransport::Tcp(RuntimeTcpSocket::new(socket)), url)
+                .await
+                .unwrap();
+            let (mut recv, mut send) = tunnel.split();
+            send.send(ZCPacket::new_with_payload(b"runtime fakehttp seam"))
+                .await
+                .unwrap();
+            let packet = recv.next().await.unwrap().unwrap();
+            assert_eq!(packet.payload(), b"runtime fakehttp seam".as_slice());
+            send.close().await.unwrap();
             server_task.await.unwrap();
         })
         .await

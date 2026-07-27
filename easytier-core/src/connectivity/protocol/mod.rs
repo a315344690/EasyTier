@@ -22,7 +22,7 @@ pub(crate) enum ProtocolTransport {
 
 pub(crate) const fn protocol_transport(scheme: &str) -> Option<ProtocolTransport> {
     match scheme.as_bytes() {
-        b"tcp" | b"ws" | b"wss" => Some(ProtocolTransport::Tcp),
+        b"tcp" | b"ws" | b"wss" | b"fakehttp" => Some(ProtocolTransport::Tcp),
         b"faketcp" => Some(ProtocolTransport::FakeTcp),
         b"udp" => Some(ProtocolTransport::Udp(UdpSessionMode::EasyTierMux)),
         b"wg" => Some(ProtocolTransport::Udp(UdpSessionMode::Classified(
@@ -47,6 +47,7 @@ pub const fn protocol_port_offset(scheme: &str) -> Option<u16> {
         b"wg" | b"ws" => Some(1),
         b"quic" | b"wss" => Some(2),
         b"faketcp" => Some(3),
+        b"fakehttp" => Some(4),
         _ => None,
     }
 }
@@ -157,6 +158,7 @@ pub trait ServerProtocolUpgrader<TcpSocket>: Send + Sync + 'static {
 pub struct CoreClientProtocolConfig {
     pub unix: bool,
     pub faketcp: bool,
+    pub faketcp_disguised: bool,
 }
 
 /// Owns portable client protocol dispatch and delegates only protocol engines
@@ -203,6 +205,13 @@ where
     }
 
     fn connect_timeout(&self, scheme: &str) -> Option<Duration> {
+        if scheme == "faketcp" && self.config.faketcp_disguised {
+            if let Some(ext) = &self.external {
+                if ext.supports_scheme("faketcp") {
+                    return ext.connect_timeout("faketcp");
+                }
+            }
+        }
         self.external
             .as_ref()
             .filter(|external| external.supports_scheme(scheme))
@@ -233,14 +242,24 @@ where
             },
             "ring" => upgrade_byte_stream(connected),
             "unix" if self.config.unix => upgrade_byte_stream(connected),
-            "faketcp" if self.config.faketcp => match connected {
-                ConnectedTransport::Tcp(socket) => {
-                    Ok(raw::upgrade_connected_tcp(socket, requested_url)?)
+            "faketcp" if self.config.faketcp => {
+                if self.config.faketcp_disguised {
+                    let external = self.external.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("faketcp disguise requires external protocol upgrader")
+                    })?;
+                    if external.supports_scheme("faketcp") {
+                        return external.upgrade_client(connected, requested_url).await;
+                    }
                 }
-                ConnectedTransport::Udp(_) | ConnectedTransport::ByteStream(_) => {
-                    anyhow::bail!("FakeTCP protocol requires a TCP transport")
+                match connected {
+                    ConnectedTransport::Tcp(socket) => {
+                        Ok(raw::upgrade_connected_tcp(socket, requested_url)?)
+                    }
+                    ConnectedTransport::Udp(_) | ConnectedTransport::ByteStream(_) => {
+                        anyhow::bail!("FakeTCP protocol requires a TCP transport")
+                    }
                 }
-            },
+            }
             "unix" | "faketcp" => anyhow::bail!(
                 "unsupported client protocol upgrader: {}",
                 requested_url.scheme()
@@ -276,6 +295,7 @@ where
 pub struct CoreServerProtocolConfig {
     pub unix: bool,
     pub faketcp: bool,
+    pub faketcp_disguised: bool,
 }
 
 /// Owns portable server protocol dispatch and delegates only protocol engines
@@ -353,6 +373,14 @@ where
         local_url: Url,
     ) -> anyhow::Result<ServerProtocolUpgrade> {
         match local_url.scheme() {
+            "faketcp" if self.config.faketcp && self.config.faketcp_disguised => {
+                if let Ok(ext) = self.external(local_url.scheme()) {
+                    return ext.upgrade_tcp(socket, local_url).await;
+                }
+                Ok(ServerProtocolUpgrade::Tunnel(
+                    upgrade_accepted_tcp(socket, local_url, self.config).await?,
+                ))
+            }
             "tcp" | "faketcp" => Ok(ServerProtocolUpgrade::Tunnel(
                 upgrade_accepted_tcp(socket, local_url, self.config).await?,
             )),
@@ -626,6 +654,7 @@ mod tests {
             CoreClientProtocolConfig {
                 unix: false,
                 faketcp: false,
+                faketcp_disguised: false,
             },
             Arc::new(MockExternalUpgrader),
         );

@@ -23,10 +23,6 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use async_trait::async_trait;
 use cidr::{Ipv4Inet, Ipv6Inet};
-#[cfg(any(
-    all(target_os = "macos", not(feature = "macos-ne")),
-    target_os = "freebsd"
-))]
 use tokio::process::Command;
 
 use super::error::Error;
@@ -199,7 +195,7 @@ pub(crate) fn list_ipv6_route_messages() -> Result<Vec<RouteMessage>, Error> {
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
-pub(crate) fn list_routes() -> Result<Vec<netlink_packet_route::route::RouteMessage>, Error> {
+pub(crate) fn list_routes() -> Result<Vec<RouteMessage>, Error> {
     netlink::NetlinkIfConfiger::list_routes()
 }
 

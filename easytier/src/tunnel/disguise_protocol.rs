@@ -302,7 +302,10 @@ pub fn extract_ws_key(headers: &[u8]) -> Option<&str> {
 }
 
 // --- Data frame encode/decode (pure functions) ---
+// These are used when faketcp raw disguise is integrated at the packet level.
+// Currently fakehttp uses AsyncRead/AsyncWrite stream adapters instead.
 
+#[allow(dead_code)]
 pub fn encode_tls_record(payload: &[u8]) -> Vec<u8> {
     let len = payload.len();
     let mut buf = Vec::with_capacity(TLS_RECORD_HEADER_SIZE + len);
@@ -313,6 +316,7 @@ pub fn encode_tls_record(payload: &[u8]) -> Vec<u8> {
 
 /// Decode a TLS Application Data record from the beginning of `buf`.
 /// Returns `(consumed_bytes, payload_slice)` or `None` if incomplete.
+#[allow(dead_code)]
 pub fn decode_tls_record(buf: &[u8]) -> Option<(usize, &[u8])> {
     if buf.len() < TLS_RECORD_HEADER_SIZE {
         return None;
@@ -325,6 +329,7 @@ pub fn decode_tls_record(buf: &[u8]) -> Option<(usize, &[u8])> {
     Some((total, &buf[TLS_RECORD_HEADER_SIZE..total]))
 }
 
+#[allow(dead_code)]
 pub fn encode_ws_frame(payload: &[u8], is_client: bool) -> Vec<u8> {
     let payload_len = payload.len();
     let mask_len = if is_client { 4 } else { 0 };
@@ -375,6 +380,7 @@ pub fn encode_ws_frame(payload: &[u8], is_client: bool) -> Vec<u8> {
 
 /// Decode a WebSocket binary frame from `buf`.
 /// Returns `(consumed_bytes, unmasked_payload)` or `None` if incomplete.
+#[allow(dead_code)]
 pub fn decode_ws_frame(buf: &[u8]) -> Option<(usize, Vec<u8>)> {
     if buf.len() < 2 {
         return None;
@@ -437,6 +443,7 @@ pub fn decode_ws_frame(buf: &[u8]) -> Option<(usize, Vec<u8>)> {
     Some((total, payload))
 }
 
+#[allow(dead_code)]
 pub fn ws_frame_overhead(payload_len: usize, is_client: bool) -> usize {
     let len_bytes = if payload_len <= 125 {
         1

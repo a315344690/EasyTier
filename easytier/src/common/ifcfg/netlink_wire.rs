@@ -36,12 +36,17 @@ const IFA_BROADCAST: u16 = 4;
 const RTA_DST: u16 = 1;
 const RTA_SRC: u16 = 2;
 const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
 const RTA_PRIORITY: u16 = 6;
 const RTA_TABLE: u16 = 15;
 
 const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
 const NTF_PROXY: u8 = 0x08;
+pub(crate) const NUD_INCOMPLETE: u16 = 0x01;
+pub(crate) const NUD_FAILED: u16 = 0x20;
 const NUD_PERMANENT: u16 = 0x80;
+pub(crate) const NUD_NONE: u16 = 0x00;
 
 fn align4(len: usize) -> Option<usize> {
     len.checked_add(3).map(|len| len & !3)
@@ -342,6 +347,7 @@ pub(crate) struct RouteMessage {
     destination: Option<IpAddr>,
     source: Option<IpAddr>,
     oif: Option<u32>,
+    gateway: Option<IpAddr>,
 }
 
 impl RouteMessage {
@@ -372,6 +378,10 @@ impl RouteMessage {
     pub(crate) fn oif(&self) -> Option<u32> {
         self.oif
     }
+
+    pub(crate) fn gateway(&self) -> Option<&IpAddr> {
+        self.gateway.as_ref()
+    }
 }
 
 impl RouteMessage {
@@ -401,6 +411,10 @@ impl NetlinkDecode for RouteMessage {
             .iter()
             .find(|attribute| attribute.kind & NLA_TYPE_MASK == RTA_OIF)
             .and_then(|attribute| read_u32(&attribute.value).ok());
+        let gateway = attributes
+            .iter()
+            .find(|attribute| attribute.kind & NLA_TYPE_MASK == RTA_GATEWAY)
+            .and_then(|attribute| parse_ip(family, &attribute.value));
 
         Ok(Self {
             family,
@@ -416,6 +430,7 @@ impl NetlinkDecode for RouteMessage {
             destination,
             source,
             oif,
+            gateway,
         })
     }
 }
@@ -459,6 +474,7 @@ impl RouteMessageBuilder {
                 destination: None,
                 source: None,
                 oif: None,
+                gateway: None,
             },
         }
     }
@@ -562,6 +578,25 @@ impl NeighborMessage {
     pub(crate) fn destination(&self) -> Option<&IpAddr> {
         self.destination.as_ref()
     }
+
+    pub(crate) fn state(&self) -> u16 {
+        self.state
+    }
+
+    pub(crate) fn lladdr(&self) -> Option<&[u8]> {
+        self.attributes
+            .iter()
+            .find(|a| a.kind & NLA_TYPE_MASK == NDA_LLADDR)
+            .map(|a| a.value.as_slice())
+    }
+
+    pub(crate) fn dump_header(family: u8) -> Vec<u8> {
+        let mut bytes = vec![family, 0, 0, 0];
+        bytes.extend_from_slice(&0_u32.to_ne_bytes());
+        bytes.extend_from_slice(&0_u16.to_ne_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+        bytes
+    }
 }
 
 impl NetlinkDecode for NeighborMessage {
@@ -596,6 +631,29 @@ impl NetlinkEncode for NeighborMessage {
         bytes.extend_from_slice(&self.state.to_ne_bytes());
         bytes.extend_from_slice(&[self.flags, self.kind]);
         write_attributes(&self.attributes, bytes)
+    }
+}
+
+impl From<RouteMessage> for super::route::Route {
+    fn from(msg: RouteMessage) -> Self {
+        let destination = msg.destination.unwrap_or_else(|| {
+            if msg.family as i32 == libc::AF_INET6 {
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            }
+        });
+        super::route::Route {
+            destination,
+            prefix: msg.dst_len,
+            gateway: msg.gateway,
+            ifindex: msg.oif,
+            table: msg.table,
+            source: msg.source,
+            source_prefix: msg.src_len,
+            source_hint: None,
+            metric: None,
+        }
     }
 }
 

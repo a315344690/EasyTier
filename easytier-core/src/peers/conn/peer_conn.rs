@@ -1418,6 +1418,14 @@ impl PeerConn {
         self.close_event_notifier.clone()
     }
 
+    pub fn get_latency_us(&self) -> u64 {
+        self.latency_stats.get_latency_us()
+    }
+
+    pub fn get_loss_rate_percent(&self) -> u32 {
+        self.loss_rate_stats.load(Ordering::Relaxed)
+    }
+
     pub fn get_stats(&self) -> PeerConnStats {
         PeerConnStats {
             latency_us: self.latency_stats.get_latency_us(),
