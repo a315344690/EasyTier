@@ -3,9 +3,10 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 
+use arc_swap::ArcSwapOption;
 use crossbeam::atomic::AtomicCell;
 use dashmap::{DashMap, DashSet};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use tokio::{select, sync::mpsc};
 
@@ -41,11 +42,12 @@ pub struct Peer {
 
     shutdown_notifier: Arc<tokio::sync::Notify>,
 
-    default_conn_id: Arc<AtomicCell<PeerConnId>>,
+    default_conn: Arc<ArcSwapOption<PeerConn>>,
+    default_conn_update_lock: Arc<Mutex<()>>,
     peer_identity_type: Arc<AtomicCell<Option<PeerIdentityType>>>,
     peer_public_key: Arc<RwLock<Option<Vec<u8>>>>,
     #[allow(dead_code)]
-    default_conn_id_clear_task: AbortOnDropHandle<()>,
+    default_conn_clear_task: AbortOnDropHandle<()>,
 
     send_seq: AtomicU32,
 }
@@ -63,10 +65,14 @@ impl Peer {
         let peer_identity_type_copy = peer_identity_type.clone();
         let peer_public_key = Arc::new(RwLock::new(None));
         let peer_public_key_copy = peer_public_key.clone();
+        let default_conn = Arc::new(ArcSwapOption::empty());
+        let default_conn_update_lock = Arc::new(Mutex::new(()));
 
         let conns_copy = conns.clone();
         let shutdown_notifier_copy = shutdown_notifier.clone();
         let context_copy = context.clone();
+        let default_conn_copy = default_conn.clone();
+        let default_conn_update_lock_copy = default_conn_update_lock.clone();
         let close_event_listener = AbortOnDropHandle::new(tokio::spawn(
             async move {
                 loop {
@@ -82,7 +88,22 @@ impl Peer {
                                 "notified that peer conn is closed",
                             );
 
-                            if let Some((_, conn)) = conns_copy.remove(&ret) {
+                            let removed_conn = {
+                                let _update_guard = default_conn_update_lock_copy.lock();
+                                let removed_conn = conns_copy.remove(&ret);
+                                if let Some((_, conn)) = removed_conn.as_ref() {
+                                    let cached_conn = default_conn_copy.load();
+                                    if cached_conn
+                                        .as_ref()
+                                        .is_some_and(|cached| Arc::ptr_eq(cached, conn))
+                                    {
+                                        default_conn_copy.store(None);
+                                    }
+                                }
+                                removed_conn
+                            };
+
+                            if let Some((_, conn)) = removed_conn {
                                 context_copy.issue_event(PeerEvent::PeerConnRemoved(
                                     conn.get_conn_info(),
                                 ));
@@ -108,11 +129,9 @@ impl Peer {
             )),
         ));
 
-        let default_conn_id = Arc::new(AtomicCell::new(PeerConnId::default()));
-
         let conns_copy = conns.clone();
-        let default_conn_id_copy = default_conn_id.clone();
-        let default_conn_id_clear_task = AbortOnDropHandle::new(tokio::spawn(async move {
+        let default_conn_copy = default_conn.clone();
+        let default_conn_clear_task = AbortOnDropHandle::new(tokio::spawn(async move {
             loop {
                 crate::foundation::time::sleep(std::time::Duration::from_secs(2)).await;
                 if conns_copy.len() <= 1 {
@@ -120,7 +139,7 @@ impl Peer {
                 }
 
                 let mut best_score = u64::MAX;
-                let mut best_id = None;
+                let mut best_conn = None;
                 for conn in conns_copy.iter() {
                     let latency_us = conn.value().get_latency_us();
                     let loss = conn.value().get_loss_rate_percent() as u64;
@@ -130,13 +149,13 @@ impl Peer {
                     let score = latency_us * 100 / (100 - loss);
                     if score < best_score {
                         best_score = score;
-                        best_id = Some(conn.get_conn_id());
+                        best_conn = Some(conn.value().clone());
                     }
                 }
-                let Some(best_id) = best_id else { continue };
+                let Some(best_conn) = best_conn else { continue };
 
-                let current_id = default_conn_id_copy.load();
-                if let Some(current_conn) = conns_copy.get(&current_id) {
+                let current = default_conn_copy.load_full();
+                if let Some(ref current_conn) = current {
                     let latency_us = current_conn.get_latency_us();
                     let loss = current_conn.get_loss_rate_percent() as u64;
                     if latency_us > 0 && loss < 100 {
@@ -147,7 +166,7 @@ impl Peer {
                     }
                 }
 
-                default_conn_id_copy.store(best_id);
+                default_conn_copy.store(Some(best_conn));
             }
         }));
 
@@ -161,10 +180,11 @@ impl Peer {
             close_event_listener,
 
             shutdown_notifier,
-            default_conn_id,
+            default_conn,
+            default_conn_update_lock,
             peer_identity_type,
             peer_public_key,
-            default_conn_id_clear_task,
+            default_conn_clear_task,
 
             send_seq: AtomicU32::new(rand::random()),
         }
@@ -232,27 +252,28 @@ impl Peer {
         Some(latency_us * 100 / (100 - loss))
     }
 
-    async fn select_conn(&self) -> Option<ArcPeerConn> {
-        let default_conn_id = self.default_conn_id.load();
-        if let Some(conn) = self.conns.get(&default_conn_id) {
-            return Some(conn.clone());
+    fn select_conn(&self) -> Option<ArcPeerConn> {
+        let _update_guard = self.default_conn_update_lock.lock();
+        if let Some(conn) = self.default_conn.load_full() {
+            return Some(conn);
         }
 
         let mut best_score = u64::MAX;
-        let mut best_id = None;
+        let mut selected = None;
         for conn in self.conns.iter() {
             if let Some(score) = Self::calc_conn_score(conn.value()) {
                 if score < best_score {
                     best_score = score;
-                    best_id = Some(conn.get_conn_id());
+                    selected = Some(conn.value().clone());
                 }
             }
         }
-        let best_id = best_id
-            .or_else(|| self.conns.iter().next().map(|conn| conn.get_conn_id()))?;
-
-        self.default_conn_id.store(best_id);
-        self.conns.get(&best_id).map(|conn| conn.clone())
+        let selected =
+            selected.or_else(|| self.conns.iter().next().map(|c| c.value().clone()));
+        if let Some(conn) = selected.as_ref() {
+            self.default_conn.store(Some(conn.clone()));
+        }
+        selected
     }
 
     pub async fn send_msg(&self, mut msg: ZCPacket) -> Result<(), Error> {
@@ -263,7 +284,15 @@ impl Peer {
                 hdr.seq.set(self.send_seq.fetch_add(1, Ordering::Relaxed));
             }
         }
-        let Some(conn) = self.select_conn().await else {
+
+        let default_conn = self.default_conn.load();
+        if let Some(conn) = default_conn.as_ref() {
+            conn.send_msg(msg).await?;
+            return Ok(());
+        }
+        drop(default_conn);
+
+        let Some(conn) = self.select_conn() else {
             return Err(Error::PeerNoConnectionError(self.peer_node_id));
         };
         conn.send_msg(msg).await?;
@@ -319,7 +348,11 @@ impl Peer {
     }
 
     pub fn get_default_conn_id(&self) -> PeerConnId {
-        self.default_conn_id.load()
+        self.default_conn
+            .load()
+            .as_ref()
+            .map(|conn| conn.get_conn_id())
+            .unwrap_or_default()
     }
 
     pub fn get_peer_identity_type(&self) -> Option<PeerIdentityType> {
