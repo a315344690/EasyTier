@@ -265,9 +265,12 @@ impl Socket {
         // construction. A connector passes `None` (it allocates in `SynSent` before
         // its handshake completes) and calibrates in the `SynSent` arm from the
         // captured SYN-ACK, then adopts the kernel's authoritative numbers via
-        // `adopt_kernel_state` once TCP_REPAIR has frozen the socket.
+        // `adopt_kernel_state` once TCP_REPAIR has frozen the socket. Key
+        // calibration off presence, not the values: a frozen kernel could in
+        // principle report seq/ack of 0, which value-inference would misread as
+        // uncalibrated and wedge the socket into never sending.
+        let calibrated = kernel_state.is_some();
         let kernel_state = kernel_state.unwrap_or_default();
-        let calibrated = kernel_state.seq != 0 || kernel_state.ack != 0;
 
         (
             Socket {
@@ -443,10 +446,9 @@ impl Socket {
     /// interval has elapsed.
     ///
     /// The trigger is the volume of payload received, not movement of the ACK
-    /// field. On the fail-soft path that field is pinned and cannot signal new
-    /// data at all; on the repair path a bare ACK is only needed when we have no
-    /// outgoing data segment to carry the advance, i.e. exactly when the pure
-    /// receive direction has unacknowledged bytes. `recv_since_ack` covers both.
+    /// field: a bare ACK is only needed when we have no outgoing data segment to
+    /// carry the advancing ACK, i.e. exactly when the pure receive direction has
+    /// unacknowledged bytes, which `recv_since_ack` tracks.
     pub fn send_ack(&self) {
         if !self.seq_calibrated.load(Ordering::Acquire) {
             return;
@@ -982,8 +984,7 @@ mod tests {
 
     /// A `MockTun`-backed established socket seeded with the frozen kernel's
     /// numbers (SND.NXT = 5000, RCV.NXT = 1000), as a listener gets them from
-    /// `freeze_kernel_socket`. This is the only way an established socket is built
-    /// now that TCP_REPAIR is mandatory, so it is the single test fixture. Returns
+    /// `freeze_kernel_socket` -- i.e. a calibrated socket ready to send. Returns
     /// the sender side of the dispatch channel so tests can inject inbound frames
     /// without a real capture device.
     fn mock_socket() -> (Arc<MockTun>, Stack, Socket, flume::Sender<Bytes>) {
@@ -1324,8 +1325,21 @@ mod tests {
         let stack = Stack::new(tun.clone(), None);
         let local: SocketAddr = TEST_LOCAL.parse().unwrap();
         let remote: SocketAddr = TEST_REMOTE.parse().unwrap();
+        // Seed with kernel state so the socket is calibrated: `send_ack` guards on
+        // `seq_calibrated` and would otherwise early-return before touching the tun,
+        // leaving the failed-send debt-return path (the whole point of this test)
+        // unexercised.
         let socket = stack
-            .try_alloc_established_socket(local, remote, State::Established, None)
+            .try_alloc_established_socket(
+                local,
+                remote,
+                State::Established,
+                Some(super::super::KernelTcpState {
+                    seq: 5000,
+                    ack: 1000,
+                    ts_offset: 0,
+                }),
+            )
             .expect("fresh stack should allocate");
         let tx = stack
             .shared
@@ -1343,7 +1357,8 @@ mod tests {
         assert_eq!(socket.recv(&mut buf).await, Some(4));
         assert_eq!(socket.recv_since_ack.load(Ordering::Relaxed), 4);
 
-        // The wire is dead, so the ACK never goes out and the debt must survive.
+        // The wire is dead, so `try_send` fails and the ACK never goes out; the swap
+        // that claimed the debt must be undone so the bytes stay owed.
         socket.send_ack();
         assert_eq!(
             socket.recv_since_ack.load(Ordering::Relaxed),
