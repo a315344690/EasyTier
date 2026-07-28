@@ -491,8 +491,9 @@ impl LinuxBpfTun {
                     libc::recvmmsg(
                         read_fd,
                         msgvec.as_mut_ptr(),
-                        RECV_BATCH_SIZE as libc::c_uint,
-                        libc::MSG_WAITFORONE,
+                        RECV_BATCH_SIZE as _,
+                        // flags is c_int on glibc but c_uint on musl, let inference pick.
+                        libc::MSG_WAITFORONE as _,
                         std::ptr::null_mut(),
                     )
                 };
@@ -697,7 +698,7 @@ impl stack::Tun for LinuxBpfTun {
             libc::sendmmsg(
                 self.fd.as_ref().as_raw_fd(),
                 msgvec.as_mut_ptr(),
-                valid as u32,
+                valid as _,
                 0,
             )
         };
@@ -833,6 +834,10 @@ mod tests {
             0,
             TcpFlags::SYN,
             Some(b"ping"),
+            None,
+            0,
+            0xffff,
+            0,
         );
 
         send_raw_frame(&ifname, &frame).unwrap();
@@ -886,6 +891,10 @@ mod tests {
             0,
             TcpFlags::SYN,
             Some(b"nope"),
+            None,
+            0,
+            0xffff,
+            0,
         );
         send_raw_frame(&ifname, &non_matching).unwrap();
 
@@ -911,6 +920,10 @@ mod tests {
             0,
             TcpFlags::SYN,
             Some(b"ok"),
+            None,
+            0,
+            0xffff,
+            0,
         );
         send_raw_frame(&ifname, &matching).unwrap();
 

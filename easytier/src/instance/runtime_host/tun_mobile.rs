@@ -68,7 +68,8 @@ impl NativeTunRuntime {
             .get_ipv4()
             .map(|ip| MagicDnsRuntime::start(global_ctx, packet_plane, None, ip))
             .unwrap_or_default();
-        nic_state.install(nic, magic_dns).await;
+        // No default route guard on mobile: routing is owned by the platform VPN service.
+        nic_state.install(nic, magic_dns, None).await;
         Ok(())
     }
 
