@@ -18,7 +18,7 @@ use crate::proto::common::TunnelInfo;
 
 const TCP_MTU_BYTES: usize = 2000;
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 // --- Payload types ---
 

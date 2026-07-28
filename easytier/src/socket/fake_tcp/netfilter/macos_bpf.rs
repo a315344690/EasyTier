@@ -1022,6 +1022,13 @@ impl stack::Tun for MacosBpfTun {
         }
     }
 
+    async fn recv_bytes(&self) -> Result<Bytes, std::io::Error> {
+        let mut rx = self.recv_queue.lock().await;
+        rx.recv().await.map(Bytes::from).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "MacosBpfTun channel closed")
+        })
+    }
+
     #[tracing::instrument(ret, skip(self))]
     fn try_send(&self, packet: &Bytes) -> Result<(), std::io::Error> {
         if packet.len() < ETH_HDR_LEN {

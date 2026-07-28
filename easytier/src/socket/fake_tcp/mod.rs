@@ -240,11 +240,24 @@ impl FakeTcpSocket {
     {
         let socket = Arc::new(socket);
         let ack_socket = socket.clone();
+        let notify = socket.ack_notify().clone();
         let ack_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            ack_socket.send_ack();
+
+            let mut idle_deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                let jitter = rand::random::<u64>() % 100;
-                tokio::time::sleep(std::time::Duration::from_millis(150 + jitter)).await;
-                ack_socket.send_ack();
+                tokio::select! {
+                    _ = notify.notified() => {
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                        ack_socket.send_ack();
+                        idle_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                    }
+                    _ = tokio::time::sleep_until(idle_deadline) => {
+                        ack_socket.send_ack();
+                        idle_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                    }
+                }
             }
         }));
         Self {
@@ -473,14 +486,23 @@ async fn connect_socket_with_cache(
         let local_ip = get_local_ip_for_destination(remote_addr.ip())
             .ok_or(TunnelError::InternalError("Failed to get local ip".into()))?;
 
-        let os_socket = tokio::net::TcpSocket::new_v4()?;
+        let os_socket = if remote_addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
         // SO_MARK applies only to the kernel-visible "decoy" socket below.
         // The actual FakeTCP payload travels via crafted segments written
         // straight to the TUN device, which the kernel doesn't tag with
         // SO_MARK. Operators relying on fwmark for FakeTCP must mark the
         // TUN device's traffic with a separate nftables/iptables rule.
         crate::tunnel::common::apply_socket_mark(&socket2::SockRef::from(&os_socket), socket_mark)?;
-        os_socket.bind("0.0.0.0:0".parse().unwrap())?;
+        let bind_addr: SocketAddr = if remote_addr.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        };
+        os_socket.bind(bind_addr)?;
         let local_addr = SocketAddr::new(local_ip, os_socket.local_addr()?.port());
 
         let (interface_name, mac) =

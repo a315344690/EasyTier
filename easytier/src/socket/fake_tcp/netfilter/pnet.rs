@@ -323,6 +323,13 @@ impl stack::Tun for PnetTun {
         }
     }
 
+    async fn recv_bytes(&self) -> Result<Bytes, std::io::Error> {
+        let mut rx = self.recv_queue.lock().await;
+        rx.recv().await.map(Bytes::from).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PnetTun channel closed")
+        })
+    }
+
     fn try_send(&self, packet: &Bytes) -> Result<(), std::io::Error> {
         tracing::trace!(len = packet.len(), "PnetTun try_sending packet");
         // We need async lock for tx.

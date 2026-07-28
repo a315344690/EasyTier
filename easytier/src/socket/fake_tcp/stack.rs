@@ -54,7 +54,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
 };
 use std::time::Instant;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 use tokio::time;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, info, trace, warn};
@@ -78,16 +78,19 @@ fn system_boot_instant() -> Instant {
     }
 }
 
-const TIMEOUT: time::Duration = time::Duration::from_secs(1);
+const HANDSHAKE_TIMEOUT: time::Duration = time::Duration::from_secs(3);
 const MPMC_BUFFER_LEN: usize = 4096;
 const MAX_UNACKED_LEN: u32 = u32::MAX / 2;
-const DEFAULT_WINDOW: u32 = 0x3400000;
-const WINDOW_SCALE: u8 = 14;
 const KEEPALIVE_INTERVAL_SECS: u32 = 20;
 
 #[async_trait::async_trait]
 pub trait Tun: Send + Sync + 'static {
     async fn recv(&self, packet: &mut BytesMut) -> Result<usize, std::io::Error>;
+    async fn recv_bytes(&self) -> Result<Bytes, std::io::Error> {
+        let mut buf = BytesMut::with_capacity(2048);
+        self.recv(&mut buf).await?;
+        Ok(buf.freeze())
+    }
     fn try_send(&self, packet: &Bytes) -> Result<(), std::io::Error>;
     fn try_send_batch(&self, packets: &[Bytes]) -> Result<usize, std::io::Error> {
         let mut sent = 0;
@@ -173,8 +176,8 @@ pub struct Socket {
     ts_offset: u32,
     remote_tsval: AtomicU32,
     ip_id: AtomicU16,
-    recv_window: AtomicU32,
     last_send_time_secs: AtomicU32,
+    ack_notify: Arc<Notify>,
 }
 
 /// A socket that represents a unique TCP connection between a server and client.
@@ -216,11 +219,15 @@ impl Socket {
                 ts_offset: 0,
                 remote_tsval: AtomicU32::new(0),
                 ip_id: AtomicU16::new(rand::random()),
-                recv_window: AtomicU32::new(DEFAULT_WINDOW),
                 last_send_time_secs: AtomicU32::new(0),
+                ack_notify: Arc::new(Notify::new()),
             },
             incoming_tx,
         )
+    }
+
+    pub fn ack_notify(&self) -> &Arc<Notify> {
+        &self.ack_notify
     }
 
     fn build_tcp_packet_inner(
@@ -235,8 +242,20 @@ impl Socket {
         let tsval = (self.ts_base.elapsed().as_millis() as u32).wrapping_add(self.ts_offset);
         let tsecr = self.remote_tsval.load(Ordering::Relaxed);
         let ip_id = self.ip_id.fetch_add(1, Ordering::Relaxed);
-        let raw_window = self.recv_window.load(Ordering::Relaxed);
-        let window = ((raw_window >> WINDOW_SCALE) as u16).min(0xFFFF);
+        // The TCP window field is always advertised at its 16-bit maximum. FakeTCP has no
+        // flow control -- payload is handed straight to the caller in `recv` with no backlog
+        // buffer -- so the only readers of the advertised window are stateful middleboxes
+        // (conntrack, NAT gateways, commercial firewalls). Those interpret this field using
+        // the window scale negotiated by the *kernel decoy* handshake, not any constant of
+        // ours; if a middlebox strips the wscale option the factor collapses to 0. Filling
+        // 0xFFFF keeps the effective window at 64 KB even then, so our segments are never
+        // judged out-of-window. This matches upstream phantun's `set_window(0xffff)`.
+        // A bare RST advertises a zero window, as real stacks do.
+        let window = if flags == tcp::TcpFlags::RST {
+            0
+        } else {
+            u16::MAX
+        };
 
         build_tcp_packet(
             self.local_mac,
@@ -390,6 +409,10 @@ impl Socket {
                         },
                     );
 
+                    if !payload.is_empty() {
+                        self.ack_notify.notify_one();
+                    }
+
                     // SEQ calibration from peer's ACK (one-time only)
                     if !self.seq_calibrated.load(Ordering::Acquire)
                         && (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0
@@ -400,58 +423,8 @@ impl Socket {
                         self.seq_calibrated.store(true, Ordering::Release);
                     }
 
-                    for opt in tcp_packet.get_options_iter() {
-                        if opt.get_number() == TcpOptionNumbers::SACK {
-                            // SACK 选项类型为 5
-                            let payload = opt.payload();
-                            for chunk in payload.chunks(8) {
-                                if chunk.len() != 8 {
-                                    continue;
-                                }
-                                let left = tcp_packet.get_acknowledgement();
-                                let right = u32::from_be_bytes(chunk[0..4].try_into().unwrap());
-                                let len = right.wrapping_sub(left);
-
-                                let sack_end = u32::from_be_bytes(chunk[4..8].try_into().unwrap());
-                                if len == 0 || sack_end <= left {
-                                    continue;
-                                }
-
-                                let send_len = std::cmp::min(len, 1400) as usize;
-                                let data = vec![0u8; send_len];
-                                let ack_val = self.ack.load(Ordering::Relaxed);
-
-                                let buf = self.build_tcp_packet_inner(
-                                    tcp::TcpFlags::ACK,
-                                    Some(&data),
-                                    left,
-                                    ack_val,
-                                    0,
-                                );
-
-                                if let Err(e) = self.tun.try_send(&buf) {
-                                    tracing::error!("Failed to send SACK response: {}", e);
-                                }
-                                break;
-                            }
-                        }
-                    }
-
                     if payload.is_empty() {
                         continue;
-                    }
-
-                    // Dynamic receive window management
-                    let current_window = self
-                        .recv_window
-                        .load(Ordering::Relaxed)
-                        .saturating_sub(payload.len() as u32);
-                    self.recv_window.store(current_window, Ordering::Relaxed);
-                    let threshold = DEFAULT_WINDOW / 4
-                        + (tcp_packet.get_sequence() % (DEFAULT_WINDOW / 4));
-                    if current_window < threshold {
-                        self.recv_window.store(DEFAULT_WINDOW, Ordering::Relaxed);
-                        self.send_ack();
                     }
 
                     buf.extend_from_slice(payload);
@@ -459,7 +432,8 @@ impl Socket {
                     return Some(payload.len());
                 }
                 State::SynSent => {
-                    let Ok(Ok(buf)) = time::timeout(TIMEOUT, self.incoming.recv_async()).await
+                    let Ok(Ok(buf)) =
+                        time::timeout(HANDSHAKE_TIMEOUT, self.incoming.recv_async()).await
                     else {
                         info!("Waiting for client SYN + ACK timed out");
                         return None;
@@ -629,12 +603,10 @@ impl Stack {
         let mut tuples: HashMap<AddrTuple, flume::Sender<Bytes>> = HashMap::new();
 
         loop {
-            let mut buf = BytesMut::new();
-
             tokio::select! {
-                size = tun.recv(&mut buf) => {
-                    let size = match size {
-                        Ok(size) => size,
+                result = tun.recv_bytes() => {
+                    let buf = match result {
+                        Ok(buf) => buf,
                         Err(e) => {
                             let shared_tuple_count = shared.mark_closed_and_clear_tuples();
                             let cached_tuple_count = tuples.len();
@@ -649,8 +621,7 @@ impl Stack {
                             break;
                         }
                     };
-                    tracing::trace!(len = size, ?buf, "PnetTun received packet");
-                    let buf = buf.split().freeze();
+                    tracing::trace!(len = buf.len(), "received packet");
 
                     match parse_ip_packet(&buf) {
                         Some((_src_mac, _dst_mac, ip_packet, tcp_packet)) => {

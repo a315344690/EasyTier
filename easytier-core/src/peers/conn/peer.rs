@@ -152,10 +152,13 @@ impl Peer {
                         best_conn = Some(conn.value().clone());
                     }
                 }
-                let Some(best_conn) = best_conn else { continue };
+                let Some(ref best_conn) = best_conn else { continue };
 
                 let current = default_conn_copy.load_full();
                 if let Some(ref current_conn) = current {
+                    if Arc::ptr_eq(current_conn, best_conn) {
+                        continue;
+                    }
                     let latency_us = current_conn.get_latency_us();
                     let loss = current_conn.get_loss_rate_percent() as u64;
                     if latency_us > 0 && loss < 100 {
@@ -166,7 +169,7 @@ impl Peer {
                     }
                 }
 
-                default_conn_copy.store(Some(best_conn));
+                default_conn_copy.store(None);
             }
         }));
 

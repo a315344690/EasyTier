@@ -619,6 +619,13 @@ impl stack::Tun for LinuxBpfTun {
         }
     }
 
+    async fn recv_bytes(&self) -> Result<Bytes, std::io::Error> {
+        let mut rx = self.recv_queue.lock().await;
+        rx.recv().await.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "LinuxBpfTun channel closed")
+        })
+    }
+
     fn try_send(&self, packet: &Bytes) -> Result<(), std::io::Error> {
         if packet.len() < 6 {
             return Err(std::io::Error::new(

@@ -195,6 +195,13 @@ impl stack::Tun for WinDivertTun {
         }
     }
 
+    async fn recv_bytes(&self) -> Result<Bytes, std::io::Error> {
+        let mut rx = self.recv_queue.lock().await;
+        rx.recv().await.map(Bytes::from).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Channel closed")
+        })
+    }
+
     fn try_send(&self, packet: &Bytes) -> Result<(), std::io::Error> {
         // Strip ethernet header
         if packet.len() < 14 {
