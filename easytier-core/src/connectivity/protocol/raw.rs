@@ -470,14 +470,19 @@ fn connected_tunnel_info(
     }
 }
 
+/// Resolves the `tunnel_type` reported for a TCP-like transport.
+///
+/// The transport label (e.g. `faketcp_linux_bpf`) stays available for diagnostics
+/// via [`VirtualTcpSocket::transport_label`], but is deliberately not used as the
+/// `tunnel_type`: display normalization derives the IPv6 form by matching a known
+/// scheme, so a driver suffix would render as `faketcp_linux_bpf`, never `faketcp6`.
 fn tcp_tunnel_type(socket: &impl VirtualTcpSocket, scheme: &str) -> Result<String, TunnelError> {
-    match socket.transport_label() {
-        Some(label) => Ok(label.to_owned()),
-        None if scheme == "faketcp" => Err(TunnelError::InternalError(
+    if scheme == "faketcp" && socket.transport_label().is_none() {
+        return Err(TunnelError::InternalError(
             "FakeTCP upgrader received a socket without a FakeTCP transport label".to_owned(),
-        )),
-        None => Ok(scheme.to_owned()),
+        ));
     }
+    Ok(scheme.to_owned())
 }
 
 fn socket_url(scheme: &str, addr: SocketAddr) -> Url {
@@ -656,7 +661,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn raw_tcp_upgrader_preserves_host_transport_label() {
+    fn raw_tcp_upgrader_reports_scheme_not_host_transport_label() {
         let local_addr: SocketAddr = "192.0.2.1:10000".parse().unwrap();
         let peer_addr: SocketAddr = "192.0.2.2:11013".parse().unwrap();
         let requested_url: Url = "faketcp://peer.example:11013".parse().unwrap();
@@ -667,7 +672,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let connected_info = connected.info().unwrap();
-        assert_eq!(connected_info.tunnel_type, "faketcp_test-driver");
+        // driver suffix stays in the transport label, not in tunnel_type
+        assert_eq!(connected_info.tunnel_type, "faketcp");
         assert_eq!(
             connected_info.resolved_remote_addr.unwrap().url,
             "faketcp://192.0.2.2:11013"
@@ -679,7 +685,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let accepted_info = accepted.info().unwrap();
-        assert_eq!(accepted_info.tunnel_type, "faketcp_test-driver");
+        assert_eq!(accepted_info.tunnel_type, "faketcp");
         assert_eq!(
             accepted_info.remote_addr,
             accepted_info.resolved_remote_addr

@@ -802,6 +802,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires root for AF_PACKET capture"]
     async fn linux_bpf_tun_receives_matching_ipv4_frame() {
         if !is_root() {
             eprintln!("linux_bpf_tun_receives_matching_ipv4_frame: skipped (not root)");
@@ -856,6 +857,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires root for AF_PACKET capture"]
     async fn linux_bpf_tun_filters_out_non_matching_ipv4_frame() {
         if !is_root() {
             eprintln!("linux_bpf_tun_filters_out_non_matching_ipv4_frame: skipped (not root)");

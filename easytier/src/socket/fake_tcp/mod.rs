@@ -1,6 +1,9 @@
+mod guard;
 mod netfilter;
 mod packet;
 mod stack;
+
+pub(crate) use guard::cleanup_all as cleanup_kernel_silencers;
 
 use bytes::{Bytes, BytesMut};
 use network_interface::NetworkInterfaceConfig;
@@ -22,7 +25,13 @@ use easytier_core::{
     tunnel::{IpVersion, TunnelError},
 };
 
-use crate::{common::netns::NetNS, tunnel::FromUrl};
+use crate::{
+    common::netns::NetNS,
+    tunnel::{
+        FromUrl,
+        common::{BindDev, bind},
+    },
+};
 
 use self::netfilter::create_tun;
 
@@ -61,6 +70,8 @@ impl IpToIfNameCache {
     }
 
     fn get_ifname(&self, ip: &IpAddr) -> Option<(String, Option<MacAddr>)> {
+        // interfaces are cached in their native family, so unwrap ::ffff: forms
+        let ip = &ip.to_canonical();
         if let Some(ifname) = self.ip_to_ifname.get(ip) {
             Some(ifname.clone())
         } else {
@@ -91,8 +102,10 @@ async fn create_tun_off_runtime(
 pub(crate) struct FakeTcpSocketListener {
     addr: url::Url,
     os_listener: Option<tokio::net::TcpListener>,
-    // interface_name -> fake tcp stack
-    stack_map: DashMap<String, Arc<stack::Stack>>,
+    // (interface_name, local_addr) -> fake tcp stack.
+    // local_addr is part of the key because the stack's packet filter is pinned
+    // to it, so a dual-stack interface needs one stack per address family.
+    stack_map: DashMap<(String, SocketAddr), Arc<stack::Stack>>,
     // a cache from ip addr to interface name
     ip_to_ifname: IpToIfNameCache,
 }
@@ -162,8 +175,9 @@ impl FakeTcpSocketListener {
         let local_socket_addr = accept_result.local_addr;
 
         let interface_name = &accept_result.interface_name;
+        let key = accept_result.stack_key();
 
-        if let Some(entry) = self.stack_map.get(interface_name) {
+        if let Some(entry) = self.stack_map.get(&key) {
             let stack = entry.clone();
             drop(entry);
 
@@ -173,9 +187,10 @@ impl FakeTcpSocketListener {
 
             tracing::warn!(
                 interface_name,
+                ?local_socket_addr,
                 "fake_tcp stack reader_task finished, recreating stack"
             );
-            self.stack_map.remove(interface_name);
+            self.stack_map.remove(&key);
         }
 
         let tun = create_tun_off_runtime(
@@ -190,15 +205,161 @@ impl FakeTcpSocketListener {
             "create new stack with interface_name: {:?}",
             interface_name
         );
+        // drop stacks of retired local addrs (e.g. rotated IPv6 privacy addrs),
+        // which are otherwise only evicted when their own key is looked up again
+        self.stack_map.retain(|_, stack| !stack.is_closed());
+
         let stack = Arc::new(stack::Stack::new(tun, accept_result.mac));
-        self.stack_map
-            .insert(interface_name.to_string(), stack.clone());
+        self.stack_map.insert(key, stack.clone());
 
         Ok(stack)
     }
 }
 
+/// State copied out of the kernel socket that completed the real handshake.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct KernelTcpState {
+    /// The kernel's send sequence, i.e. where our crafted segments must start.
+    pub seq: u32,
+    /// The kernel's receive sequence. Nothing has arrived since the handshake,
+    /// so this is the peer's ISN+1 -- exactly what our segments must acknowledge.
+    pub ack: u32,
+    /// Added to our TSval so it lines up with the kernel's TCP timestamp clock,
+    /// which carries a random per-destination offset when `tcp_timestamps=1`.
+    pub ts_offset: u32,
+}
+
+/// Freezes the kernel socket that performed the handshake and reads its sequence
+/// state, so our crafted segments continue exactly where the kernel left off.
+///
+/// `TCP_REPAIR` does double duty: besides exposing the sequence numbers, it stops
+/// the kernel from emitting anything further on this 4-tuple -- no ACKs, no window
+/// updates, and no FIN or RST when the socket is closed. Those would otherwise
+/// collide with our own segments, since we and the kernel disagree about how far
+/// the sequence space has advanced. The socket is deliberately *left* in repair
+/// mode for the rest of its life.
+///
+/// Needs `CAP_NET_ADMIN`. On failure the connection still works -- the peer's
+/// kernel just keeps answering our segments with corrective ACKs.
+#[cfg(target_os = "linux")]
+fn freeze_kernel_socket(socket: &TcpStream) -> io::Result<KernelTcpState> {
+    use nix::libc;
+    use std::os::unix::io::AsRawFd;
+
+    // Not in libc: see include/uapi/linux/tcp.h.
+    const TCP_REPAIR: libc::c_int = 19;
+    const TCP_REPAIR_QUEUE: libc::c_int = 20;
+    const TCP_QUEUE_SEQ: libc::c_int = 21;
+    const TCP_TIMESTAMP: libc::c_int = 24;
+    const TCP_RECV_QUEUE: libc::c_int = 1;
+    const TCP_SEND_QUEUE: libc::c_int = 2;
+
+    let fd = socket.as_raw_fd();
+
+    fn set_int(fd: i32, opt: libc::c_int, value: libc::c_int) -> io::Result<()> {
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                opt,
+                &value as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn get_u32(fd: i32, opt: libc::c_int) -> io::Result<u32> {
+        let mut value: u32 = 0;
+        let mut len = std::mem::size_of::<u32>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                opt,
+                &mut value as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(value)
+    }
+
+    set_int(fd, TCP_REPAIR, 1).map_err(|e| {
+        tracing::warn!(
+            errno = e.raw_os_error(),
+            "faketcp: TCP_REPAIR failed, kernel will keep talking on this tuple"
+        );
+        e
+    })?;
+
+    // Any failure past this point leaves the socket frozen but us without usable
+    // numbers, so hand it back to the kernel rather than stranding it.
+    let read_state = || -> io::Result<(u32, u32)> {
+        set_int(fd, TCP_REPAIR_QUEUE, TCP_SEND_QUEUE)?;
+        let seq = get_u32(fd, TCP_QUEUE_SEQ)?;
+        set_int(fd, TCP_REPAIR_QUEUE, TCP_RECV_QUEUE)?;
+        let ack = get_u32(fd, TCP_QUEUE_SEQ)?;
+        Ok((seq, ack))
+    };
+    let (seq, ack) = match read_state() {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = set_int(fd, TCP_REPAIR, 0);
+            tracing::warn!(errno = e.raw_os_error(), "faketcp: reading repair queues failed");
+            return Err(e);
+        }
+    };
+
+    // `tcp_timestamps=1` (the default) adds a random per-destination offset to
+    // every TSval. Recover it so our segments and the kernel's handshake segments
+    // present one continuous timestamp clock to any middlebox doing PAWS checks.
+    let ts_offset = match get_u32(fd, TCP_TIMESTAMP) {
+        Ok(kernel_ts) => {
+            kernel_ts.wrapping_sub(stack::ts_base().elapsed().as_millis() as u32)
+        }
+        Err(e) => {
+            tracing::warn!(
+                errno = e.raw_os_error(),
+                "faketcp: TCP_TIMESTAMP failed, timestamps will not match the kernel's"
+            );
+            0
+        }
+    };
+
+    tracing::debug!(seq, ack, ts_offset, "faketcp: froze kernel socket");
+    Ok(KernelTcpState {
+        seq,
+        ack,
+        ts_offset,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn freeze_kernel_socket(_socket: &TcpStream) -> io::Result<KernelTcpState> {
+    // No `TCP_REPAIR` equivalent. Sequence numbers come from the captured SYN-ACK
+    // (connector) or the first inbound segment (listener) instead.
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "TCP_REPAIR is Linux-only",
+    ))
+}
+
 fn build_os_socket_reader_task(mut socket: TcpStream) -> AbortOnDropHandle<()> {
+    // The decoy socket exists only to hold the 4-tuple; no payload ever flows
+    // through it, so keep its buffers minimal, and keep the kernel from probing a
+    // peer that will never answer at the kernel's sequence numbers.
+    let sock_ref = socket2::SockRef::from(&socket);
+    let _ = sock_ref.set_recv_buffer_size(1024);
+    let _ = sock_ref.set_send_buffer_size(1024);
+    let _ = sock_ref.set_nodelay(true);
+    let _ = sock_ref.set_keepalive(false);
+
     AbortOnDropHandle::new(tokio::spawn(async move {
         // read the os socket until it's closed
         let mut buf = [0u8; 1024];
@@ -212,10 +373,13 @@ fn build_os_socket_reader_task(mut socket: TcpStream) -> AbortOnDropHandle<()> {
     }))
 }
 
-type FakeTcpReadFuture = Pin<Box<dyn Future<Output = Option<BytesMut>> + Send + Sync + 'static>>;
+type FakeTcpReadFuture = Pin<Box<dyn Future<Output = Option<Bytes>> + Send + Sync + 'static>>;
 
 enum FakeTcpReadState {
-    Buffered(BytesMut),
+    // A zero-copy view into a received frame, consumed from the front as the
+    // caller reads. Holding `Bytes` rather than `BytesMut` is what lets
+    // `recv_payload` hand us the payload without an intermediate copy.
+    Buffered(Bytes),
     Receiving(FakeTcpReadFuture),
     Closed,
 }
@@ -262,7 +426,7 @@ impl FakeTcpSocket {
         }));
         Self {
             socket,
-            read_state: FakeTcpReadState::Buffered(BytesMut::new()),
+            read_state: FakeTcpReadState::Buffered(Bytes::new()),
             transport_label,
             raw_pending: BytesMut::new(),
             pending_frames: Vec::new(),
@@ -315,8 +479,7 @@ impl AsyncRead for FakeTcpSocket {
                 FakeTcpReadState::Buffered(_) => {
                     let socket = this.socket.clone();
                     this.read_state = FakeTcpReadState::Receiving(Box::pin(async move {
-                        let mut buffer = BytesMut::new();
-                        socket.recv(&mut buffer).await.map(|_| buffer)
+                        socket.recv_payload().await
                     }));
                 }
                 FakeTcpReadState::Receiving(mut receive) => match receive.as_mut().poll(context) {
@@ -394,47 +557,88 @@ struct AcceptResult {
     mac: Option<MacAddr>,
 }
 
+impl AcceptResult {
+    fn stack_key(&self) -> (String, SocketAddr) {
+        (self.interface_name.clone(), self.local_addr)
+    }
+}
+
 impl FakeTcpSocketListener {
     pub(crate) async fn accept_socket(&mut self) -> Result<FakeTcpSocket, TunnelError> {
         tracing::debug!("FakeTcpSocketListener waiting for accept");
-        let (res, stack, socket) = loop {
+        let (res, stack, socket, silencer) = loop {
             let res = self.do_accept().await?;
+            // Silence the kernel on this 4-tuple before anything else: from here on
+            // it holds a live connection whose sequence numbers diverge from ours, so
+            // every moment it is free to speak is a moment it can emit a RST.
+            let silencer = guard::KernelSilencer::new(res.local_addr, res.remote_addr);
+            let kernel_state = freeze_kernel_socket(&res.socket)
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        ?e,
+                        remote = %res.remote_addr,
+                        "faketcp: could not freeze kernel socket, \
+                         falling back to calibrating from the first inbound segment"
+                    )
+                })
+                .ok();
             let stack = self.get_stack(&res).await?;
             let socket = stack.try_alloc_established_socket(
                 res.local_addr,
                 res.remote_addr,
                 stack::State::Established,
+                kernel_state,
             );
             let Some(socket) = socket else {
                 tracing::warn!(
                     interface_name = res.interface_name,
+                    local_addr = ?res.local_addr,
                     "fake_tcp stack closed while accepting connection, dropping accepted socket"
                 );
-                self.stack_map.remove(&res.interface_name);
+                self.stack_map.remove(&res.stack_key());
                 continue;
             };
-            break (res, stack, socket);
+            break (res, stack, socket, silencer);
         };
 
         tracing::info!(
             ?res,
             remote = socket.remote_addr().to_string(),
+            driver = stack.driver_type(),
             "FakeTcpSocketListener accepted connection"
         );
 
         let transport_label = faketcp_transport_label(stack.driver_type());
+        // Tuple drop order matters: the reader task and stack go first so no more
+        // segments are in flight by the time the filter rule is withdrawn.
         Ok(FakeTcpSocket::new(
             socket,
             transport_label,
-            (build_os_socket_reader_task(res.socket), stack),
+            (build_os_socket_reader_task(res.socket), stack, silencer),
         ))
     }
 
     async fn listen_socket(&mut self) -> Result<(), TunnelError> {
         let port = self.addr.port().unwrap_or(0);
         let bind_addr = SocketAddr::from_url(self.addr.clone(), IpVersion::Both).await?;
-        let os_listener = tokio::net::TcpListener::bind(bind_addr).await?;
-        tracing::info!(port, "FakeTcpSocketListener listening");
+        // must bind V6ONLY: a `[::]` shadow listener shares the port with the
+        // `0.0.0.0` one, and tokio's TcpListener::bind never sets IPV6_V6ONLY
+        let os_listener = bind::<tokio::net::TcpListener>()
+            .addr(bind_addr)
+            .dev(BindDev::Disabled)
+            .only_v6(bind_addr.is_ipv6())
+            .call()?;
+        // bind() only warns on ipv6 bind failure, and listen() then auto-binds an
+        // ephemeral port, so verify we really own the requested address
+        let bound_addr = os_listener.local_addr().map_err(|e| {
+            TunnelError::InternalError(format!("faketcp listener has no local address: {e}"))
+        })?;
+        if bound_addr.ip() != bind_addr.ip() || (port != 0 && bound_addr.port() != port) {
+            return Err(TunnelError::InternalError(format!(
+                "faketcp listener bound to {bound_addr} instead of {bind_addr}"
+            )));
+        }
+        tracing::info!(?bound_addr, "FakeTcpSocketListener listening");
         self.os_listener = Some(os_listener);
         Ok(())
     }
@@ -518,15 +722,21 @@ async fn connect_socket_with_cache(
     let stack = stack::Stack::new(tun, mac);
     let transport_label = faketcp_transport_label(stack.driver_type());
 
+    // Registered before `connect()` so the reader task has somewhere to dispatch
+    // the SYN-ACK the kernel is about to receive.
     let socket = stack
-        .try_alloc_established_socket(local_addr, remote_addr, stack::State::SynSent)
+        .try_alloc_established_socket(local_addr, remote_addr, stack::State::SynSent, None)
         .ok_or(TunnelError::InternalError(
             "FakeTCP stack closed while allocating socket".into(),
         ))?;
 
     let os_stream = os_socket.connect(remote_addr).await?;
 
-    tracing::info!(?remote_addr, "FakeTCP socket connecting");
+    tracing::info!(
+        ?remote_addr,
+        driver = stack.driver_type(),
+        "FakeTCP socket connecting"
+    );
 
     let mut buf = BytesMut::new();
     socket
@@ -536,12 +746,29 @@ async fn connect_socket_with_cache(
             "Failed to recv bytes to establish connection".into(),
         ))?;
 
+    // Only now that the handshake is done are the kernel's sequence numbers final,
+    // so the freeze happens here rather than at allocation time. The socket already
+    // derived the same values from the SYN-ACK; this replaces them with the
+    // kernel's own, and more importantly silences the kernel for good.
+    match freeze_kernel_socket(&os_stream) {
+        Ok(kernel_state) => socket.adopt_kernel_state(kernel_state),
+        Err(e) => tracing::warn!(
+            ?e,
+            remote = %remote_addr,
+            "faketcp: could not freeze kernel socket, it may keep sending on this tuple"
+        ),
+    }
+
     tracing::info!(local_addr = ?socket.local_addr(), "FakeTCP socket connected");
 
+    // Only now, and deliberately not earlier: the rule drops *all* kernel egress on
+    // this 4-tuple, which before `connect()` completed would have included the
+    // kernel's own SYN and left the handshake unable to finish.
+    let silencer = guard::KernelSilencer::new(local_addr, remote_addr);
     Ok(FakeTcpSocket::new(
         socket,
         transport_label,
-        (build_os_socket_reader_task(os_stream), stack),
+        (build_os_socket_reader_task(os_stream), stack, silencer),
     ))
 }
 
@@ -560,12 +787,18 @@ mod tests {
 
     use super::*;
 
+    /// Needs raw packet capture, so it is `#[ignore]`d rather than silently
+    /// returning when run unprivileged -- a test that reports success without
+    /// having exercised anything is worse than one that is visibly skipped.
+    /// Run with `sudo -E cargo test --features faketcp -- --ignored`.
     #[tokio::test]
+    #[ignore = "requires root for raw packet capture"]
     async fn faketcp_socket_pingpong() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             #[cfg(target_family = "unix")]
             {
                 if unsafe { nix::libc::geteuid() } != 0 {
+                    eprintln!("faketcp_socket_pingpong: skipped (not root)");
                     return;
                 }
             }

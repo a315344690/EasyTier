@@ -579,6 +579,7 @@ mod tests {
             "aes-gcm".to_string(),
             "aes-gcm".to_string(),
             None,
+            128,
         ));
         store.insert_session(key.clone(), session);
         let last_used_at = store.sessions.get(&key).unwrap().last_used_at.load();

@@ -371,6 +371,7 @@ fn normalize_scheme(scheme: impl Into<String>) -> String {
 mod tests {
     use super::*;
 
+    // mirrors the scheme registry built by `prepare_listener_plan`
     fn registry() -> ListenerSchemeRegistry {
         ListenerSchemeRegistry::new()
             .support("tcp", ListenerKind::TcpStream)
@@ -378,7 +379,6 @@ mod tests {
             .support("quic", ListenerKind::External)
             .support("faketcp", ListenerKind::External)
             .disable_ipv6_shadow("quic")
-            .disable_ipv6_shadow("faketcp")
     }
 
     #[test]
@@ -439,15 +439,18 @@ mod tests {
 
     #[test]
     fn listener_plan_skips_ipv6_shadow_for_excluded_schemes() {
-        for url in ["quic://0.0.0.0:11012", "faketcp://0.0.0.0:11013"] {
-            let plan = plan_listeners(
-                ListenerPlanRequest::new(uuid::Uuid::new_v4(), vec![url.parse().unwrap()], true),
-                &registry(),
-            );
+        // quic binds dual-stack by default, so a shadow listener would collide
+        let plan = plan_listeners(
+            ListenerPlanRequest::new(
+                uuid::Uuid::new_v4(),
+                vec!["quic://0.0.0.0:11012".parse().unwrap()],
+                true,
+            ),
+            &registry(),
+        );
 
-            assert_eq!(plan.failures, Vec::new());
-            assert_eq!(plan.listeners.len(), 2);
-        }
+        assert_eq!(plan.failures, Vec::new());
+        assert_eq!(plan.listeners.len(), 2);
     }
 
     #[test]
