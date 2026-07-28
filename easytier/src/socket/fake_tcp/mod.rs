@@ -1,9 +1,6 @@
-mod guard;
 mod netfilter;
 mod packet;
 mod stack;
-
-pub(crate) use guard::cleanup_all as cleanup_kernel_silencers;
 
 use bytes::{Bytes, BytesMut};
 use network_interface::NetworkInterfaceConfig;
@@ -239,9 +236,9 @@ pub(crate) struct KernelTcpState {
 /// the sequence space has advanced. The socket is deliberately *left* in repair
 /// mode for the rest of its life.
 ///
-/// Needs `CAP_NET_ADMIN`. On failure the connection still works -- the peer's
-/// kernel just keeps answering our segments with corrective ACKs.
-#[cfg(target_os = "linux")]
+/// Needs `CAP_NET_ADMIN`. On failure the caller aborts the connection: TCP_REPAIR
+/// is FakeTCP's only kernel-quieting mechanism, so there is no safe way to run
+/// without it.
 fn freeze_kernel_socket(socket: &TcpStream) -> io::Result<KernelTcpState> {
     use nix::libc;
     use std::os::unix::io::AsRawFd;
@@ -338,16 +335,6 @@ fn freeze_kernel_socket(socket: &TcpStream) -> io::Result<KernelTcpState> {
         ack,
         ts_offset,
     })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn freeze_kernel_socket(_socket: &TcpStream) -> io::Result<KernelTcpState> {
-    // No `TCP_REPAIR` equivalent. Sequence numbers come from the captured SYN-ACK
-    // (connector) or the first inbound segment (listener) instead.
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "TCP_REPAIR is Linux-only",
-    ))
 }
 
 fn build_os_socket_reader_task(mut socket: TcpStream) -> AbortOnDropHandle<()> {
@@ -566,28 +553,25 @@ impl AcceptResult {
 impl FakeTcpSocketListener {
     pub(crate) async fn accept_socket(&mut self) -> Result<FakeTcpSocket, TunnelError> {
         tracing::debug!("FakeTcpSocketListener waiting for accept");
-        let (res, stack, socket, silencer) = loop {
+        let (res, stack, socket) = loop {
             let res = self.do_accept().await?;
-            // Silence the kernel on this 4-tuple before anything else: from here on
-            // it holds a live connection whose sequence numbers diverge from ours, so
-            // every moment it is free to speak is a moment it can emit a RST.
-            let silencer = guard::KernelSilencer::new(res.local_addr, res.remote_addr);
-            let kernel_state = freeze_kernel_socket(&res.socket)
-                .inspect_err(|e| {
-                    tracing::warn!(
-                        ?e,
-                        remote = %res.remote_addr,
-                        "faketcp: could not freeze kernel socket, \
-                         falling back to calibrating from the first inbound segment"
-                    )
-                })
-                .ok();
+            // Freeze the decoy kernel socket with TCP_REPAIR: this silences the
+            // kernel on the 4-tuple (no ACK/window/FIN/RST to collide with our
+            // crafted segments) and yields its authoritative sequence numbers.
+            // It is the sole quieting mechanism, so a failure is fatal rather than
+            // degraded -- returning `Err` surfaces the missing capability
+            // immediately instead of silently rejecting every future peer.
+            let kernel_state = freeze_kernel_socket(&res.socket).map_err(|e| {
+                TunnelError::InternalError(format!(
+                    "faketcp: TCP_REPAIR unavailable ({e}); needs CAP_NET_ADMIN"
+                ))
+            })?;
             let stack = self.get_stack(&res).await?;
             let socket = stack.try_alloc_established_socket(
                 res.local_addr,
                 res.remote_addr,
                 stack::State::Established,
-                kernel_state,
+                Some(kernel_state),
             );
             let Some(socket) = socket else {
                 tracing::warn!(
@@ -598,7 +582,7 @@ impl FakeTcpSocketListener {
                 self.stack_map.remove(&res.stack_key());
                 continue;
             };
-            break (res, stack, socket, silencer);
+            break (res, stack, socket);
         };
 
         tracing::info!(
@@ -609,12 +593,10 @@ impl FakeTcpSocketListener {
         );
 
         let transport_label = faketcp_transport_label(stack.driver_type());
-        // Tuple drop order matters: the reader task and stack go first so no more
-        // segments are in flight by the time the filter rule is withdrawn.
         Ok(FakeTcpSocket::new(
             socket,
             transport_label,
-            (build_os_socket_reader_task(res.socket), stack, silencer),
+            (build_os_socket_reader_task(res.socket), stack),
         ))
     }
 
@@ -747,28 +729,23 @@ async fn connect_socket_with_cache(
         ))?;
 
     // Only now that the handshake is done are the kernel's sequence numbers final,
-    // so the freeze happens here rather than at allocation time. The socket already
-    // derived the same values from the SYN-ACK; this replaces them with the
-    // kernel's own, and more importantly silences the kernel for good.
-    match freeze_kernel_socket(&os_stream) {
-        Ok(kernel_state) => socket.adopt_kernel_state(kernel_state),
-        Err(e) => tracing::warn!(
-            ?e,
-            remote = %remote_addr,
-            "faketcp: could not freeze kernel socket, it may keep sending on this tuple"
-        ),
-    }
+    // so the freeze happens here rather than at allocation time. It replaces the
+    // SYN-ACK-derived numbers with the kernel's authoritative ones and, more
+    // importantly, silences the kernel for good. It is the sole quieting mechanism,
+    // so a failure is fatal rather than degraded.
+    let kernel_state = freeze_kernel_socket(&os_stream).map_err(|e| {
+        TunnelError::InternalError(format!(
+            "faketcp: TCP_REPAIR unavailable ({e}); needs CAP_NET_ADMIN"
+        ))
+    })?;
+    socket.adopt_kernel_state(kernel_state);
 
     tracing::info!(local_addr = ?socket.local_addr(), "FakeTCP socket connected");
 
-    // Only now, and deliberately not earlier: the rule drops *all* kernel egress on
-    // this 4-tuple, which before `connect()` completed would have included the
-    // kernel's own SYN and left the handshake unable to finish.
-    let silencer = guard::KernelSilencer::new(local_addr, remote_addr);
     Ok(FakeTcpSocket::new(
         socket,
         transport_label,
-        (build_os_socket_reader_task(os_stream), stack, silencer),
+        (build_os_socket_reader_task(os_stream), stack),
     ))
 }
 

@@ -141,7 +141,7 @@ pub enum IpScheme {
     Ws,
     #[cfg(feature = "websocket")]
     Wss,
-    #[cfg(feature = "faketcp")]
+    #[cfg(all(feature = "faketcp", target_os = "linux"))]
     FakeTcp,
     #[cfg(feature = "fakehttp")]
     FakeHttp,

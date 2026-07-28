@@ -46,7 +46,7 @@ pub(crate) fn runtime_client_protocol_upgrader(
     Arc::new(CoreClientProtocolUpgrader::with_external(
         CoreClientProtocolConfig {
             unix: cfg!(unix),
-            faketcp: cfg!(feature = "faketcp"),
+            faketcp: cfg!(all(feature = "faketcp", target_os = "linux")),
             faketcp_disguised,
         },
         Arc::new(runtime_client_protocol_adapter(&global_ctx)),
@@ -61,7 +61,7 @@ pub(crate) fn runtime_server_protocol_upgrader(
     Arc::new(CoreServerProtocolUpgrader::with_external(
         CoreServerProtocolConfig {
             unix: cfg!(unix),
-            faketcp: cfg!(feature = "faketcp"),
+            faketcp: cfg!(all(feature = "faketcp", target_os = "linux")),
             faketcp_disguised,
         },
         Arc::new(runtime_server_protocol_adapter(&global_ctx)),
@@ -204,7 +204,7 @@ mod tests {
         );
         assert_eq!(
             upgrader.supports_scheme("faketcp"),
-            cfg!(feature = "faketcp")
+            cfg!(all(feature = "faketcp", target_os = "linux"))
         );
 
         let server_external = runtime_server_protocol_adapter(&global_ctx);

@@ -6,7 +6,7 @@ use easytier_core::listener::{
 };
 use easytier_core::socket::SocketListener;
 
-#[cfg(feature = "faketcp")]
+#[cfg(all(feature = "faketcp", target_os = "linux"))]
 use crate::common::netns::NetNS;
 use crate::socket::tcp::RuntimeTcpSocket;
 
@@ -18,7 +18,7 @@ impl ExternalListenerFactory<AcceptedTransport<RuntimeTcpSocket>>
     #[allow(clippy::match_like_matches_macro)]
     fn supports_scheme(&self, scheme: &str) -> bool {
         match scheme {
-            "faketcp" => cfg!(feature = "faketcp"),
+            "faketcp" => cfg!(all(feature = "faketcp", target_os = "linux")),
             "unix" => cfg!(unix),
             _ => false,
         }
@@ -29,7 +29,7 @@ impl ExternalListenerFactory<AcceptedTransport<RuntimeTcpSocket>>
         request: ExternalListenerRequest,
     ) -> Box<dyn SocketListener<Accepted = AcceptedTransport<RuntimeTcpSocket>>> {
         match request.url.scheme() {
-            #[cfg(feature = "faketcp")]
+            #[cfg(all(feature = "faketcp", target_os = "linux"))]
             "faketcp" => Box::new(RuntimeFakeTcpSocketListener::new(
                 request.url,
                 NetNS::from_socket_context(&request.socket_context),
@@ -112,13 +112,13 @@ impl Drop for RuntimeUnixStreamListener {
     }
 }
 
-#[cfg(feature = "faketcp")]
+#[cfg(all(feature = "faketcp", target_os = "linux"))]
 struct RuntimeFakeTcpSocketListener {
     net_ns: NetNS,
     inner: crate::socket::fake_tcp::FakeTcpSocketListener,
 }
 
-#[cfg(feature = "faketcp")]
+#[cfg(all(feature = "faketcp", target_os = "linux"))]
 impl RuntimeFakeTcpSocketListener {
     fn new(url: url::Url, net_ns: NetNS) -> Self {
         Self {
@@ -128,7 +128,7 @@ impl RuntimeFakeTcpSocketListener {
     }
 }
 
-#[cfg(feature = "faketcp")]
+#[cfg(all(feature = "faketcp", target_os = "linux"))]
 impl Debug for RuntimeFakeTcpSocketListener {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -138,7 +138,7 @@ impl Debug for RuntimeFakeTcpSocketListener {
     }
 }
 
-#[cfg(feature = "faketcp")]
+#[cfg(all(feature = "faketcp", target_os = "linux"))]
 #[async_trait]
 impl SocketListener for RuntimeFakeTcpSocketListener {
     type Accepted = AcceptedTransport<RuntimeTcpSocket>;
@@ -174,7 +174,7 @@ mod tests {
 
         assert_eq!(
             factory.supports_scheme("faketcp"),
-            cfg!(feature = "faketcp")
+            cfg!(all(feature = "faketcp", target_os = "linux"))
         );
         assert_eq!(factory.supports_scheme("unix"), cfg!(unix));
         assert!(!factory.supports_scheme("tcp"));

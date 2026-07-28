@@ -1541,13 +1541,6 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // Individual connections withdraw their own filter rules on drop; this removes
-    // the process-wide scaffolding they share. The only paths that skip it are the
-    // ones that skip destructors too (`process::exit`), and a leftover table is
-    // reclaimed by the next start.
-    #[cfg(feature = "faketcp")]
-    crate::socket::fake_tcp::cleanup_kernel_silencers();
-
     Ok(())
 }
 

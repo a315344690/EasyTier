@@ -59,7 +59,7 @@ impl VirtualTcpSocketFactory for NativeHostRuntime {
     type Socket = RuntimeTcpSocket;
 
     async fn connect_tcp(&self, options: TcpConnectOptions) -> anyhow::Result<Self::Socket> {
-        #[cfg(feature = "faketcp")]
+        #[cfg(all(feature = "faketcp", target_os = "linux"))]
         if options.purpose == TcpSocketPurpose::FakeTcp {
             let remote_addr = options.remote_addr;
             let socket_mark = options.bind.context.socket_mark;
@@ -69,9 +69,10 @@ impl VirtualTcpSocketFactory for NativeHostRuntime {
             return Ok(RuntimeTcpSocket::from_fake_tcp(socket));
         }
 
-        #[cfg(not(feature = "faketcp"))]
+        // FakeTCP is Linux-only (needs TCP_REPAIR); reject it everywhere else.
+        #[cfg(not(all(feature = "faketcp", target_os = "linux")))]
         if options.purpose == TcpSocketPurpose::FakeTcp {
-            anyhow::bail!("FakeTCP socket support is disabled")
+            anyhow::bail!("FakeTCP socket support is only available on Linux")
         }
 
         crate::socket::tcp::connect_tcp(options)

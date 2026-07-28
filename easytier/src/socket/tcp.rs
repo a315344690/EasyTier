@@ -30,7 +30,7 @@ enum RuntimeTcpSocketInner {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
-    #[cfg(feature = "faketcp")]
+    #[cfg(all(feature = "faketcp", target_os = "linux"))]
     FakeTcp(crate::socket::fake_tcp::FakeTcpSocket),
 }
 
@@ -55,7 +55,7 @@ impl RuntimeTcpSocket {
         }
     }
 
-    #[cfg(feature = "faketcp")]
+    #[cfg(all(feature = "faketcp", target_os = "linux"))]
     pub(crate) fn from_fake_tcp(socket: crate::socket::fake_tcp::FakeTcpSocket) -> Self {
         Self {
             inner: RuntimeTcpSocketInner::FakeTcp(socket),
@@ -80,7 +80,7 @@ impl AsyncRead for RuntimeTcpSocket {
             RuntimeTcpSocketInner::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(unix)]
             RuntimeTcpSocketInner::Unix(stream) => Pin::new(stream).poll_read(cx, buf),
-            #[cfg(feature = "faketcp")]
+            #[cfg(all(feature = "faketcp", target_os = "linux"))]
             RuntimeTcpSocketInner::FakeTcp(socket) => Pin::new(socket).poll_read(cx, buf),
         }
     }
@@ -96,7 +96,7 @@ impl AsyncWrite for RuntimeTcpSocket {
             RuntimeTcpSocketInner::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(unix)]
             RuntimeTcpSocketInner::Unix(stream) => Pin::new(stream).poll_write(cx, buf),
-            #[cfg(feature = "faketcp")]
+            #[cfg(all(feature = "faketcp", target_os = "linux"))]
             RuntimeTcpSocketInner::FakeTcp(socket) => Pin::new(socket).poll_write(cx, buf),
         }
     }
@@ -106,7 +106,7 @@ impl AsyncWrite for RuntimeTcpSocket {
             RuntimeTcpSocketInner::Tcp(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(unix)]
             RuntimeTcpSocketInner::Unix(stream) => Pin::new(stream).poll_flush(cx),
-            #[cfg(feature = "faketcp")]
+            #[cfg(all(feature = "faketcp", target_os = "linux"))]
             RuntimeTcpSocketInner::FakeTcp(socket) => Pin::new(socket).poll_flush(cx),
         }
     }
@@ -116,7 +116,7 @@ impl AsyncWrite for RuntimeTcpSocket {
             RuntimeTcpSocketInner::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(unix)]
             RuntimeTcpSocketInner::Unix(stream) => Pin::new(stream).poll_shutdown(cx),
-            #[cfg(feature = "faketcp")]
+            #[cfg(all(feature = "faketcp", target_os = "linux"))]
             RuntimeTcpSocketInner::FakeTcp(socket) => Pin::new(socket).poll_shutdown(cx),
         }
     }
@@ -134,7 +134,7 @@ impl VirtualTcpSocket for RuntimeTcpSocket {
                 let (reader, writer) = stream.into_split();
                 (Box::new(reader), Box::new(writer))
             }
-            #[cfg(feature = "faketcp")]
+            #[cfg(all(feature = "faketcp", target_os = "linux"))]
             RuntimeTcpSocketInner::FakeTcp(socket) => {
                 let (reader, writer) = tokio::io::split(socket);
                 (Box::new(reader), Box::new(writer))
@@ -150,7 +150,7 @@ impl VirtualTcpSocket for RuntimeTcpSocket {
                 io::ErrorKind::Unsupported,
                 "Unix stream has no IP local address",
             )),
-            #[cfg(feature = "faketcp")]
+            #[cfg(all(feature = "faketcp", target_os = "linux"))]
             RuntimeTcpSocketInner::FakeTcp(socket) => socket.local_addr(),
         }
     }
@@ -163,14 +163,14 @@ impl VirtualTcpSocket for RuntimeTcpSocket {
                 io::ErrorKind::Unsupported,
                 "Unix stream has no IP peer address",
             )),
-            #[cfg(feature = "faketcp")]
+            #[cfg(all(feature = "faketcp", target_os = "linux"))]
             RuntimeTcpSocketInner::FakeTcp(socket) => socket.peer_addr(),
         }
     }
 
     fn transport_label(&self) -> Option<&str> {
         match &self.inner {
-            #[cfg(feature = "faketcp")]
+            #[cfg(all(feature = "faketcp", target_os = "linux"))]
             RuntimeTcpSocketInner::FakeTcp(socket) => socket.transport_label(),
             RuntimeTcpSocketInner::Tcp(_) => None,
             #[cfg(unix)]
