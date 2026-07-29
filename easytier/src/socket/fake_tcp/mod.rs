@@ -7,7 +7,7 @@ use network_interface::NetworkInterfaceConfig;
 use pnet::util::MacAddr;
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll},
@@ -676,23 +676,20 @@ impl easytier_core::socket::SocketListener for FakeTcpSocketListener {
     }
 }
 
-fn get_local_ip_for_destination(destination: IpAddr) -> Option<IpAddr> {
-    // 使用一个不可路由的、私有的、或回环地址创建一个临时的 socket，让内核自动选择源接口。
-    // 对于 IPv4，使用 0.0.0.0; 对于 IPv6，使用 ::
-    let bind_addr = if destination.is_ipv4() {
-        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))
+fn get_local_ip_for_destination(destination: IpAddr, socket_mark: Option<u32>) -> Option<IpAddr> {
+    let (domain, bind_addr) = if destination.is_ipv4() {
+        (socket2::Domain::IPV4, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
     } else {
-        IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0))
+        (socket2::Domain::IPV6, SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0))
     };
-
-    // 绑定到一个临时端口 (0)
-    let socket = UdpSocket::bind((bind_addr, 0)).ok()?;
-
-    // 尝试连接到目标地址。这不会真正发送数据包，只是让内核确定路由。
-    socket.connect((destination, 80)).ok()?; // 使用一个常见的端口，例如 80
-
-    // 获取 socket 的本地地址信息
-    socket.local_addr().map(|addr| addr.ip()).ok()
+    let socket =
+        socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)).ok()?;
+    crate::tunnel::common::apply_socket_mark(&socket, socket_mark).ok()?;
+    socket.bind(&socket2::SockAddr::from(bind_addr)).ok()?;
+    socket
+        .connect(&socket2::SockAddr::from(SocketAddr::new(destination, 80)))
+        .ok()?;
+    socket.local_addr().ok()?.as_socket().map(|a| a.ip())
 }
 
 async fn connect_socket_with_cache(
@@ -702,7 +699,7 @@ async fn connect_socket_with_cache(
     net_ns: NetNS,
 ) -> Result<FakeTcpSocket, TunnelError> {
     let (local_addr, interface_name, mac, os_socket) = net_ns.run(|| {
-        let local_ip = get_local_ip_for_destination(remote_addr.ip())
+        let local_ip = get_local_ip_for_destination(remote_addr.ip(), socket_mark)
             .ok_or(TunnelError::InternalError("Failed to get local ip".into()))?;
 
         let os_socket = if remote_addr.is_ipv4() {

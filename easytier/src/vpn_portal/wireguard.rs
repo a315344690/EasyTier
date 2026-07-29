@@ -48,6 +48,9 @@ impl WireGuardPortalHost {
         listener_url.set_port(Some(listener_addr.port())).unwrap();
         listener_url.set_ip_host(listener_addr.ip()).unwrap();
         let mut listener = WgTunnelListener::new(listener_url, self.wg_config.clone());
+        listener.set_socket_mark(easytier_core::instance::default_route_socket_mark(
+            self.global_ctx.config.get_flags().default_route,
+        ));
         {
             let _guard = self.global_ctx.net_ns.guard();
             listener

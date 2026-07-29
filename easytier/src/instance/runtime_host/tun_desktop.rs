@@ -232,6 +232,11 @@ impl NativeTunRuntime {
                     continue;
                 }
 
+                // Stop the previous NIC state (and its DefaultRouteManager guard)
+                // BEFORE activating the new default route, so the old guard's Drop
+                // does not wipe the freshly installed rules.
+                nic_state.stop().await;
+
                 let ifname = nic.ifname().await.unwrap_or_default();
                 let default_route_guard = activate_default_route(
                     &global_ctx, &ifname, &packet_plane, &cancel,

@@ -6,6 +6,7 @@ use crate::common::{
 };
 
 const VPN_TABLE: u32 = 6846;
+const RULE_PRIO_FROM_TUN: u32 = 6838;
 const RULE_PRIO_FROM_PHY: u32 = 6839;
 const RULE_PRIO_SUPPRESS: u32 = 6840;
 const RULE_PRIO_VPN: u32 = 6841;
@@ -42,7 +43,7 @@ impl DefaultRouteManager {
     }
 
     pub async fn cleanup_stale(&self) -> Result<(), Error> {
-        for prio in RULE_PRIO_FROM_PHY..=RULE_PRIO_BYPASS_DEFAULT {
+        for prio in RULE_PRIO_FROM_TUN..=RULE_PRIO_BYPASS_DEFAULT {
             loop {
                 if run_shell_cmd(&format!("ip rule del prio {prio}"))
                     .await
@@ -68,6 +69,12 @@ impl DefaultRouteManager {
 
         run_shell_cmd("sysctl -w net.ipv4.ip_forward=1").await?;
         run_shell_cmd("sysctl -w net.ipv4.conf.all.src_valid_mark=1").await?;
+
+        run_shell_cmd(&format!(
+            "ip rule add iif {} table main prio {RULE_PRIO_FROM_TUN}",
+            self.tun_ifname
+        ))
+        .await?;
 
         for cidr in THROW_CIDRS {
             let _ =
@@ -134,7 +141,7 @@ impl DefaultRouteManager {
             return Ok(());
         };
 
-        for prio in RULE_PRIO_FROM_PHY..=RULE_PRIO_BYPASS_DEFAULT {
+        for prio in RULE_PRIO_FROM_TUN..=RULE_PRIO_BYPASS_DEFAULT {
             loop {
                 if run_shell_cmd(&format!("ip rule del prio {prio}"))
                     .await
@@ -162,17 +169,6 @@ impl DefaultRouteManager {
         Ok(())
     }
 
-    fn generate_cleanup_script(&self) -> String {
-        let mut script = String::new();
-        for prio in RULE_PRIO_FROM_PHY..=RULE_PRIO_BYPASS_DEFAULT {
-            script.push_str(&format!(
-                "while ip rule del prio {prio} 2>/dev/null; do :; done;"
-            ));
-        }
-        script.push_str(&format!("ip route flush table {VPN_TABLE} 2>/dev/null"));
-        script
-    }
-
     pub fn is_active(&self) -> bool {
         self.state.is_some()
     }
@@ -180,8 +176,22 @@ impl DefaultRouteManager {
 
 impl Drop for DefaultRouteManager {
     fn drop(&mut self) {
-        if self.state.is_some() {
-            let script = self.generate_cleanup_script();
+        if let Some(state) = self.state.take() {
+            let mut script = String::new();
+            for prio in RULE_PRIO_FROM_TUN..=RULE_PRIO_BYPASS_DEFAULT {
+                script.push_str(&format!(
+                    "while ip rule del prio {prio} 2>/dev/null; do :; done;"
+                ));
+            }
+            script.push_str(&format!("ip route flush table {VPN_TABLE} 2>/dev/null;"));
+            script.push_str(&format!(
+                "sysctl -w net.ipv4.ip_forward={} 2>/dev/null;",
+                state.original_ip_forward
+            ));
+            script.push_str(&format!(
+                "sysctl -w net.ipv4.conf.all.src_valid_mark={} 2>/dev/null;",
+                state.original_src_valid_mark
+            ));
             let _ = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&script)
