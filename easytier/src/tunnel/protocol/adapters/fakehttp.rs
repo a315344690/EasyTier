@@ -17,32 +17,29 @@ use crate::{
     common::global_ctx::ArcGlobalCtx,
     socket::tcp::RuntimeTcpSocket,
     tunnel::fakehttp::{
-        CONNECT_TIMEOUT, FakeHttpPayload, HANDSHAKE_TIMEOUT, parse_payloads, upgrade_accepted,
-        upgrade_connected,
+        CONNECT_TIMEOUT, FakeHttpPayload, HANDSHAKE_TIMEOUT, upgrade_accepted, upgrade_connected,
     },
 };
 
 use super::{ClientAdapter, ServerAdapter};
 
-struct FakeHttpAdapter {
-    payloads: Vec<FakeHttpPayload>,
-    counter: AtomicUsize,
-}
+struct FakeHttpAdapter;
 
 impl FakeHttpAdapter {
-    fn new(global_ctx: &ArcGlobalCtx) -> Self {
-        let hosts = global_ctx.config.get_flags().fakehttp_hosts;
-        Self {
-            payloads: parse_payloads(hosts),
-            counter: AtomicUsize::new(0),
-        }
+    fn new(_global_ctx: &ArcGlobalCtx) -> Self {
+        Self
     }
 
     fn is_scheme_supported(&self, scheme: &str) -> bool {
-        match scheme {
-            "fakehttp" => true,
-            "faketcp" => !self.payloads.is_empty(),
-            _ => false,
+        scheme == "fakehttp"
+    }
+
+    fn payload_for_url(url: &url::Url) -> FakeHttpPayload {
+        let host = url.host_str().unwrap_or("").to_string();
+        if url.port().unwrap_or(80) == 443 {
+            FakeHttpPayload::Https { host }
+        } else {
+            FakeHttpPayload::Http { host }
         }
     }
 }
@@ -54,6 +51,7 @@ pub(super) fn client_adapter(global_ctx: &ArcGlobalCtx) -> ClientAdapter {
 pub(super) fn server_adapter(global_ctx: &ArcGlobalCtx) -> ServerAdapter {
     Arc::new(FakeHttpAdapter::new(global_ctx))
 }
+
 
 #[async_trait]
 impl ClientProtocolUpgrader<RuntimeTcpSocket> for FakeHttpAdapter {
@@ -73,9 +71,11 @@ impl ClientProtocolUpgrader<RuntimeTcpSocket> for FakeHttpAdapter {
         let ConnectedTransport::Tcp(socket) = connected else {
             anyhow::bail!("FakeHTTP protocol requires a TCP transport");
         };
+        let payload = Self::payload_for_url(&requested_url);
+        let counter = AtomicUsize::new(0);
         Ok(tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
-            upgrade_connected(socket, requested_url, &self.payloads, &self.counter),
+            upgrade_connected(socket, requested_url, std::slice::from_ref(&payload), &counter),
         )
         .await
         .map_err(|_| anyhow::anyhow!("fakehttp client handshake timed out"))??)

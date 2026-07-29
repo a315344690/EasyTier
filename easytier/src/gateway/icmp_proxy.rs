@@ -23,6 +23,13 @@ impl RuntimeIcmpProxyHost {
             socket2::Type::RAW,
             Some(socket2::Protocol::ICMPV4),
         )?;
+        // Stamp SO_MARK (before bind, so the kernel applies it during source-address
+        // selection) so proxied ICMP echoes bypass the default-route `ip rule not
+        // fwmark <MARK>` instead of self-routing into the TUN. The context already
+        // carries the default_route-derived mark; without this the raw socket would
+        // drop it and public-destination ICMP would black-hole.
+        crate::tunnel::common::apply_socket_mark(&socket, context.socket_mark)
+            .map_err(std::io::Error::other)?;
         socket.bind(&socket2::SockAddr::from(SocketAddrV4::new(
             Ipv4Addr::UNSPECIFIED,
             0,

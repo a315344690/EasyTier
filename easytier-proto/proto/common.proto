@@ -85,7 +85,8 @@ message FlagsInConfig {
   // non-Linux platforms.
   optional uint32 socket_mark = 43;
 
-  repeated string fakehttp_hosts = 44;
+  reserved 44;
+  reserved "fakehttp_hosts";
 
   // Linux-only: capture all traffic through VPN tunnel by setting up policy
   // routing (ip rules + custom routing table). Requires socket_mark to be set

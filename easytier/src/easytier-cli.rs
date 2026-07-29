@@ -4,10 +4,11 @@ use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
+    io::Write,
     pin::Pin,
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
     vec,
 };
 
@@ -575,6 +576,169 @@ mod tests {
 struct PeerListData {
     node_info: NodeInfo,
     peer_routes: Vec<PeerRoutePair>,
+}
+
+/// A snapshot of a peer's cumulative byte counters at a point in time, used to
+/// compute the instantaneous rate between two watch frames.
+struct RateSample {
+    rx: u64,
+    tx: u64,
+    at: Instant,
+}
+
+/// Cross-frame rate cache keyed by (instance_key, peer_id). The instance key is
+/// the fan-out instance's stable uuid, or "" for the single-instance case.
+type RateCache = HashMap<(String, u32), RateSample>;
+
+fn rate_instance_key(target: &Option<InstanceTarget>) -> String {
+    target
+        .as_ref()
+        .map(|t| t.instance_id.clone())
+        .unwrap_or_default()
+}
+
+/// Format a down/up rate pair. down = rx (received), up = tx (sent).
+fn format_rate_pair(down_bps: f64, up_bps: f64) -> String {
+    format!(
+        "{}/s / {}/s",
+        format_size(down_bps.round() as u64, humansize::DECIMAL),
+        format_size(up_bps.round() as u64, humansize::DECIMAL),
+    )
+}
+
+#[derive(tabled::Tabled, serde::Serialize)]
+struct PeerTableItem {
+    #[tabled(rename = "ipv4")]
+    cidr: String,
+    #[tabled(skip)]
+    ipv4: String,
+    hostname: String,
+    cost: String,
+    #[tabled(rename = "lat(ms)")]
+    lat_ms: String,
+    #[tabled(rename = "loss")]
+    loss_rate: String,
+    #[tabled(rename = "rate")]
+    rate: String,
+    #[tabled(rename = "rx")]
+    rx_bytes: String,
+    #[tabled(rename = "tx")]
+    tx_bytes: String,
+    #[tabled(rename = "tunnel")]
+    tunnel_proto: String,
+    #[tabled(rename = "active")]
+    active_proto: String,
+    #[tabled(rename = "NAT")]
+    nat_type: String,
+    #[tabled(skip)]
+    id: String,
+    version: String,
+}
+
+impl From<PeerRoutePair> for PeerTableItem {
+    fn from(p: PeerRoutePair) -> Self {
+        let route = p.route.clone().unwrap_or_default();
+        let lat_ms = if route.cost == 1 {
+            p.get_latency_ms().unwrap_or(0.0)
+        } else {
+            route.path_latency_latency_first() as f64
+        };
+        PeerTableItem {
+            cidr: route.ipv4_addr.map(|ip| ip.to_string()).unwrap_or_default(),
+            ipv4: route
+                .ipv4_addr
+                .map(|ip: easytier::proto::common::Ipv4Inet| ip.address.unwrap_or_default())
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            hostname: route.hostname.clone(),
+            cost: cost_to_str(route.cost),
+            lat_ms: format!("{:.2}", lat_ms),
+            loss_rate: format!("{:.1}%", p.get_loss_rate().unwrap_or(0.0) * 100.0),
+            rate: "-".to_string(),
+            rx_bytes: format_size(p.get_rx_bytes().unwrap_or(0), humansize::DECIMAL),
+            tx_bytes: format_size(p.get_tx_bytes().unwrap_or(0), humansize::DECIMAL),
+            tunnel_proto: p.get_conn_protos().unwrap_or_default().join(","),
+            active_proto: p.get_default_conn_proto().unwrap_or_default(),
+            nat_type: p.get_udp_nat_type(),
+            id: route.peer_id.to_string(),
+            version: if route.version.is_empty() {
+                "unknown".to_string()
+            } else {
+                route.version
+            },
+        }
+    }
+}
+
+impl From<NodeInfo> for PeerTableItem {
+    fn from(p: NodeInfo) -> Self {
+        PeerTableItem {
+            cidr: p.ipv4_addr.clone(),
+            ipv4: Ipv4Inet::from_str(&p.ipv4_addr)
+                .map(|ip| ip.address().to_string())
+                .unwrap_or_default(),
+            hostname: p.hostname.clone(),
+            cost: "Local".to_string(),
+            lat_ms: "-".to_string(),
+            loss_rate: "-".to_string(),
+            rate: "-".to_string(),
+            rx_bytes: "-".to_string(),
+            tx_bytes: "-".to_string(),
+            tunnel_proto: "-".to_string(),
+            active_proto: "-".to_string(),
+            nat_type: if let Some(info) = p.stun_info {
+                info.udp_nat_type().as_str_name().to_string()
+            } else {
+                "Unknown".to_string()
+            },
+            id: p.peer_id.to_string(),
+            version: p.version,
+        }
+    }
+}
+
+/// Build the sorted peer rows for one instance: local node first, then public
+/// servers, then by IPv4 / hostname. The `rate` column is left as a placeholder
+/// (`-`) here and backfilled by the watch renderer.
+fn build_peer_items(data: &PeerListData) -> Vec<PeerTableItem> {
+    let mut items = Vec::with_capacity(data.peer_routes.len() + 1);
+    items.push(PeerTableItem::from(data.node_info.clone()));
+    items.extend(data.peer_routes.iter().cloned().map(Into::into));
+    items.sort_by(|a, b| {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let a_is_local = a.cost == "Local";
+        let b_is_local = b.cost == "Local";
+        if a_is_local != b_is_local {
+            return if a_is_local {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+
+        let a_is_public = a
+            .hostname
+            .starts_with(easytier_core::peers::foreign_network::PUBLIC_SERVER_HOSTNAME_PREFIX);
+        let b_is_public = b
+            .hostname
+            .starts_with(easytier_core::peers::foreign_network::PUBLIC_SERVER_HOSTNAME_PREFIX);
+        if a_is_public != b_is_public {
+            return if a_is_public {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+
+        let a_ip = IpAddr::from_str(&a.ipv4).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let b_ip = IpAddr::from_str(&b.ipv4).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        match a_ip.cmp(&b_ip) {
+            std::cmp::Ordering::Equal => a.hostname.cmp(&b.hostname),
+            other => other,
+        }
+    });
+    items
 }
 
 #[derive(serde::Serialize)]
@@ -1302,134 +1466,68 @@ impl<'a> CommandHandler<'a> {
     }
 
     async fn handle_peer_list(&self) -> Result<(), Error> {
-        #[derive(tabled::Tabled, serde::Serialize)]
-        struct PeerTableItem {
-            #[tabled(rename = "ipv4")]
-            cidr: String,
-            #[tabled(skip)]
-            ipv4: String,
-            hostname: String,
-            cost: String,
-            #[tabled(rename = "lat(ms)")]
-            lat_ms: String,
-            #[tabled(rename = "loss")]
-            loss_rate: String,
-            #[tabled(rename = "rx")]
-            rx_bytes: String,
-            #[tabled(rename = "tx")]
-            tx_bytes: String,
-            #[tabled(rename = "tunnel")]
-            tunnel_proto: String,
-            #[tabled(rename = "active")]
-            active_proto: String,
-            #[tabled(rename = "NAT")]
-            nat_type: String,
-            #[tabled(skip)]
-            id: String,
-            version: String,
+        // JSON / verbose stay single-shot so scripts and pipes are not broken by
+        // the interactive watch loop (repeated pretty-JSON + ANSI escapes).
+        if self.verbose || *self.output_format == OutputFormat::Json {
+            return self.render_peer_list_once().await;
         }
 
-        impl From<PeerRoutePair> for PeerTableItem {
-            fn from(p: PeerRoutePair) -> Self {
-                let route = p.route.clone().unwrap_or_default();
-                let lat_ms = if route.cost == 1 {
-                    p.get_latency_ms().unwrap_or(0.0)
-                } else {
-                    route.path_latency_latency_first() as f64
-                };
-                PeerTableItem {
-                    cidr: route.ipv4_addr.map(|ip| ip.to_string()).unwrap_or_default(),
-                    ipv4: route
-                        .ipv4_addr
-                        .map(|ip: easytier::proto::common::Ipv4Inet| ip.address.unwrap_or_default())
-                        .map(|ip| ip.to_string())
-                        .unwrap_or_default(),
-                    hostname: route.hostname.clone(),
-                    cost: cost_to_str(route.cost),
-                    lat_ms: format!("{:.2}", lat_ms),
-                    loss_rate: format!("{:.1}%", p.get_loss_rate().unwrap_or(0.0) * 100.0),
-                    rx_bytes: format_size(p.get_rx_bytes().unwrap_or(0), humansize::DECIMAL),
-                    tx_bytes: format_size(p.get_tx_bytes().unwrap_or(0), humansize::DECIMAL),
-                    tunnel_proto: p.get_conn_protos().unwrap_or_default().join(","),
-                    active_proto: p.get_default_conn_proto().unwrap_or_default(),
-                    nat_type: p.get_udp_nat_type(),
-                    id: route.peer_id.to_string(),
-                    version: if route.version.is_empty() {
-                        "unknown".to_string()
-                    } else {
-                        route.version
-                    },
+        // Table mode: refresh in place every second until Ctrl+C.
+        let mut rate_cache = RateCache::new();
+        // The first `tick()` fires immediately, so the first frame renders at once.
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        // If a frame's fetch+render overruns the period, don't burst-fire the
+        // backlog of missed ticks; just resume on the next whole interval.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Register the Ctrl+C listener once, up front, and keep it alive across
+        // every iteration. Recreating it each loop would drop the listener in the
+        // gap between iterations and could lose a SIGINT; a single pinned future
+        // also lets us race it against the fetch so a hung RPC stays interruptible.
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+
+        loop {
+            // Race Ctrl+C against "wait for the next tick, then fetch". This keeps
+            // Ctrl+C responsive both while idle between frames and during a slow or
+            // hung RPC call (which can otherwise block up to the 60s rx timeout).
+            let fetched = tokio::select! {
+                _ = &mut ctrl_c => None,
+                r = async {
+                    ticker.tick().await;
+                    self.collect_instance_results(|handler| {
+                        Box::pin(handler.fetch_peer_list_data())
+                    })
+                    .await
+                } => Some(r),
+            };
+
+            let Some(fetched) = fetched else {
+                // Leave the shell prompt on a fresh line below the table.
+                println!();
+                break;
+            };
+
+            match fetched {
+                Ok(results) => {
+                    // Clear screen + scrollback, move cursor home, then redraw.
+                    print!("\x1b[2J\x1b[3J\x1b[H");
+                    self.render_peer_frame(&results, &mut rate_cache)?;
+                }
+                Err(e) => {
+                    // core restart / transient RPC error: keep looping, the scoped
+                    // client reconnects on the next tick.
+                    print!("\x1b[2J\x1b[3J\x1b[H");
+                    println!("failed to fetch peers: {e:#}; retrying...");
                 }
             }
+            std::io::stdout().flush().ok();
         }
+        Ok(())
+    }
 
-        impl From<NodeInfo> for PeerTableItem {
-            fn from(p: NodeInfo) -> Self {
-                PeerTableItem {
-                    cidr: p.ipv4_addr.clone(),
-                    ipv4: Ipv4Inet::from_str(&p.ipv4_addr)
-                        .map(|ip| ip.address().to_string())
-                        .unwrap_or_default(),
-                    hostname: p.hostname.clone(),
-                    cost: "Local".to_string(),
-                    lat_ms: "-".to_string(),
-                    loss_rate: "-".to_string(),
-                    rx_bytes: "-".to_string(),
-                    tx_bytes: "-".to_string(),
-                    tunnel_proto: "-".to_string(),
-                    active_proto: "-".to_string(),
-                    nat_type: if let Some(info) = p.stun_info {
-                        info.udp_nat_type().as_str_name().to_string()
-                    } else {
-                        "Unknown".to_string()
-                    },
-                    id: p.peer_id.to_string(),
-                    version: p.version,
-                }
-            }
-        }
-
-        let build_items = |data: &PeerListData| {
-            let mut items = Vec::with_capacity(data.peer_routes.len() + 1);
-            items.push(PeerTableItem::from(data.node_info.clone()));
-            items.extend(data.peer_routes.iter().cloned().map(Into::into));
-            items.sort_by(|a, b| {
-                use std::net::{IpAddr, Ipv4Addr};
-
-                let a_is_local = a.cost == "Local";
-                let b_is_local = b.cost == "Local";
-                if a_is_local != b_is_local {
-                    return if a_is_local {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Greater
-                    };
-                }
-
-                let a_is_public = a.hostname.starts_with(
-                    easytier_core::peers::foreign_network::PUBLIC_SERVER_HOSTNAME_PREFIX,
-                );
-                let b_is_public = b.hostname.starts_with(
-                    easytier_core::peers::foreign_network::PUBLIC_SERVER_HOSTNAME_PREFIX,
-                );
-                if a_is_public != b_is_public {
-                    return if a_is_public {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Greater
-                    };
-                }
-
-                let a_ip = IpAddr::from_str(&a.ipv4).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-                let b_ip = IpAddr::from_str(&b.ipv4).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-                match a_ip.cmp(&b_ip) {
-                    std::cmp::Ordering::Equal => a.hostname.cmp(&b.hostname),
-                    other => other,
-                }
-            });
-            items
-        };
-
+    /// Single-shot peer list output for JSON / verbose modes (no rate, no watch).
+    async fn render_peer_list_once(&self) -> Result<(), Error> {
         let results = self
             .collect_instance_results(|handler| Box::pin(handler.fetch_peer_list_data()))
             .await?;
@@ -1446,21 +1544,102 @@ impl<'a> CommandHandler<'a> {
             return self.print_json_results(
                 results
                     .into_iter()
-                    .map(|result| result.map(|data| build_items(&data)))
+                    .map(|result| result.map(|data| build_peer_items(&data)))
                     .collect(),
             );
         }
 
         self.print_results(&results, |data| {
-            let items = build_items(data);
+            let items = build_peer_items(data);
             print_output(
                 &items,
                 self.output_format,
                 &["tunnel", "active", "version"],
-                &["version", "tunnel", "active", "nat", "tx", "rx", "loss", "lat(ms)"],
+                &[
+                    "version", "tunnel", "active", "nat", "tx", "rx", "loss", "lat(ms)", "rate",
+                ],
                 self.no_trunc,
             )
         })
+    }
+
+    /// Render one watch frame: compute per-peer rates from the previous snapshot,
+    /// backfill the `rate` column, print each instance's table, then update the
+    /// rate cache with this frame's cumulative byte counters.
+    fn render_peer_frame(
+        &self,
+        results: &[InstanceResult<PeerListData>],
+        rate_cache: &mut RateCache,
+    ) -> Result<(), Error> {
+        let now = Instant::now();
+        let multi = results.len() > 1;
+
+        for (idx, result) in results.iter().enumerate() {
+            if multi {
+                if idx > 0 {
+                    println!();
+                }
+                if let Some(target) = result.target.as_ref() {
+                    self.print_target_header(target);
+                }
+            }
+
+            let key = rate_instance_key(&result.target);
+            let data = &result.value;
+
+            // Compute this frame's rates against the cached previous snapshot, and
+            // collect fresh samples to store after rendering.
+            let mut rate_map: HashMap<u32, String> = HashMap::new();
+            let mut fresh: Vec<(u32, u64, u64)> = Vec::with_capacity(data.peer_routes.len());
+            for pair in &data.peer_routes {
+                let peer_id = pair.route.clone().unwrap_or_default().peer_id;
+                let rx = pair.get_rx_bytes().unwrap_or(0);
+                let tx = pair.get_tx_bytes().unwrap_or(0);
+                if let Some(prev) = rate_cache.get(&(key.clone(), peer_id)) {
+                    let dt = now.duration_since(prev.at).as_secs_f64();
+                    if dt > 0.0 {
+                        // saturating_sub guards against counter resets on reconnect.
+                        let drx = rx.saturating_sub(prev.rx) as f64 / dt;
+                        let dtx = tx.saturating_sub(prev.tx) as f64 / dt;
+                        rate_map.insert(peer_id, format_rate_pair(drx, dtx));
+                    }
+                }
+                fresh.push((peer_id, rx, tx));
+            }
+
+            let mut items = build_peer_items(data);
+            for item in items.iter_mut() {
+                if item.cost == "Local" {
+                    continue;
+                }
+                if let Ok(pid) = item.id.parse::<u32>() {
+                    if let Some(rate) = rate_map.get(&pid) {
+                        item.rate = rate.clone();
+                    }
+                }
+            }
+
+            print_output(
+                &items,
+                self.output_format,
+                &["tunnel", "active", "version"],
+                &[
+                    "version", "tunnel", "active", "nat", "tx", "rx", "loss", "lat(ms)", "rate",
+                ],
+                self.no_trunc,
+            )?;
+
+            // Drop cache entries for peers of this instance that vanished this
+            // frame, so the cache can't grow unbounded over a long session.
+            let seen: std::collections::HashSet<u32> =
+                fresh.iter().map(|(peer_id, _, _)| *peer_id).collect();
+            rate_cache.retain(|(k, peer_id), _| *k != key || seen.contains(peer_id));
+
+            for (peer_id, rx, tx) in fresh {
+                rate_cache.insert((key.clone(), peer_id), RateSample { rx, tx, at: now });
+            }
+        }
+        Ok(())
     }
 
     async fn handle_peer_ipv6(&self) -> Result<(), Error> {

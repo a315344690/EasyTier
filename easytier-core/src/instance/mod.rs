@@ -113,6 +113,7 @@ use crate::gateway::{
 #[cfg(feature = "public-ipv6-provider")]
 use crate::peers::public_ipv6::provider::PublicIpv6ProviderRuntime;
 pub use config::CoreInstanceHostConfig;
+pub use config::{DEFAULT_ROUTE_SOCKET_MARK, default_route_socket_mark};
 use management_state::ManagementState;
 pub use packet_io::PacketEgressHost;
 use packet_io::PacketSinkEgress;

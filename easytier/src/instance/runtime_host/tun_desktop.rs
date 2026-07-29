@@ -52,7 +52,10 @@ async fn activate_default_route(
 
     #[cfg(target_os = "linux")]
     {
-        let socket_mark = global_ctx.config.get_flags().socket_mark.unwrap_or(0x6846);
+        // Fixed internal mark; not user-configurable. Must match the mark stamped
+        // on our own sockets (see `default_route_socket_mark`) or self-traffic
+        // self-routes into the TUN.
+        let socket_mark = easytier_core::instance::DEFAULT_ROUTE_SOCKET_MARK;
         let mut mgr = DefaultRouteManager::new(ifname.to_owned(), socket_mark);
         match mgr.activate().await {
             Ok(()) => Some(Box::new(mgr)),

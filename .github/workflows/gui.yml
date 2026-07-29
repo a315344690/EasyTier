@@ -50,10 +50,6 @@ jobs:
             GUI_TARGET: aarch64-unknown-linux-gnu
             ARTIFACT_NAME: linux-aarch64
 
-          - TARGET: x86_64-apple-darwin
-            OS: macos-latest
-            GUI_TARGET: x86_64-apple-darwin
-            ARTIFACT_NAME: macos-x86_64
           - TARGET: aarch64-apple-darwin
             OS: macos-latest
             GUI_TARGET: aarch64-apple-darwin
@@ -63,14 +59,6 @@ jobs:
             OS: windows-latest
             GUI_TARGET: x86_64-pc-windows-msvc
             ARTIFACT_NAME: windows-x86_64
-          - TARGET: i686-pc-windows-msvc
-            OS: windows-latest
-            GUI_TARGET: i686-pc-windows-msvc
-            ARTIFACT_NAME: windows-i686
-          - TARGET: aarch64-pc-windows-msvc
-            OS: windows-11-arm
-            GUI_TARGET: aarch64-pc-windows-msvc
-            ARTIFACT_NAME: windows-arm64
 
     runs-on: ${{ matrix.OS }}
     env:

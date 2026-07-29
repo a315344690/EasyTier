@@ -41,13 +41,10 @@ fn runtime_server_protocol_adapter(global_ctx: &ArcGlobalCtx) -> RuntimeServerPr
 pub(crate) fn runtime_client_protocol_upgrader(
     global_ctx: ArcGlobalCtx,
 ) -> Arc<dyn ClientProtocolUpgrader<RuntimeTcpSocket>> {
-    let faketcp_disguised =
-        cfg!(feature = "fakehttp") && !global_ctx.config.get_flags().fakehttp_hosts.is_empty();
     Arc::new(CoreClientProtocolUpgrader::with_external(
         CoreClientProtocolConfig {
             unix: cfg!(unix),
             faketcp: cfg!(all(feature = "faketcp", target_os = "linux")),
-            faketcp_disguised,
         },
         Arc::new(runtime_client_protocol_adapter(&global_ctx)),
     ))
@@ -56,13 +53,10 @@ pub(crate) fn runtime_client_protocol_upgrader(
 pub(crate) fn runtime_server_protocol_upgrader(
     global_ctx: ArcGlobalCtx,
 ) -> Arc<dyn ServerProtocolUpgrader<RuntimeTcpSocket>> {
-    let faketcp_disguised =
-        cfg!(feature = "fakehttp") && !global_ctx.config.get_flags().fakehttp_hosts.is_empty();
     Arc::new(CoreServerProtocolUpgrader::with_external(
         CoreServerProtocolConfig {
             unix: cfg!(unix),
             faketcp: cfg!(all(feature = "faketcp", target_os = "linux")),
-            faketcp_disguised,
         },
         Arc::new(runtime_server_protocol_adapter(&global_ctx)),
     ))
@@ -514,12 +508,6 @@ mod tests {
         let url: url::Url = format!("fakehttp://{addr}").parse().unwrap();
 
         let global_ctx = get_mock_global_ctx();
-        {
-            let mut flags = global_ctx.config.get_flags();
-            flags.fakehttp_hosts = vec!["https://www.example.com".to_string()];
-            global_ctx.config.set_flags(flags);
-        }
-
         let server = runtime_server_protocol_upgrader(global_ctx.clone());
         let client = runtime_client_protocol_upgrader(global_ctx);
 

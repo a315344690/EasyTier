@@ -113,7 +113,9 @@ impl PublicIpv6Host for GlobalCtx {
         prefix: cidr::Ipv6Cidr,
     ) -> HashSet<Ipv6Addr> {
         let context = SocketContext::default()
-            .with_socket_mark(self.config.get_flags().socket_mark)
+            .with_socket_mark(easytier_core::instance::default_route_socket_mark(
+                self.config.get_flags().default_route,
+            ))
             .with_netns(self.net_ns.name().map(NetNamespace::new));
         let ip_list = crate::host_runtime::native_host_runtime()
             .collect_ip_addrs(&context)

@@ -888,14 +888,15 @@ pub(crate) async fn upgrade_accepted<S: VirtualTcpSocket>(
         ));
     };
 
+    let scheme = local_url.scheme().to_owned();
     let info = TunnelInfo {
-        tunnel_type: "fakehttp".to_owned(),
+        tunnel_type: scheme.clone(),
         local_addr: Some(local_url.into()),
         remote_addr: Some(
-            super::build_url_from_socket_addr(&peer_addr.to_string(), "fakehttp").into(),
+            super::build_url_from_socket_addr(&peer_addr.to_string(), &scheme).into(),
         ),
         resolved_remote_addr: Some(
-            super::build_url_from_socket_addr(&peer_addr.to_string(), "fakehttp").into(),
+            super::build_url_from_socket_addr(&peer_addr.to_string(), &scheme).into(),
         ),
     };
 
@@ -934,14 +935,15 @@ pub(crate) async fn upgrade_connected<S: VirtualTcpSocket>(
 
     let hs_result = perform_client_handshake(&mut socket, payload).await?;
 
+    let scheme = requested_url.scheme().to_owned();
     let info = TunnelInfo {
-        tunnel_type: "fakehttp".to_owned(),
+        tunnel_type: scheme.clone(),
         local_addr: Some(
-            super::build_url_from_socket_addr(&local_addr.to_string(), "fakehttp").into(),
+            super::build_url_from_socket_addr(&local_addr.to_string(), &scheme).into(),
         ),
         remote_addr: Some(requested_url.into()),
         resolved_remote_addr: Some(
-            super::build_url_from_socket_addr(&peer_addr.to_string(), "fakehttp").into(),
+            super::build_url_from_socket_addr(&peer_addr.to_string(), &scheme).into(),
         ),
     };
 

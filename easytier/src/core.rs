@@ -532,17 +532,11 @@ struct NetworkOptions {
     )]
     bind_device: Option<bool>,
 
-    // SO_MARK (fwmark) is a Linux-family kernel feature. Gate the flag out
-    // entirely on other targets so users on Windows/macOS/BSD don't see a
-    // `--socket-mark` they can't act on.
-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-    #[arg(
-        long,
-        env = "ET_SOCKET_MARK",
-        help = t!("core_clap.socket_mark").to_string()
-    )]
-    socket_mark: Option<u32>,
-
+    // Note: SO_MARK (fwmark) is no longer user-configurable. It is a fixed
+    // internal mark driven solely by `default_route` -- see
+    // `easytier_core::instance::default_route_socket_mark`. The `ip rule` side
+    // and the socket side must agree, so exposing it as a knob only invited the
+    // self-routing black-hole when the two diverged.
     #[cfg(any(target_os = "linux", all(target_os = "macos", not(feature = "macos-ne"))))]
     #[arg(
         long,
@@ -550,14 +544,6 @@ struct NetworkOptions {
         help = "Route all traffic through VPN tunnel (Linux/macOS)"
     )]
     default_route: Option<bool>,
-
-    #[arg(
-        long,
-        env = "ET_FAKEHTTP_HOSTS",
-        help = t!("core_clap.fakehttp_hosts").to_string(),
-        value_delimiter = ','
-    )]
-    fakehttp_hosts: Option<Vec<String>>,
 
     #[arg(
         long,
@@ -1155,17 +1141,12 @@ impl NetworkOptions {
             .into();
         }
         f.bind_device = self.bind_device.unwrap_or(f.bind_device);
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        {
-            f.socket_mark = self.socket_mark.or(f.socket_mark);
-        }
+        // socket_mark is no longer user-configurable; it is derived from
+        // `default_route` at socket-construction time (see
+        // `easytier_core::instance::default_route_socket_mark`).
         #[cfg(any(target_os = "linux", all(target_os = "macos", not(feature = "macos-ne"))))]
         {
             f.default_route = self.default_route.unwrap_or(f.default_route);
-        }
-        #[cfg(target_os = "linux")]
-        if f.default_route && f.socket_mark.is_none() {
-            f.socket_mark = Some(0x6846);
         }
         f.enable_kcp_proxy = self.enable_kcp_proxy.unwrap_or(f.enable_kcp_proxy);
         f.disable_kcp_input = self.disable_kcp_input.unwrap_or(f.disable_kcp_input);
@@ -1198,9 +1179,6 @@ impl NetworkOptions {
         // Configure tld_dns_zone: use provided value if set
         if let Some(tld_dns_zone) = &self.tld_dns_zone {
             f.tld_dns_zone = tld_dns_zone.clone();
-        }
-        if let Some(fakehttp_hosts) = &self.fakehttp_hosts {
-            f.fakehttp_hosts = fakehttp_hosts.clone();
         }
         cfg.set_flags(f);
 

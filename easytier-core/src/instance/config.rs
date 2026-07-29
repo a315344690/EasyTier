@@ -28,6 +28,30 @@ use super::{CoreConnectivityConfig, CoreInstanceConfig};
 const OSPF_UPDATE_MY_FOREIGN_NETWORK_INTERVAL_SEC: u64 = 10;
 const MAX_DIRECT_CONNS_PER_PEER_IN_FOREIGN_NETWORK: usize = 3;
 
+/// Internal SO_MARK stamped on EasyTier's own underlay sockets (peer connectors
+/// and DNS) when `default_route` is on, so the accompanying `ip rule not fwmark
+/// <MARK> table <vpn>` lets them bypass the tunnel instead of self-routing into
+/// the TUN and black-holing (connection setup and DNS both fail otherwise).
+///
+/// It is NOT user-configurable: the `ip rule` side and the socket side must
+/// agree, so the mark is a fixed constant driven solely by `default_route`.
+/// `default_route` (and this mark) only take effect on Linux; the platform
+/// route manager (`easytier` crate) uses the same value on its `ip rule` side.
+pub const DEFAULT_ROUTE_SOCKET_MARK: u32 = 0x6846;
+
+/// The SO_MARK to stamp on our own underlay/DNS sockets. Returns the fixed
+/// internal mark when `default_route` is enabled (Linux only), otherwise `None`
+/// (leave SO_MARK untouched). Callers building a `SocketContext` must route
+/// through this so the socket side always agrees with the `ip rule` side.
+pub fn default_route_socket_mark(default_route: bool) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    if default_route {
+        return Some(DEFAULT_ROUTE_SOCKET_MARK);
+    }
+    let _ = default_route;
+    None
+}
+
 /// Host facts and policy that cannot be derived from the shared TOML model.
 ///
 /// This input deliberately contains no routes, ACL, peer, gateway, listener,
@@ -86,7 +110,7 @@ impl CoreInstanceConfig {
         let identity: crate::config::NetworkIdentity = config.get_network_identity().into();
         let network_name = identity.network_name.clone();
         let socket_context = SocketContext::default()
-            .with_socket_mark(flags.socket_mark)
+            .with_socket_mark(default_route_socket_mark(flags.default_route))
             .with_netns(config.get_netns().map(NetNamespace::new));
         let hostname = match config.get_hostname() {
             hostname if !hostname.is_empty() => hostname,
@@ -264,6 +288,22 @@ impl CoreInstanceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_route_drives_socket_mark() {
+        // default_route off: never mark (leave SO_MARK untouched).
+        assert_eq!(default_route_socket_mark(false), None);
+
+        // default_route on: fixed internal mark on Linux, still nothing elsewhere
+        // (macOS/Windows use a different bypass mechanism, not fwmark).
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            default_route_socket_mark(true),
+            Some(DEFAULT_ROUTE_SOCKET_MARK)
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(default_route_socket_mark(true), None);
+    }
 
     #[test]
     fn shared_toml_normalizes_instance_identity_and_connectivity() {

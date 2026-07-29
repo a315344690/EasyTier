@@ -89,7 +89,8 @@ fn build_foreign_peer_context(
     let parent_flags = parent_context_dyn.flags();
     flags.disable_relay_kcp = !parent_flags.enable_relay_foreign_network_kcp;
     flags.disable_relay_quic = !parent_flags.enable_relay_foreign_network_quic;
-    flags.socket_mark = parent_flags.socket_mark;
+    flags.socket_mark = crate::instance::default_route_socket_mark(parent_flags.default_route)
+        .or(parent_flags.socket_mark);
 
     let mut feature_flags = parent_context_dyn.feature_flags();
     feature_flags.is_public_server = true;
@@ -382,6 +383,9 @@ impl ForeignNetworkEntry {
             relay_data,
             foreign_context_default_flags,
         );
+        // Use the socket_mark already resolved in build_foreign_peer_context, which
+        // accounts for default_route (fixed internal mark on Linux) and any explicit
+        // user-configured socket_mark, matching the main instance's socket behaviour.
         let socket_mark = peer_context.flags().socket_mark;
         let stats_mgr = peer_context.stats_manager();
         let network_name = network.network_name.clone();
@@ -1689,5 +1693,70 @@ mod tests {
                 .value,
             64
         );
+    }
+
+    #[test]
+    fn foreign_context_socket_mark_is_driven_by_default_route() {
+        // When default_route is enabled on Linux, the foreign context must
+        // inherit the fixed internal mark so its relay sockets bypass the TUN
+        // routing table just like the main instance's sockets.
+
+        let make_parent = |default_route: bool, socket_mark: Option<u32>| {
+            let mut snap = PeerRuntimeSnapshot::default();
+            snap.flags.default_route = default_route;
+            snap.flags.socket_mark = socket_mark;
+            let store = CoreRuntimeConfigStore::new(
+                CoreRuntimeConfig::default(),
+                Arc::new(snap),
+            );
+            Arc::new(CorePeerContext::new(
+                store,
+                Arc::new(()),
+                CorePeerContextAdapters {
+                    stun_info_source: None,
+                    events: Arc::new(()),
+                    credential_storage: None,
+                },
+            ))
+        };
+
+        let network = NetworkIdentity {
+            network_name: "foreign".to_owned(),
+            network_secret: None,
+            network_secret_digest: None,
+        };
+
+        // default_route=false, no user socket_mark -> None
+        let foreign = build_foreign_peer_context(
+            &network,
+            &make_parent(false, None),
+            false,
+            FlagsInConfig::default(),
+        );
+        assert_eq!(foreign.flags().socket_mark, None);
+
+        // default_route=false, user socket_mark=Some(7) -> Some(7)
+        let foreign = build_foreign_peer_context(
+            &network,
+            &make_parent(false, Some(7)),
+            false,
+            FlagsInConfig::default(),
+        );
+        assert_eq!(foreign.flags().socket_mark, Some(7));
+
+        // default_route=true -> fixed internal mark on Linux, None elsewhere
+        let foreign = build_foreign_peer_context(
+            &network,
+            &make_parent(true, None),
+            false,
+            FlagsInConfig::default(),
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            foreign.flags().socket_mark,
+            Some(crate::instance::DEFAULT_ROUTE_SOCKET_MARK)
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(foreign.flags().socket_mark, None);
     }
 }

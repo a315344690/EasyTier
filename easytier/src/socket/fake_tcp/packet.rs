@@ -1,5 +1,5 @@
 use bytes::{Bytes, BytesMut};
-use pnet::packet::{MutablePacket, Packet as _};
+use pnet::packet::Packet as _;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::{ip, ipv4, ipv6, tcp};
 use pnet::util::MacAddr;
