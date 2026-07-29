@@ -178,7 +178,6 @@ fn new_web_secure_session(root_key: [u8; 32], algorithm: &str) -> Arc<SecureData
         WEB_INITIAL_EPOCH,
         algo.clone(),
         algo,
-        crate::tunnel::padding::effective_padding_max(0),
     ))
 }
 

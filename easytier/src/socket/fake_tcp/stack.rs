@@ -150,6 +150,24 @@ pub trait Tun: Send + Sync + 'static {
         }
         Ok(sent)
     }
+    /// Sends a single frame with a prepended virtio_net_hdr for checksum offload.
+    /// Falls back to `try_send` if the implementation does not support VNET_HDR.
+    fn try_send_gso(&self, packet: &Bytes, gso_size: u16) -> Result<(), std::io::Error> {
+        let _ = gso_size;
+        self.try_send(packet)
+    }
+    /// Batch-sends frames with prepended virtio_net_hdr.
+    /// Returns how many frames were successfully sent.
+    fn try_send_gso_batch(&self, packets: &[Bytes], gso_size: u16) -> Result<usize, std::io::Error> {
+        let mut sent = 0;
+        for p in packets {
+            if self.try_send_gso(p, gso_size).is_err() {
+                break;
+            }
+            sent += 1;
+        }
+        Ok(sent)
+    }
     fn driver_type(&self) -> &'static str;
 }
 
@@ -330,7 +348,6 @@ impl Socket {
         flags: u8,
         payload: Option<&[u8]>,
         seq: u32,
-        padding_len: usize,
     ) -> Bytes {
         // Advance the ACK field with received data like a real receiver: this keeps
         // a middlebox's forward-window right edge (`ack + win<<wscale`) sliding, so
@@ -369,7 +386,6 @@ impl Socket {
             Some((tsval, tsecr)),
             ip_id,
             window,
-            padding_len,
         )
     }
 
@@ -387,7 +403,6 @@ impl Socket {
             tcp::TcpFlags::ACK | tcp::TcpFlags::PSH,
             Some(payload),
             seq,
-            0,
         );
         self.last_send_time_secs
             .store(self.ts_base.elapsed().as_secs() as u32, Ordering::Relaxed);
@@ -466,13 +481,63 @@ impl Socket {
             return;
         }
         let seq = self.seq.load(Ordering::Relaxed);
-        let buf = self.build_tcp_packet_inner(tcp::TcpFlags::ACK, None, seq, 0);
+        let buf = self.build_tcp_packet_inner(tcp::TcpFlags::ACK, None, seq);
         if self.tun.try_send(&buf).is_err() {
             // The ACK never reached the wire, so that data is still unacknowledged;
             // hand the debt back, folding in anything that arrived since the swap.
             self.recv_since_ack.fetch_add(owed, Ordering::Relaxed);
         }
         self.last_send_time_secs.store(now_secs, Ordering::Relaxed);
+    }
+
+    /// Builds a frame with partial checksum (for PACKET_VNET_HDR offload).
+    /// SEQ is advanced atomically inside after state validation, so no SEQ hole
+    /// can occur if the socket transitions out of Established concurrently.
+    pub fn build_gso_frame(&self, payload: &[u8]) -> Option<Bytes> {
+        if !matches!(self.state.load(), State::Established) {
+            return None;
+        }
+        if !self.seq_calibrated.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let seq = self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
+        let ack = self.ack.load(Ordering::Relaxed);
+        let tsval = (self.ts_base.elapsed().as_millis() as u32)
+            .wrapping_add(self.ts_offset.load(Ordering::Relaxed));
+        let tsecr = self.remote_tsval.load(Ordering::Relaxed);
+        let ip_id = self.ip_id.fetch_add(1, Ordering::Relaxed);
+        let window = WINDOW_RNG
+            .with(|r| (r.borrow_mut().next_u32() % RECV_WINDOW_JITTER as u32) as u16);
+        let window = RECV_WINDOW_MAX - window;
+
+        let buf = build_gso_frame(
+            self.local_mac,
+            self.remote_mac.load().unwrap_or(MacAddr::zero()),
+            self.local_addr,
+            self.remote_addr,
+            seq,
+            ack,
+            tcp::TcpFlags::ACK | tcp::TcpFlags::PSH,
+            payload,
+            Some((tsval, tsecr)),
+            ip_id,
+            window,
+        );
+
+        self.last_send_time_secs
+            .store(self.ts_base.elapsed().as_secs() as u32, Ordering::Relaxed);
+        Some(buf)
+    }
+
+    /// Atomically swaps the ACK debt counter, returning the prior value.
+    pub fn recv_since_ack_swap(&self, val: u32) -> u32 {
+        self.recv_since_ack.swap(val, Ordering::Relaxed)
+    }
+
+    /// Adds back ACK debt (used when a send fails and the ACK never reached the wire).
+    pub fn recv_since_ack_add(&self, val: u32) {
+        self.recv_since_ack.fetch_add(val, Ordering::Relaxed);
     }
 
     pub fn close(&self) {
@@ -484,7 +549,7 @@ impl Socket {
                 return;
             }
             let seq = self.seq.load(Ordering::Relaxed);
-            let buf = self.build_tcp_packet_inner(tcp::TcpFlags::RST, None, seq, 0);
+            let buf = self.build_tcp_packet_inner(tcp::TcpFlags::RST, None, seq);
             let _ = self.tun.try_send(&buf);
             self.state.store(State::Idle);
         }
@@ -706,7 +771,7 @@ impl Drop for Socket {
         }
 
         let seq = self.seq.load(Ordering::Relaxed);
-        let buf = self.build_tcp_packet_inner(tcp::TcpFlags::RST, None, seq, 0);
+        let buf = self.build_tcp_packet_inner(tcp::TcpFlags::RST, None, seq);
         if let Err(e) = self.tun.try_send(&buf) {
             warn!("Unable to send RST to remote end: {}", e);
         }
@@ -756,6 +821,11 @@ impl Stack {
     /// Returns the driver type of the stack.
     pub fn driver_type(&self) -> &'static str {
         self.shared.tun.driver_type()
+    }
+
+    /// Returns a clone of the shared Tun device handle.
+    pub fn tun(&self) -> Arc<dyn Tun> {
+        self.shared.tun.clone()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -1038,7 +1108,6 @@ mod tests {
             None,
             0,
             0xffff,
-            0,
         )
     }
 
@@ -1096,7 +1165,6 @@ mod tests {
             None,
             0,
             0xffff,
-            0,
         );
         tx.send(frame).unwrap();
         let payload = socket.recv_payload().await.expect("payload");

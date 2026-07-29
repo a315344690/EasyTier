@@ -47,7 +47,6 @@ impl SessionKey {
 #[derive(Clone)]
 pub struct PeerSessionStore {
     sessions: Arc<DashMap<SessionKey, PeerSessionEntry>>,
-    padding_max: u32,
 }
 
 struct PeerSessionEntry {
@@ -72,7 +71,6 @@ impl Default for PeerSessionStore {
     fn default() -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
-            padding_max: crate::tunnel::padding::DEFAULT_PADDING_MAX,
         }
     }
 }
@@ -80,13 +78,6 @@ impl Default for PeerSessionStore {
 impl PeerSessionStore {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn with_padding_max(padding_max: u32) -> Self {
-        Self {
-            sessions: Arc::new(DashMap::new()),
-            padding_max,
-        }
     }
 
     pub fn get(&self, key: &SessionKey) -> Option<Arc<PeerSession>> {
@@ -152,7 +143,6 @@ impl PeerSessionStore {
                     send_algorithm,
                     recv_algorithm,
                     peer_static_pubkey,
-                    self.padding_max,
                 ));
                 self.sessions
                     .insert(key.clone(), PeerSessionEntry::new(session.clone()));
@@ -226,7 +216,6 @@ impl PeerSessionStore {
                     self.sessions.remove(key);
                 }
                 let session = {
-                    let padding_max = self.padding_max;
                     let entry = self.sessions.entry(key.clone()).or_insert_with(|| {
                         PeerSessionEntry::new(Arc::new(PeerSession::new(
                             key.peer_id,
@@ -236,7 +225,6 @@ impl PeerSessionStore {
                             send_algorithm.clone(),
                             recv_algorithm.clone(),
                             peer_static_pubkey,
-                            padding_max,
                         )))
                     });
                     entry.touch();
@@ -282,7 +270,6 @@ impl PeerSession {
         send_cipher_algorithm: String,
         recv_cipher_algorithm: String,
         peer_static_pubkey: Option<[u8; 32]>,
-        padding_max: u32,
     ) -> Self {
         Self {
             peer_id,
@@ -293,7 +280,6 @@ impl PeerSession {
                 initial_epoch,
                 send_cipher_algorithm,
                 recv_cipher_algorithm,
-                padding_max,
             ),
             invalidated: AtomicBool::new(false),
         }
@@ -462,7 +448,6 @@ mod tests {
             "aes-256-gcm".to_string(),
             "chacha20-poly1305".to_string(),
             None,
-            128,
         );
         let sb = PeerSession::new(
             a,
@@ -472,7 +457,6 @@ mod tests {
             "chacha20-poly1305".to_string(),
             "aes-256-gcm".to_string(),
             None,
-            128,
         );
 
         let plaintext1 = b"hello from a";
@@ -502,7 +486,6 @@ mod tests {
             "aes-gcm".to_string(),
             "aes-gcm".to_string(),
             None,
-            128,
         ));
         store.insert_session(key.clone(), session);
 
@@ -527,7 +510,6 @@ mod tests {
             "aes-gcm".to_string(),
             "aes-gcm".to_string(),
             None,
-            128,
         ));
         store.insert_session(key.clone(), session);
 
@@ -551,7 +533,6 @@ mod tests {
             "aes-gcm".to_string(),
             "aes-gcm".to_string(),
             None,
-            128,
         ));
         store.insert_session(key.clone(), session);
 
@@ -579,7 +560,6 @@ mod tests {
             "aes-gcm".to_string(),
             "aes-gcm".to_string(),
             None,
-            128,
         ));
         store.insert_session(key.clone(), session);
         let last_used_at = store.sessions.get(&key).unwrap().last_used_at.load();

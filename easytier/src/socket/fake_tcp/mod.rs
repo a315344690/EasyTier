@@ -409,6 +409,7 @@ const BATCH_SIZE: usize = 64;
 
 pub(crate) struct FakeTcpSocket {
     socket: Arc<stack::Socket>,
+    tun: Arc<dyn stack::Tun>,
     read_state: FakeTcpReadState,
     transport_label: String,
     raw_pending: BytesMut,
@@ -418,7 +419,12 @@ pub(crate) struct FakeTcpSocket {
 }
 
 impl FakeTcpSocket {
-    fn new<T>(socket: stack::Socket, transport_label: String, lifetime_guard: T) -> Self
+    fn new<T>(
+        socket: stack::Socket,
+        tun: Arc<dyn stack::Tun>,
+        transport_label: String,
+        lifetime_guard: T,
+    ) -> Self
     where
         T: Send + Sync + 'static,
     {
@@ -446,13 +452,18 @@ impl FakeTcpSocket {
         }));
         Self {
             socket,
+            tun,
             read_state: FakeTcpReadState::Buffered(Bytes::new()),
             transport_label,
-            raw_pending: BytesMut::new(),
+            raw_pending: BytesMut::with_capacity(MAX_COALESCED_PAYLOAD),
             pending_frames: Vec::new(),
             _ack_task: ack_task,
             _lifetime_guard: Box::new(lifetime_guard),
         }
+    }
+
+    fn build_frame(&self, payload: &[u8]) -> Option<Bytes> {
+        self.socket.build_gso_frame(payload)
     }
 
     fn seal_current_frame(&mut self) {
@@ -460,7 +471,7 @@ impl FakeTcpSocket {
             return;
         }
         let data = self.raw_pending.split().freeze();
-        if let Some(frame) = self.socket.build_packet(&data) {
+        if let Some(frame) = self.build_frame(&data) {
             self.pending_frames.push(frame);
         } else {
             self.raw_pending = BytesMut::from(data.as_ref());
@@ -471,11 +482,15 @@ impl FakeTcpSocket {
         if self.pending_frames.is_empty() {
             return;
         }
-        let sent = self.socket.flush_batch(&self.pending_frames);
+        let owed = self.socket.recv_since_ack_swap(0);
+        let sent = self.tun.try_send_gso_batch(&self.pending_frames, 0).unwrap_or(0);
         if sent >= self.pending_frames.len() {
             self.pending_frames.clear();
         } else if sent > 0 {
             self.pending_frames.drain(..sent);
+        }
+        if sent == 0 && owed > 0 {
+            self.socket.recv_since_ack_add(owed);
         }
     }
 }
@@ -528,13 +543,25 @@ impl AsyncWrite for FakeTcpSocket {
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if this.raw_pending.len() + buffer.len() > MAX_COALESCED_PAYLOAD {
+
+        if buffer.len() >= MAX_COALESCED_PAYLOAD {
             this.seal_current_frame();
+            if let Some(frame) = this.build_frame(buffer) {
+                this.pending_frames.push(frame);
+            }
+        } else {
+            if this.raw_pending.len() + buffer.len() > MAX_COALESCED_PAYLOAD {
+                this.seal_current_frame();
+            }
+            this.raw_pending.extend_from_slice(buffer);
         }
+
         if this.pending_frames.len() >= BATCH_SIZE {
             this.do_flush();
+            if this.pending_frames.len() >= BATCH_SIZE {
+                this.pending_frames.drain(..this.pending_frames.len() - BATCH_SIZE / 2);
+            }
         }
-        this.raw_pending.extend_from_slice(buffer);
         Poll::Ready(Ok(buffer.len()))
     }
 
@@ -626,8 +653,10 @@ impl FakeTcpSocketListener {
         );
 
         let transport_label = faketcp_transport_label(stack.driver_type());
+        let tun = stack.tun();
         Ok(FakeTcpSocket::new(
             socket,
+            tun,
             transport_label,
             (build_os_socket_reader_task(res.socket), stack),
         ))
@@ -772,8 +801,10 @@ async fn connect_socket_with_cache(
 
     tracing::info!(local_addr = ?socket.local_addr(), "FakeTCP socket connected");
 
+    let tun = stack.tun();
     Ok(FakeTcpSocket::new(
         socket,
+        tun,
         transport_label,
         (build_os_socket_reader_task(os_stream), stack),
     ))

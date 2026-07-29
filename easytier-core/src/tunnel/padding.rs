@@ -12,13 +12,6 @@ thread_local! {
     static PADDING_RNG: RefCell<SmallRng> = RefCell::new(SmallRng::from_rng(rand::thread_rng()).unwrap());
 }
 
-pub fn effective_padding_max(config_value: u32) -> u32 {
-    if config_value == 0 {
-        DEFAULT_PADDING_MAX
-    } else {
-        config_value
-    }
-}
 
 pub fn add_padding(pkt: &mut ZCPacket, max_padding: u32) {
     let clamped = max_padding.min(u16::MAX as u32);
@@ -128,13 +121,7 @@ mod tests {
         assert!(remove_padding(&mut pkt).is_err());
     }
 
-    #[test]
-    fn test_effective_padding_max() {
-        assert_eq!(effective_padding_max(0), DEFAULT_PADDING_MAX);
-        assert_eq!(effective_padding_max(64), 64);
-        assert_eq!(effective_padding_max(1), 1);
-        assert_eq!(effective_padding_max(1000), 1000);
-    }
+
 
     #[test]
     fn test_padding_respects_budget() {

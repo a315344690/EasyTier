@@ -84,7 +84,7 @@ pub fn gen_default_flags() -> Flags {
         enable_udp_broadcast_relay: false,
         socket_mark: None,
         default_route: false,
-        padding_max: 0,
+        fakehttp_hosts: vec![],
     }
 }
 
@@ -178,6 +178,8 @@ define_flags_diff! {
         disable_relay_data,
         enable_udp_broadcast_relay,
         socket_mark,
+        default_route,
+        fakehttp_hosts,
     ],
     u64s: [foreign_relay_bps_limit, instance_recv_bps_limit],
     enums: [data_compress_algo]

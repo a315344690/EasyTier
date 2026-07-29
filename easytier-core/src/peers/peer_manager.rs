@@ -849,7 +849,6 @@ impl PeerManagerCore {
                 &flags.encryption_algorithm,
                 derive_key_128(secret),
                 derive_key_256(secret),
-                flags.padding_max,
             )
         } else {
             Arc::new(NullCipher)

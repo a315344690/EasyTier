@@ -85,8 +85,7 @@ message FlagsInConfig {
   // non-Linux platforms.
   optional uint32 socket_mark = 43;
 
-  reserved 44;
-  reserved "fakehttp_hosts";
+  repeated string fakehttp_hosts = 44;
 
   // Linux-only: capture all traffic through VPN tunnel by setting up policy
   // routing (ip rules + custom routing table). Requires socket_mark to be set
@@ -96,10 +95,8 @@ message FlagsInConfig {
 
   reserved 46;
 
-  // Maximum random padding bytes appended to each encrypted packet.
-  // Actual padding per packet is uniform random in [0, padding_max].
-  // Default 0 means use built-in default (128 bytes).
-  uint32 padding_max = 47;
+  reserved 47;
+  reserved "padding_max";
 }
 
 message RpcDescriptor {

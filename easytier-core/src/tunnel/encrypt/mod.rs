@@ -294,14 +294,13 @@ pub(super) fn effective_algorithm_uses_xor(algorithm: &str) -> bool {
 /// Callers that accept user configuration validate it during construction.
 /// Protocol paths remain infallible here and receive an encryptor that returns
 /// an explicit error if a peer names an invalid or unavailable algorithm.
-pub struct PaddedEncryptor {
+struct PaddedEncryptor {
     inner: Arc<dyn Encryptor>,
-    padding_max: u32,
 }
 
 impl Encryptor for PaddedEncryptor {
     fn encrypt(&self, zc_packet: &mut crate::packet::ZCPacket) -> Result<(), Error> {
-        super::padding::add_padding(zc_packet, self.padding_max);
+        super::padding::add_padding(zc_packet, super::padding::DEFAULT_PADDING_MAX);
         self.inner.encrypt(zc_packet)
     }
 
@@ -321,7 +320,7 @@ impl Encryptor for PaddedEncryptor {
         zc_packet: &mut crate::packet::ZCPacket,
         nonce: Option<&[u8]>,
     ) -> Result<(), Error> {
-        super::padding::add_padding(zc_packet, self.padding_max);
+        super::padding::add_padding(zc_packet, super::padding::DEFAULT_PADDING_MAX);
         self.inner.encrypt_with_nonce(zc_packet, nonce)
     }
 }
@@ -330,7 +329,6 @@ pub fn create_encryptor(
     algorithm: &str,
     key_128: [u8; 16],
     key_256: [u8; 32],
-    padding_max: u32,
 ) -> Arc<dyn Encryptor> {
     let Ok(algorithm) = algorithm.parse::<EncryptionAlgorithm>() else {
         return invalid_encryptor(algorithm);
@@ -343,11 +341,7 @@ pub fn create_encryptor(
         EncryptionAlgorithm::ChaCha20 => create_chacha20(key_256),
     };
 
-    if padding_max > 0 {
-        Arc::new(PaddedEncryptor { inner, padding_max })
-    } else {
-        inner
-    }
+    Arc::new(PaddedEncryptor { inner })
 }
 
 #[cfg(test)]

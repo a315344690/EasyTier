@@ -40,10 +40,30 @@ const BPF_K: u16 = 0x00;
 
 const SOL_PACKET: i32 = 263;
 const PACKET_STATISTICS: i32 = 6;
+const PACKET_VNET_HDR: i32 = 15;
+const PACKET_QDISC_BYPASS: i32 = 20;
 
 const DEFAULT_RCVBUF_BYTES: i32 = 32 * 1024 * 1024;
 const RECV_BATCH_SIZE: usize = 64;
 const SEND_BATCH_MAX: usize = 64;
+
+const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
+const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
+const VIRTIO_NET_HDR_GSO_TCPV6: u8 = 4;
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct VirtioNetHdr {
+    flags: u8,
+    gso_type: u8,
+    hdr_len: u16,
+    gso_size: u16,
+    csum_start: u16,
+    csum_offset: u16,
+}
+
+const VIRTIO_NET_HDR_SIZE: usize = mem::size_of::<VirtioNetHdr>();
 
 // The recv worker's stack only holds a handful of scalar counters and a few Vec
 // handles -- the receive buffers (bufs/iovecs/msgvec) are all heap-allocated --
@@ -377,6 +397,7 @@ fn read_packet_socket_stats(fd: i32) -> io::Result<PacketSocketStats> {
 
 pub struct LinuxBpfTun {
     fd: Arc<OwnedFd>,
+    send_fd: Arc<OwnedFd>,
     ifindex: i32,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -456,6 +477,49 @@ impl LinuxBpfTun {
                 libc::SO_RCVTIMEO,
                 &timeout as *const _ as *const libc::c_void,
                 mem::size_of::<libc::timeval>() as u32,
+            )
+        };
+
+        // Create a separate send socket with PACKET_VNET_HDR for GSO/checksum offload.
+        let send_raw_fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, proto) };
+        if send_raw_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let send_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(send_raw_fd) });
+
+        let bind_ret = unsafe {
+            libc::bind(
+                send_fd.as_ref().as_raw_fd(),
+                &addr as *const _ as *const libc::sockaddr,
+                mem::size_of::<libc::sockaddr_ll>() as u32,
+            )
+        };
+        if bind_ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let vnet_val: i32 = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                send_fd.as_ref().as_raw_fd(),
+                SOL_PACKET,
+                PACKET_VNET_HDR,
+                &vnet_val as *const _ as *const libc::c_void,
+                mem::size_of::<i32>() as u32,
+            )
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let bypass_val: i32 = 1;
+        let _ = unsafe {
+            libc::setsockopt(
+                send_fd.as_ref().as_raw_fd(),
+                SOL_PACKET,
+                PACKET_QDISC_BYPASS,
+                &bypass_val as *const _ as *const libc::c_void,
+                mem::size_of::<i32>() as u32,
             )
         };
 
@@ -593,6 +657,7 @@ impl LinuxBpfTun {
 
         Ok(Self {
             fd,
+            send_fd,
             ifindex,
             stop,
             worker: Some(worker),
@@ -733,6 +798,172 @@ impl stack::Tun for LinuxBpfTun {
         Ok(ret as usize)
     }
 
+    fn try_send_gso(&self, packet: &Bytes, gso_size: u16) -> Result<(), std::io::Error> {
+        if packet.len() < ETH_HDR_LEN + 20 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "packet too short for GSO",
+            ));
+        }
+
+        let ethertype = u16::from_be_bytes([packet[12], packet[13]]);
+        let ip_hdr_len: usize = if ethertype == ETHERTYPE_IPV4 as u16 {
+            20
+        } else {
+            40
+        };
+        let tcp_data_offset = packet
+            .get(ETH_HDR_LEN + ip_hdr_len + 12)
+            .map(|b| ((b >> 4) as usize) * 4)
+            .unwrap_or(20);
+
+        let gso_type = if gso_size == 0 {
+            VIRTIO_NET_HDR_GSO_NONE
+        } else if ethertype == ETHERTYPE_IPV6 as u16 {
+            VIRTIO_NET_HDR_GSO_TCPV6
+        } else {
+            VIRTIO_NET_HDR_GSO_TCPV4
+        };
+
+        let hdr = VirtioNetHdr {
+            flags: VIRTIO_NET_HDR_F_NEEDS_CSUM,
+            gso_type,
+            hdr_len: ((ETH_HDR_LEN + ip_hdr_len + tcp_data_offset) as u16).to_le(),
+            gso_size: gso_size.to_le(),
+            csum_start: ((ETH_HDR_LEN + ip_hdr_len) as u16).to_le(),
+            csum_offset: 16u16.to_le(),
+        };
+
+        let mut addr: libc::sockaddr_ll = unsafe { mem::zeroed() };
+        addr.sll_family = libc::AF_PACKET as u16;
+        addr.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+        addr.sll_ifindex = self.ifindex;
+        addr.sll_halen = 6;
+        addr.sll_addr[..6].copy_from_slice(&packet[..6]);
+
+        let iov = [
+            libc::iovec {
+                iov_base: &hdr as *const _ as *mut libc::c_void,
+                iov_len: VIRTIO_NET_HDR_SIZE,
+            },
+            libc::iovec {
+                iov_base: packet.as_ptr() as *mut libc::c_void,
+                iov_len: packet.len(),
+            },
+        ];
+
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        msg.msg_name = &mut addr as *mut _ as *mut libc::c_void;
+        msg.msg_namelen = mem::size_of::<libc::sockaddr_ll>() as u32;
+        msg.msg_iov = iov.as_ptr() as *mut libc::iovec;
+        msg.msg_iovlen = 2;
+
+        let ret = unsafe {
+            libc::sendmsg(
+                self.send_fd.as_ref().as_raw_fd(),
+                &msg,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn try_send_gso_batch(&self, packets: &[Bytes], gso_size: u16) -> Result<usize, std::io::Error> {
+        if packets.is_empty() {
+            return Ok(0);
+        }
+        let limit = packets.len().min(SEND_BATCH_MAX);
+
+        // Each message needs its own vnet_hdr, sockaddr, and 2-element iovec.
+        let mut hdrs: [VirtioNetHdr; SEND_BATCH_MAX] = unsafe { mem::zeroed() };
+        let mut iovecs: [[libc::iovec; 2]; SEND_BATCH_MAX] = unsafe { mem::zeroed() };
+        let mut addrs: [libc::sockaddr_ll; SEND_BATCH_MAX] = unsafe { mem::zeroed() };
+        let mut msgvec: [libc::mmsghdr; SEND_BATCH_MAX] = unsafe { mem::zeroed() };
+
+        let mut valid = 0usize;
+        for i in 0..limit {
+            let pkt = &packets[i];
+            if pkt.len() < ETH_HDR_LEN + 20 {
+                continue;
+            }
+
+            let ethertype = u16::from_be_bytes([pkt[12], pkt[13]]);
+            let ip_hdr_len: usize = if ethertype == ETHERTYPE_IPV4 as u16 { 20 } else { 40 };
+            let tcp_data_offset = pkt
+                .get(ETH_HDR_LEN + ip_hdr_len + 12)
+                .map(|b| ((b >> 4) as usize) * 4)
+                .unwrap_or(20);
+
+            let gso_type = if gso_size == 0 {
+                VIRTIO_NET_HDR_GSO_NONE
+            } else if ethertype == ETHERTYPE_IPV6 as u16 {
+                VIRTIO_NET_HDR_GSO_TCPV6
+            } else {
+                VIRTIO_NET_HDR_GSO_TCPV4
+            };
+
+            hdrs[valid] = VirtioNetHdr {
+                flags: VIRTIO_NET_HDR_F_NEEDS_CSUM,
+                gso_type,
+                hdr_len: ((ETH_HDR_LEN + ip_hdr_len + tcp_data_offset) as u16).to_le(),
+                gso_size: gso_size.to_le(),
+                csum_start: ((ETH_HDR_LEN + ip_hdr_len) as u16).to_le(),
+                csum_offset: 16u16.to_le(),
+            };
+
+            iovecs[valid] = [
+                libc::iovec {
+                    iov_base: &hdrs[valid] as *const _ as *mut libc::c_void,
+                    iov_len: VIRTIO_NET_HDR_SIZE,
+                },
+                libc::iovec {
+                    iov_base: pkt.as_ptr() as *mut libc::c_void,
+                    iov_len: pkt.len(),
+                },
+            ];
+
+            addrs[valid].sll_family = libc::AF_PACKET as u16;
+            addrs[valid].sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+            addrs[valid].sll_ifindex = self.ifindex;
+            addrs[valid].sll_halen = 6;
+            addrs[valid].sll_addr[..6].copy_from_slice(&pkt[..6]);
+
+            msgvec[valid].msg_hdr.msg_name = &mut addrs[valid] as *mut _ as *mut libc::c_void;
+            msgvec[valid].msg_hdr.msg_namelen = mem::size_of::<libc::sockaddr_ll>() as u32;
+            msgvec[valid].msg_hdr.msg_iov = iovecs[valid].as_mut_ptr();
+            msgvec[valid].msg_hdr.msg_iovlen = 2;
+            valid += 1;
+        }
+
+        if valid == 0 {
+            return Ok(0);
+        }
+
+        let ret = unsafe {
+            libc::sendmmsg(
+                self.send_fd.as_ref().as_raw_fd(),
+                msgvec.as_mut_ptr(),
+                valid as _,
+                libc::MSG_DONTWAIT as _,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(0);
+            }
+            return Err(err);
+        }
+        Ok(ret as usize)
+    }
+
     fn driver_type(&self) -> &'static str {
         "linux_bpf"
     }
@@ -859,7 +1090,6 @@ mod tests {
             None,
             0,
             0xffff,
-            0,
         );
 
         send_raw_frame(&ifname, &frame).unwrap();
@@ -917,7 +1147,6 @@ mod tests {
             None,
             0,
             0xffff,
-            0,
         );
         send_raw_frame(&ifname, &non_matching).unwrap();
 
@@ -946,7 +1175,6 @@ mod tests {
             None,
             0,
             0xffff,
-            0,
         );
         send_raw_frame(&ifname, &matching).unwrap();
 

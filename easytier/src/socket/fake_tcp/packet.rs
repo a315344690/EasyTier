@@ -3,7 +3,6 @@ use pnet::packet::Packet as _;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::{ip, ipv4, ipv6, tcp};
 use pnet::util::MacAddr;
-use rand::RngCore;
 use std::convert::TryInto;
 use std::net::{IpAddr, SocketAddr};
 
@@ -54,6 +53,16 @@ impl Checksum {
         }
         !(self.sum as u16)
     }
+
+    /// Returns the folded 16-bit partial sum WITHOUT the final one's complement.
+    /// Used for checksum offload: the kernel's GSO path includes this value in its
+    /// own accumulation, producing the correct final checksum.
+    fn fold(mut self) -> u16 {
+        while self.sum >> 16 != 0 {
+            self.sum = (self.sum & 0xFFFF) + (self.sum >> 16);
+        }
+        self.sum as u16
+    }
 }
 #[derive(Debug)]
 pub enum IPPacket<'p> {
@@ -92,7 +101,6 @@ pub fn build_tcp_packet(
     timestamps: Option<(u32, u32)>,
     ip_id: u16,
     window: u16,
-    padding_len: usize,
 ) -> Bytes {
     let ip_header_len = match local_addr {
         SocketAddr::V4(_) => IPV4_HEADER_LEN,
@@ -106,30 +114,15 @@ pub fn build_tcp_packet(
     let tcp_opts_len = syn_opts_len + ts_opts_len;
     let tcp_header_len = TCP_HEADER_LEN + tcp_opts_len;
     let payload_len = payload.map_or(0, |p| p.len());
-    let tcp_total_len = tcp_header_len + payload_len + padding_len;
+    let tcp_total_len = tcp_header_len + payload_len;
     let total_len = ip_header_len + tcp_total_len;
     let full_len = ETH_HDR_LEN + total_len;
 
-    // Zero only the header region (Ethernet + IP + TCP header, options included).
-    // Those bytes are written by setters that leave a few fields untouched, and
-    // the IP/TCP checksum fields must read as zero while their checksums are
-    // computed. The payload and padding are then written exactly once -- appended
-    // here rather than pre-zeroed by `BytesMut::zeroed(full)` and overwritten
-    // later, which for a full 1348-byte segment drops a redundant memset over the
-    // whole payload. `with_capacity(full_len)` reserves once so the appends below
-    // never reallocate. Writing payload/padding before splitting keeps `tcp_buf`
-    // a single contiguous segment, so the checksum still sums the whole segment
-    // in one `add` -- no segmented-checksum change, hence bit-identical output.
     let header_total = ETH_HDR_LEN + ip_header_len + tcp_header_len;
     let mut buf = BytesMut::with_capacity(full_len);
     buf.resize(header_total, 0);
     if let Some(payload) = payload {
         buf.extend_from_slice(payload);
-    }
-    if padding_len > 0 {
-        let start = buf.len();
-        buf.resize(full_len, 0);
-        rand::thread_rng().fill_bytes(&mut buf[start..]);
     }
     debug_assert_eq!(buf.len(), full_len);
 
@@ -171,7 +164,6 @@ pub fn build_tcp_packet(
         }
     }
 
-    // payload and padding were written into the buffer before the split above.
 
     let mut ethernet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
     ethernet.set_destination(dst_mac);
@@ -232,6 +224,123 @@ pub fn build_tcp_packet(
             ck.add(tcp_pkt.packet());
             let tcp_ck = ck.finish();
             tcp_pkt.set_checksum(tcp_ck);
+        }
+        _ => unreachable!(),
+    };
+
+    ip_buf.unsplit(tcp_buf);
+    eth_buf.unsplit(ip_buf);
+    eth_buf.freeze()
+}
+
+/// Builds a TCP frame for GSO/checksum offload via PACKET_VNET_HDR.
+///
+/// Differs from `build_tcp_packet` in two ways:
+/// - TCP checksum contains only the pseudo-header partial sum (the kernel
+///   completes it over the payload during segmentation).
+/// - IPv4 header checksum is left zero (the kernel recomputes it per segment).
+///
+/// The frame is otherwise identical and valid for the kernel's `tcp_gso_segment`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_gso_frame(
+    src_mac: MacAddr,
+    dst_mac: MacAddr,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+    timestamps: Option<(u32, u32)>,
+    ip_id: u16,
+    window: u16,
+) -> Bytes {
+    let ip_header_len = match local_addr {
+        SocketAddr::V4(_) => IPV4_HEADER_LEN,
+        SocketAddr::V6(_) => IPV6_HEADER_LEN,
+    };
+    let ts_opts_len = if timestamps.is_some() { 12 } else { 0 };
+    let tcp_header_len = TCP_HEADER_LEN + ts_opts_len;
+    let tcp_total_len = tcp_header_len + payload.len();
+    let total_len = ip_header_len + tcp_total_len;
+    let full_len = ETH_HDR_LEN + total_len;
+
+    let header_total = ETH_HDR_LEN + ip_header_len + tcp_header_len;
+    let mut buf = BytesMut::with_capacity(full_len);
+    buf.resize(header_total, 0);
+    buf.extend_from_slice(payload);
+    debug_assert_eq!(buf.len(), full_len);
+
+    let mut eth_buf = buf.split_to(ETH_HDR_LEN);
+    let mut ip_buf = buf.split_to(ip_header_len);
+    let mut tcp_buf = buf.split_to(tcp_total_len);
+    assert_eq!(0, buf.len());
+
+    let mut tcp_pkt = tcp::MutableTcpPacket::new(&mut tcp_buf).unwrap();
+    tcp_pkt.set_window(window);
+    tcp_pkt.set_source(local_addr.port());
+    tcp_pkt.set_destination(remote_addr.port());
+    tcp_pkt.set_sequence(seq);
+    tcp_pkt.set_acknowledgement(ack);
+    tcp_pkt.set_flags(flags);
+    tcp_pkt.set_data_offset((tcp_header_len / 4) as u8);
+
+    if let Some((tsval, tsecr)) = timestamps {
+        let opts = [
+            tcp::TcpOption::nop(),
+            tcp::TcpOption::nop(),
+            tcp::TcpOption::timestamp(tsval, tsecr),
+        ];
+        tcp_pkt.set_options(&opts);
+    }
+
+    let mut ethernet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
+    ethernet.set_destination(dst_mac);
+    ethernet.set_source(src_mac);
+    ethernet.set_ethertype(match local_addr {
+        SocketAddr::V4(_) => EtherTypes::Ipv4,
+        SocketAddr::V6(_) => EtherTypes::Ipv6,
+    });
+
+    match (local_addr, remote_addr) {
+        (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
+            let mut v4 = ipv4::MutableIpv4Packet::new(&mut ip_buf).unwrap();
+            v4.set_version(4);
+            v4.set_header_length(IPV4_HEADER_LEN as u8 / 4);
+            v4.set_next_level_protocol(ip::IpNextHeaderProtocols::Tcp);
+            v4.set_ttl(64);
+            v4.set_identification(ip_id);
+            v4.set_source(*local.ip());
+            v4.set_destination(*remote.ip());
+            v4.set_total_length(total_len.try_into().unwrap());
+            v4.set_flags(ipv4::Ipv4Flags::DontFragment);
+            // IPv4 header checksum left zero — the kernel recomputes per GSO segment.
+
+            // TCP checksum: pseudo-header partial sum only. The kernel's checksum
+            // offload will sum the entire TCP segment (header + payload) starting
+            // from csum_start, fold it with this stored value, and write the result.
+            let mut ck = Checksum::new();
+            ck.add(&local.ip().octets());
+            ck.add(&remote.ip().octets());
+            ck.add(&[0, ip::IpNextHeaderProtocols::Tcp.0]);
+            ck.add(&(tcp_total_len as u16).to_be_bytes());
+            tcp_pkt.set_checksum(ck.fold());
+        }
+        (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+            let mut v6 = ipv6::MutableIpv6Packet::new(&mut ip_buf).unwrap();
+            v6.set_version(6);
+            v6.set_payload_length(tcp_total_len.try_into().unwrap());
+            v6.set_next_header(ip::IpNextHeaderProtocols::Tcp);
+            v6.set_hop_limit(64);
+            v6.set_source(*local.ip());
+            v6.set_destination(*remote.ip());
+
+            let mut ck = Checksum::new();
+            ck.add(&local.ip().octets());
+            ck.add(&remote.ip().octets());
+            ck.add(&(tcp_total_len as u32).to_be_bytes());
+            ck.add(&[0, 0, 0, ip::IpNextHeaderProtocols::Tcp.0]);
+            tcp_pkt.set_checksum(ck.fold());
         }
         _ => unreachable!(),
     };
@@ -302,7 +411,6 @@ mod tests {
             Some((111, 222)),
             7,
             0xfa00,
-            0,
         );
         let (_, _, ip, tcp_pkt) = parse_ip_packet(&frame).unwrap();
         match ip {
@@ -373,7 +481,6 @@ mod tests {
             None,
             0,
             0xffff,
-            0,
         );
 
         let (parsed_src_mac, parsed_dst_mac, ip_packet, tcp_packet) =
@@ -408,7 +515,6 @@ mod tests {
             None,
             0,
             0xffff,
-            0,
         );
 
         let ethernet = EthernetPacket::new(packet.as_ref()).unwrap();
@@ -442,7 +548,6 @@ mod tests {
             None,
             0,
             0xffff,
-            0,
         );
         let (_, _, _, tcp_packet) = parse_ip_packet(&packet).unwrap();
 
@@ -475,7 +580,6 @@ mod tests {
             None,
             0,
             0xffff,
-            0,
         );
         let truncated = Bytes::copy_from_slice(&packet[..ETH_HDR_LEN + IPV4_HEADER_LEN + 10]);
 
@@ -496,7 +600,6 @@ mod tests {
             None,
             0,
             0xffff,
-            0,
         );
         let truncated = Bytes::copy_from_slice(&packet[..ETH_HDR_LEN + IPV6_HEADER_LEN - 1]);
 

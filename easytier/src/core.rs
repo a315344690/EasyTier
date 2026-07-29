@@ -547,6 +547,14 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_FAKEHTTP_HOSTS",
+        help = t!("core_clap.fakehttp_hosts").to_string(),
+        value_delimiter = ','
+    )]
+    fakehttp_hosts: Option<Vec<String>>,
+
+    #[arg(
+        long,
         env = "ET_ENABLE_KCP_PROXY",
         help = t!("core_clap.enable_kcp_proxy").to_string(),
         num_args = 0..=1,
@@ -1147,6 +1155,9 @@ impl NetworkOptions {
         #[cfg(any(target_os = "linux", all(target_os = "macos", not(feature = "macos-ne"))))]
         {
             f.default_route = self.default_route.unwrap_or(f.default_route);
+        }
+        if let Some(hosts) = self.fakehttp_hosts.clone() {
+            f.fakehttp_hosts = hosts;
         }
         f.enable_kcp_proxy = self.enable_kcp_proxy.unwrap_or(f.enable_kcp_proxy);
         f.disable_kcp_input = self.disable_kcp_input.unwrap_or(f.disable_kcp_input);

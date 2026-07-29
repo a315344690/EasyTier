@@ -17,17 +17,25 @@ use crate::{
     common::global_ctx::ArcGlobalCtx,
     socket::tcp::RuntimeTcpSocket,
     tunnel::fakehttp::{
-        CONNECT_TIMEOUT, FakeHttpPayload, HANDSHAKE_TIMEOUT, upgrade_accepted, upgrade_connected,
+        CONNECT_TIMEOUT, FakeHttpPayload, HANDSHAKE_TIMEOUT, parse_payloads, upgrade_accepted,
+        upgrade_connected,
     },
 };
 
 use super::{ClientAdapter, ServerAdapter};
 
-struct FakeHttpAdapter;
+struct FakeHttpAdapter {
+    payloads: Vec<FakeHttpPayload>,
+    counter: AtomicUsize,
+}
 
 impl FakeHttpAdapter {
-    fn new(_global_ctx: &ArcGlobalCtx) -> Self {
-        Self
+    fn new(global_ctx: &ArcGlobalCtx) -> Self {
+        let hosts = global_ctx.get_flags().fakehttp_hosts;
+        Self {
+            payloads: parse_payloads(hosts),
+            counter: AtomicUsize::new(0),
+        }
     }
 
     fn is_scheme_supported(&self, scheme: &str) -> bool {
@@ -71,11 +79,16 @@ impl ClientProtocolUpgrader<RuntimeTcpSocket> for FakeHttpAdapter {
         let ConnectedTransport::Tcp(socket) = connected else {
             anyhow::bail!("FakeHTTP protocol requires a TCP transport");
         };
-        let payload = Self::payload_for_url(&requested_url);
-        let counter = AtomicUsize::new(0);
+        let fallback;
+        let payloads = if self.payloads.is_empty() {
+            fallback = [Self::payload_for_url(&requested_url)];
+            fallback.as_slice()
+        } else {
+            &self.payloads
+        };
         Ok(tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
-            upgrade_connected(socket, requested_url, std::slice::from_ref(&payload), &counter),
+            upgrade_connected(socket, requested_url, payloads, &self.counter),
         )
         .await
         .map_err(|_| anyhow::anyhow!("fakehttp client handshake timed out"))??)

@@ -44,10 +44,18 @@ pub(crate) fn parse_payloads(hosts: Vec<String>) -> Vec<FakeHttpPayload> {
     let mut payloads = Vec::new();
     for entry in hosts {
         if let Some(host) = entry.strip_prefix("http://") {
+            if host.is_empty() {
+                tracing::warn!(entry = %entry, "fakehttp: empty host after http://, skipping");
+                continue;
+            }
             payloads.push(FakeHttpPayload::Http {
                 host: host.to_string(),
             });
         } else if let Some(host) = entry.strip_prefix("https://") {
+            if host.is_empty() {
+                tracing::warn!(entry = %entry, "fakehttp: empty host after https://, skipping");
+                continue;
+            }
             payloads.push(FakeHttpPayload::Https {
                 host: host.to_string(),
             });
