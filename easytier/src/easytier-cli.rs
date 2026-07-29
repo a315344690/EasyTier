@@ -1320,6 +1320,8 @@ impl<'a> CommandHandler<'a> {
             tx_bytes: String,
             #[tabled(rename = "tunnel")]
             tunnel_proto: String,
+            #[tabled(rename = "active")]
+            active_proto: String,
             #[tabled(rename = "NAT")]
             nat_type: String,
             #[tabled(skip)]
@@ -1349,6 +1351,7 @@ impl<'a> CommandHandler<'a> {
                     rx_bytes: format_size(p.get_rx_bytes().unwrap_or(0), humansize::DECIMAL),
                     tx_bytes: format_size(p.get_tx_bytes().unwrap_or(0), humansize::DECIMAL),
                     tunnel_proto: p.get_conn_protos().unwrap_or_default().join(","),
+                    active_proto: p.get_default_conn_proto().unwrap_or_default(),
                     nat_type: p.get_udp_nat_type(),
                     id: route.peer_id.to_string(),
                     version: if route.version.is_empty() {
@@ -1374,6 +1377,7 @@ impl<'a> CommandHandler<'a> {
                     rx_bytes: "-".to_string(),
                     tx_bytes: "-".to_string(),
                     tunnel_proto: "-".to_string(),
+                    active_proto: "-".to_string(),
                     nat_type: if let Some(info) = p.stun_info {
                         info.udp_nat_type().as_str_name().to_string()
                     } else {
@@ -1452,8 +1456,8 @@ impl<'a> CommandHandler<'a> {
             print_output(
                 &items,
                 self.output_format,
-                &["tunnel", "version"],
-                &["version", "tunnel", "nat", "tx", "rx", "loss", "lat(ms)"],
+                &["tunnel", "active", "version"],
+                &["version", "tunnel", "active", "nat", "tx", "rx", "loss", "lat(ms)"],
                 self.no_trunc,
             )
         })

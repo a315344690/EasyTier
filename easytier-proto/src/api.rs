@@ -259,6 +259,31 @@ pub mod instance {
             if ret.is_empty() { None } else { Some(ret) }
         }
 
+        pub fn get_default_conn_proto(&self) -> Option<String> {
+            let p = self.peer.as_ref()?;
+            let default_conn_id = p.default_conn_id.map(|id| id.to_string());
+            let mut fallback = None;
+            for conn in p.conns.iter() {
+                let Some(tunnel_info) = &conn.tunnel else {
+                    continue;
+                };
+                let proto = Self::get_tunnel_proto_str(tunnel_info);
+                // Skip connections without a known protocol name, otherwise the
+                // direction suffix would render as a stray " (in)" / " (out)".
+                if proto.is_empty() {
+                    continue;
+                }
+                let dir = if conn.is_client { "out" } else { "in" };
+                let display = format!("{proto} ({dir})");
+                if default_conn_id == Some(conn.conn_id.to_string()) {
+                    return Some(display);
+                }
+                fallback.get_or_insert(display);
+            }
+
+            fallback
+        }
+
         pub fn get_udp_nat_type(&self) -> String {
             use crate::proto::common::NatType;
             let mut ret = NatType::Unknown;
@@ -483,5 +508,100 @@ mod tests {
         };
 
         assert_eq!(pair.get_loss_rate(), Some(0.0));
+    }
+
+    #[test]
+    fn peer_route_pair_default_conn_proto_uses_default_conn() {
+        use crate::proto::common::TunnelInfo;
+
+        let default_conn_id = uuid::Uuid::new_v4();
+        let pair = PeerRoutePair {
+            peer: Some(PeerInfo {
+                default_conn_id: Some(default_conn_id.into()),
+                conns: vec![
+                    PeerConnInfo {
+                        conn_id: uuid::Uuid::new_v4().to_string(),
+                        tunnel: Some(TunnelInfo {
+                            tunnel_type: "udp".to_string(),
+                            ..Default::default()
+                        }),
+                        is_client: false,
+                        ..Default::default()
+                    },
+                    PeerConnInfo {
+                        conn_id: default_conn_id.to_string(),
+                        tunnel: Some(TunnelInfo {
+                            tunnel_type: "tcp".to_string(),
+                            ..Default::default()
+                        }),
+                        is_client: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(pair.get_default_conn_proto().as_deref(), Some("tcp (out)"));
+    }
+
+    #[test]
+    fn peer_route_pair_default_conn_proto_falls_back_to_first_conn() {
+        use crate::proto::common::TunnelInfo;
+
+        let pair = PeerRoutePair {
+            peer: Some(PeerInfo {
+                conns: vec![
+                    PeerConnInfo {
+                        conn_id: uuid::Uuid::new_v4().to_string(),
+                        tunnel: Some(TunnelInfo {
+                            tunnel_type: "udp".to_string(),
+                            ..Default::default()
+                        }),
+                        is_client: false,
+                        ..Default::default()
+                    },
+                    PeerConnInfo {
+                        conn_id: uuid::Uuid::new_v4().to_string(),
+                        tunnel: Some(TunnelInfo {
+                            tunnel_type: "tcp".to_string(),
+                            ..Default::default()
+                        }),
+                        is_client: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(pair.get_default_conn_proto().as_deref(), Some("udp (in)"));
+    }
+
+    #[test]
+    fn peer_route_pair_default_conn_proto_skips_empty_proto() {
+        use crate::proto::common::TunnelInfo;
+
+        // A connection whose tunnel_type normalizes to an empty string must not
+        // produce a stray " (in)" / " (out)" value.
+        let pair = PeerRoutePair {
+            peer: Some(PeerInfo {
+                conns: vec![PeerConnInfo {
+                    conn_id: uuid::Uuid::new_v4().to_string(),
+                    tunnel: Some(TunnelInfo {
+                        tunnel_type: String::new(),
+                        ..Default::default()
+                    }),
+                    is_client: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(pair.get_default_conn_proto(), None);
     }
 }

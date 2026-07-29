@@ -45,6 +45,13 @@ const DEFAULT_RCVBUF_BYTES: i32 = 32 * 1024 * 1024;
 const RECV_BATCH_SIZE: usize = 64;
 const SEND_BATCH_MAX: usize = 64;
 
+// The recv worker's stack only holds a handful of scalar counters and a few Vec
+// handles -- the receive buffers (bufs/iovecs/msgvec) are all heap-allocated --
+// so real usage is well under 10KiB. Cap the stack at 256KiB instead of the 2MiB
+// default: with one worker per outbound FakeTCP connection, the default reserves
+// a lot of address space that is never touched.
+const WORKER_STACK_SIZE: usize = 256 * 1024;
+
 fn stmt(code: u16, k: u32) -> libc::sock_filter {
     libc::sock_filter {
         code,
@@ -459,7 +466,10 @@ impl LinuxBpfTun {
         let fd_guard = fd.clone();
         let interface_name_for_worker = interface_name.to_string();
 
-        let worker = std::thread::spawn(move || {
+        let worker = std::thread::Builder::new()
+            .name(format!("faketcp-rx-{}", interface_name))
+            .stack_size(WORKER_STACK_SIZE)
+            .spawn(move || {
             let _fd_guard = fd_guard;
             let mut stats_enabled = true;
             let mut total_packets: u64 = 0;
@@ -570,7 +580,7 @@ impl LinuxBpfTun {
                     last_stats_log = Instant::now();
                 }
             }
-        });
+        })?;
 
         tracing::info!(
             interface_name,
@@ -642,12 +652,18 @@ impl stack::Tun for LinuxBpfTun {
         addr.sll_halen = 6;
         addr.sll_addr[..6].copy_from_slice(&packet[..6]);
 
+        // The AF_PACKET fd is blocking (its recv worker relies on SO_RCVTIMEO to
+        // wake and poll the stop flag, and SOCK_NONBLOCK would busy-loop that
+        // worker since the fd is shared). Sends run synchronously from the tokio
+        // reactor via poll_write/poll_flush, so a blocking send on a full TX queue
+        // would stall a worker thread. MSG_DONTWAIT keeps just this call
+        // non-blocking, surfacing a full queue as WouldBlock instead.
         let ret = unsafe {
             libc::sendto(
                 self.fd.as_ref().as_raw_fd(),
                 packet.as_ptr() as *const libc::c_void,
                 packet.len(),
-                0,
+                libc::MSG_DONTWAIT,
                 &addr as *const _ as *const libc::sockaddr,
                 mem::size_of::<libc::sockaddr_ll>() as u32,
             )
@@ -694,12 +710,17 @@ impl stack::Tun for LinuxBpfTun {
             return Ok(0);
         }
 
+        // MSG_DONTWAIT for the same reason as `try_send`: this batch flush runs
+        // synchronously on the tokio reactor, so a blocking sendmmsg on a full TX
+        // queue would stall a worker thread. With it, a full queue surfaces as
+        // WouldBlock (handled below) rather than blocking.
         let ret = unsafe {
             libc::sendmmsg(
                 self.fd.as_ref().as_raw_fd(),
                 msgvec.as_mut_ptr(),
                 valid as _,
-                0,
+                // flags is c_int on glibc but c_uint on musl, let inference pick.
+                libc::MSG_DONTWAIT as _,
             )
         };
         if ret < 0 {

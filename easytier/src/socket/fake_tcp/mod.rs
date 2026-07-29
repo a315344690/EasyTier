@@ -348,15 +348,48 @@ fn build_os_socket_reader_task(mut socket: TcpStream) -> AbortOnDropHandle<()> {
     let _ = sock_ref.set_keepalive(false);
 
     AbortOnDropHandle::new(tokio::spawn(async move {
-        // read the os socket until it's closed
+        // The decoy exists only to hold the 4-tuple. TCP_REPAIR is supposed to keep
+        // it silent forever, so under normal operation the read below just parks --
+        // equivalent to the old loop. The crucial difference: if read ever returns
+        // EOF/Err unexpectedly (REPAIR semantics drifting, a stray FIN/RST advancing
+        // the state machine), we must NOT let this closure return. Returning would
+        // drop the TcpStream, close the fd and release the 4-tuple; subsequent
+        // inbound crafted segments would then hit an unowned port and draw a kernel
+        // RST that tears down the still-live fake connection.
         let mut buf = [0u8; 1024];
-        while let Ok(size) = socket.read(&mut buf).await {
-            tracing::trace!("read {} bytes from os socket", size);
-            if size == 0 {
-                break;
+        loop {
+            match socket.read(&mut buf).await {
+                // Keep draining while the connection is live: the kernel may enqueue
+                // the peer's inbound segments, and not draining would fill the 1024B
+                // recv buffer. When REPAIR behaves, this arm never returns.
+                Ok(n) if n > 0 => {
+                    tracing::trace!("read {} bytes from os socket", n);
+                    continue;
+                }
+                // EOF/Err means the recv direction has terminated (CLOSE_WAIT/CLOSED),
+                // so the kernel will not enqueue anything further -- no need to keep
+                // draining. Log at warn: REPAIR failing to stay silent is anomalous
+                // and worth surfacing rather than swallowing.
+                Ok(_) => {
+                    tracing::warn!(
+                        "faketcp decoy socket hit EOF unexpectedly; holding fd to keep the 4-tuple owned"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        ?e,
+                        "faketcp decoy socket read error; holding fd to keep the 4-tuple owned"
+                    );
+                    break;
+                }
             }
         }
-        tracing::info!("FakeTcpSocketListener os socket closed");
+        // Hold the fd (and thus the 4-tuple) until this task is aborted -- i.e. when
+        // the FakeTcpSocket is dropped, which is the only moment the connection is
+        // truly over.
+        let _hold = socket;
+        std::future::pending::<()>().await;
     }))
 }
 

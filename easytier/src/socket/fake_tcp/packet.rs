@@ -108,7 +108,30 @@ pub fn build_tcp_packet(
     let payload_len = payload.map_or(0, |p| p.len());
     let tcp_total_len = tcp_header_len + payload_len + padding_len;
     let total_len = ip_header_len + tcp_total_len;
-    let mut buf = BytesMut::zeroed(ETH_HDR_LEN + total_len);
+    let full_len = ETH_HDR_LEN + total_len;
+
+    // Zero only the header region (Ethernet + IP + TCP header, options included).
+    // Those bytes are written by setters that leave a few fields untouched, and
+    // the IP/TCP checksum fields must read as zero while their checksums are
+    // computed. The payload and padding are then written exactly once -- appended
+    // here rather than pre-zeroed by `BytesMut::zeroed(full)` and overwritten
+    // later, which for a full 1348-byte segment drops a redundant memset over the
+    // whole payload. `with_capacity(full_len)` reserves once so the appends below
+    // never reallocate. Writing payload/padding before splitting keeps `tcp_buf`
+    // a single contiguous segment, so the checksum still sums the whole segment
+    // in one `add` -- no segmented-checksum change, hence bit-identical output.
+    let header_total = ETH_HDR_LEN + ip_header_len + tcp_header_len;
+    let mut buf = BytesMut::with_capacity(full_len);
+    buf.resize(header_total, 0);
+    if let Some(payload) = payload {
+        buf.extend_from_slice(payload);
+    }
+    if padding_len > 0 {
+        let start = buf.len();
+        buf.resize(full_len, 0);
+        rand::thread_rng().fill_bytes(&mut buf[start..]);
+    }
+    debug_assert_eq!(buf.len(), full_len);
 
     let mut eth_buf = buf.split_to(ETH_HDR_LEN);
     let mut ip_buf = buf.split_to(ip_header_len);
@@ -148,15 +171,7 @@ pub fn build_tcp_packet(
         }
     }
 
-    if let Some(payload) = payload {
-        let p = tcp_pkt.payload_mut();
-        p[..payload.len()].copy_from_slice(payload);
-    }
-    if padding_len > 0 {
-        let p = tcp_pkt.payload_mut();
-        let start = payload_len;
-        rand::thread_rng().fill_bytes(&mut p[start..start + padding_len]);
-    }
+    // payload and padding were written into the buffer before the split above.
 
     let mut ethernet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
     ethernet.set_destination(dst_mac);
