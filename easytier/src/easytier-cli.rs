@@ -618,7 +618,7 @@ struct PeerTableItem {
     lat_ms: String,
     #[tabled(rename = "loss")]
     loss_rate: String,
-    #[tabled(rename = "rate")]
+    #[tabled(rename = "rate(rx/tx)")]
     rate: String,
     #[tabled(rename = "rx")]
     rx_bytes: String,

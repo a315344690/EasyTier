@@ -140,6 +140,7 @@ pub trait Tun: Send + Sync + 'static {
         Ok(buf.freeze())
     }
     fn try_send(&self, packet: &Bytes) -> Result<(), std::io::Error>;
+    #[cfg_attr(not(test), allow(dead_code))]
     fn try_send_batch(&self, packets: &[Bytes]) -> Result<usize, std::io::Error> {
         let mut sent = 0;
         for p in packets {
@@ -391,6 +392,7 @@ impl Socket {
 
     /// Builds a TCP packet with the given payload but does not send it.
     /// Returns `None` if the socket is not established or SEQ is not yet calibrated.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn build_packet(&self, payload: &[u8]) -> Option<Bytes> {
         if !matches!(self.state.load(), State::Established) {
             return None;
@@ -412,6 +414,7 @@ impl Socket {
     /// Sends multiple pre-built TCP frames to the TUN device in a batch.
     ///
     /// Returns how many made it out.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn flush_batch(&self, packets: &[Bytes]) -> usize {
         // Claim the whole debt atomically rather than reading a snapshot and
         // subtracting it afterwards: a concurrent `send_ack`/`flush_batch` would

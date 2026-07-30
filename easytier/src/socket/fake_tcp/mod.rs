@@ -10,7 +10,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::Arc,
-    task::{Context as TaskContext, Poll},
+    task::{Context as TaskContext, Poll, ready},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
@@ -406,6 +406,7 @@ enum FakeTcpReadState {
 
 const MAX_COALESCED_PAYLOAD: usize = 1348;
 const BATCH_SIZE: usize = 64;
+const FLUSH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
 pub(crate) struct FakeTcpSocket {
     socket: Arc<stack::Socket>,
@@ -414,6 +415,7 @@ pub(crate) struct FakeTcpSocket {
     transport_label: String,
     raw_pending: BytesMut,
     pending_frames: Vec<Bytes>,
+    flush_backoff: Option<Pin<Box<tokio::time::Sleep>>>,
     _ack_task: tokio_util::task::AbortOnDropHandle<()>,
     _lifetime_guard: Box<dyn Send + Sync>,
 }
@@ -457,6 +459,7 @@ impl FakeTcpSocket {
             transport_label,
             raw_pending: BytesMut::with_capacity(MAX_COALESCED_PAYLOAD),
             pending_frames: Vec::new(),
+            flush_backoff: None,
             _ack_task: ack_task,
             _lifetime_guard: Box::new(lifetime_guard),
         }
@@ -539,10 +542,25 @@ impl AsyncRead for FakeTcpSocket {
 impl AsyncWrite for FakeTcpSocket {
     fn poll_write(
         self: Pin<&mut Self>,
-        _context: &mut TaskContext<'_>,
+        cx: &mut TaskContext<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+
+        if let Some(sleep) = this.flush_backoff.as_mut() {
+            ready!(sleep.as_mut().poll(cx));
+            this.flush_backoff = None;
+        }
+
+        if this.pending_frames.len() >= BATCH_SIZE {
+            this.do_flush();
+            if this.pending_frames.len() >= BATCH_SIZE {
+                let mut sleep = Box::pin(tokio::time::sleep(FLUSH_RETRY_INTERVAL));
+                let _ = sleep.as_mut().poll(cx);
+                this.flush_backoff = Some(sleep);
+                return Poll::Pending;
+            }
+        }
 
         if buffer.len() >= MAX_COALESCED_PAYLOAD {
             this.seal_current_frame();
@@ -556,26 +574,53 @@ impl AsyncWrite for FakeTcpSocket {
             this.raw_pending.extend_from_slice(buffer);
         }
 
-        if this.pending_frames.len() >= BATCH_SIZE {
-            this.do_flush();
-            if this.pending_frames.len() >= BATCH_SIZE {
-                this.pending_frames.drain(..this.pending_frames.len() - BATCH_SIZE / 2);
-            }
-        }
         Poll::Ready(Ok(buffer.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+
+        if let Some(sleep) = this.flush_backoff.as_mut() {
+            ready!(sleep.as_mut().poll(cx));
+            this.flush_backoff = None;
+        }
+
         this.seal_current_frame();
-        this.do_flush();
+
+        if !this.pending_frames.is_empty() {
+            this.do_flush();
+        }
+
+        if !this.pending_frames.is_empty() {
+            let mut sleep = Box::pin(tokio::time::sleep(FLUSH_RETRY_INTERVAL));
+            let _ = sleep.as_mut().poll(cx);
+            this.flush_backoff = Some(sleep);
+            return Poll::Pending;
+        }
+
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+
+        if let Some(sleep) = this.flush_backoff.as_mut() {
+            ready!(sleep.as_mut().poll(cx));
+            this.flush_backoff = None;
+        }
+
         this.seal_current_frame();
-        this.do_flush();
+        if !this.pending_frames.is_empty() {
+            this.do_flush();
+        }
+
+        if !this.pending_frames.is_empty() {
+            let mut sleep = Box::pin(tokio::time::sleep(FLUSH_RETRY_INTERVAL));
+            let _ = sleep.as_mut().poll(cx);
+            this.flush_backoff = Some(sleep);
+            return Poll::Pending;
+        }
+
         this.socket.close();
         Poll::Ready(Ok(()))
     }
