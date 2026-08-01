@@ -139,6 +139,10 @@ impl PeerMap {
         DashSet::new()
     }
 
+    pub fn get_peer_loss_rate(&self, peer_id: PeerId) -> Option<u32> {
+        self.get_peer_by_id(peer_id)?.get_loss_rate_percent()
+    }
+
     pub fn has_peer(&self, peer_id: PeerId) -> bool {
         peer_id == self.my_peer_id || self.peer_map.contains_key(&peer_id)
     }

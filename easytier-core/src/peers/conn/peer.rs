@@ -332,6 +332,16 @@ impl Peer {
         ret
     }
 
+    pub fn get_loss_rate_percent(&self) -> Option<u32> {
+        let conn = self.default_conn.load_full()?;
+        let loss = conn.get_loss_rate_percent();
+        if loss >= 100 {
+            None
+        } else {
+            Some(loss)
+        }
+    }
+
     pub fn has_live_conns(&self) -> bool {
         self.conns.iter().any(|entry| !entry.value().is_closed())
     }

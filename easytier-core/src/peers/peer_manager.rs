@@ -717,6 +717,7 @@ pub struct PeerManagerCore {
     encryptor: Arc<dyn Encryptor + 'static>,
     data_compress_algo: CompressorAlgo,
     exit_nodes: Arc<RwLock<Vec<IpAddr>>>,
+    exit_node_selector: super::exit_node_selector::ExitNodeSelector,
     acl_filter: Arc<AclFilter>,
     context: Arc<CorePeerContext>,
     is_secure_mode_enabled: bool,
@@ -1020,6 +1021,8 @@ impl PeerManagerCore {
         let peer_packet_process_pipeline = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let nic_packet_process_pipeline = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let exit_nodes = Arc::new(RwLock::new(exit_nodes));
+        let exit_node_selector =
+            super::exit_node_selector::ExitNodeSelector::new(exit_nodes.clone(), peers.clone());
         let relay_peer_map = super::relay_peer_map::new_relay_peer_map(
             peers.clone(),
             Some(foreign_network_client.clone()),
@@ -1049,6 +1052,7 @@ impl PeerManagerCore {
             encryptor.clone(),
             data_compress_algo,
             exit_nodes.clone(),
+            exit_node_selector.clone(),
             recent_traffic.clone(),
             traffic_metrics.clone(),
             acl_filter.clone(),
@@ -1080,6 +1084,7 @@ impl PeerManagerCore {
             encryptor,
             data_compress_algo,
             exit_nodes,
+            exit_node_selector,
             acl_filter,
             context: core_context,
             is_secure_mode_enabled,
@@ -1494,6 +1499,7 @@ impl PeerManagerCore {
 
     pub async fn update_exit_nodes(&self, exit_nodes: Vec<IpAddr>) {
         *self.exit_nodes.write().await = exit_nodes;
+        self.exit_node_selector.reset();
     }
 
     pub(crate) fn reload_acl(&self, acl: Option<&crate::proto::acl::Acl>) {
@@ -1607,6 +1613,17 @@ impl PeerManagerCore {
         )
         .spawn_into(&self.tasks)
         .await;
+
+        let selector = self.exit_node_selector.clone();
+        self.tasks.lock().await.spawn(async move {
+            loop {
+                crate::foundation::time::sleep(
+                    super::exit_node_selector::EVAL_INTERVAL,
+                )
+                .await;
+                selector.evaluate().await;
+            }
+        });
 
         self.foreign_network_client.run().await;
 
@@ -2163,6 +2180,7 @@ pub(crate) struct PeerOutboundPacketRouter {
     encryptor: Arc<dyn Encryptor>,
     data_compress_algo: CompressorAlgo,
     exit_nodes: Arc<RwLock<Vec<IpAddr>>>,
+    exit_node_selector: super::exit_node_selector::ExitNodeSelector,
     recent_traffic: RecentTrafficTracker,
     traffic_metrics: Arc<TrafficMetricRecorder>,
     acl_filter: Arc<AclFilter>,
@@ -2183,6 +2201,7 @@ impl PeerOutboundPacketRouter {
         encryptor: Arc<dyn Encryptor>,
         data_compress_algo: CompressorAlgo,
         exit_nodes: Arc<RwLock<Vec<IpAddr>>>,
+        exit_node_selector: super::exit_node_selector::ExitNodeSelector,
         recent_traffic: RecentTrafficTracker,
         traffic_metrics: Arc<TrafficMetricRecorder>,
         acl_filter: Arc<AclFilter>,
@@ -2205,6 +2224,7 @@ impl PeerOutboundPacketRouter {
             encryptor,
             data_compress_algo,
             exit_nodes,
+            exit_node_selector,
             recent_traffic,
             traffic_metrics,
             acl_filter,
@@ -2432,14 +2452,19 @@ impl PeerOutboundPacketRouter {
             .context
             .is_ip_in_same_network(&std::net::IpAddr::V4(*ipv4_addr))
         {
-            for exit_node in self.exit_nodes.read().await.iter() {
-                let IpAddr::V4(exit_node) = exit_node else {
-                    continue;
-                };
-                if let Some(peer_id) = self.peers.get_peer_id_by_ipv4(exit_node).await {
-                    dst_peers.push(peer_id);
-                    is_exit_node = true;
-                    break;
+            if let Some(active) = self.exit_node_selector.get_active_v4() {
+                dst_peers.push(active.peer_id);
+                is_exit_node = true;
+            } else {
+                for exit_node in self.exit_nodes.read().await.iter() {
+                    let IpAddr::V4(exit_node) = exit_node else {
+                        continue;
+                    };
+                    if let Some(peer_id) = self.peers.get_peer_id_by_ipv4(exit_node).await {
+                        dst_peers.push(peer_id);
+                        is_exit_node = true;
+                        break;
+                    }
                 }
             }
         }
@@ -2472,14 +2497,19 @@ impl PeerOutboundPacketRouter {
             dst_peers.push(peer_id);
         } else if !ipv6_addr.is_unicast_link_local() {
             // NOTE: never route link local address to exit node.
-            for exit_node in self.exit_nodes.read().await.iter() {
-                let IpAddr::V6(exit_node) = exit_node else {
-                    continue;
-                };
-                if let Some(peer_id) = self.peers.get_peer_id_by_ipv6(exit_node).await {
-                    dst_peers.push(peer_id);
-                    is_exit_node = true;
-                    break;
+            if let Some(active) = self.exit_node_selector.get_active_v6() {
+                dst_peers.push(active.peer_id);
+                is_exit_node = true;
+            } else {
+                for exit_node in self.exit_nodes.read().await.iter() {
+                    let IpAddr::V6(exit_node) = exit_node else {
+                        continue;
+                    };
+                    if let Some(peer_id) = self.peers.get_peer_id_by_ipv6(exit_node).await {
+                        dst_peers.push(peer_id);
+                        is_exit_node = true;
+                        break;
+                    }
                 }
             }
         }
