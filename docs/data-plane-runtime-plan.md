@@ -21,8 +21,8 @@ The implementation scope is:
 - moving KCP route selection and source-connection ownership below the
   `DataPlaneRuntime` Interface without making KCP portable.
 
-The implementation explicitly excludes Mihomo integration. Consumers such as
-Mihomo must be able to use the resulting standard Go network interfaces
+The implementation explicitly excludes integration-specific code. Downstream
+consumers must be able to use the resulting standard Go network interfaces
 without requiring consumer-specific code in either repository.
 
 It also excludes:
@@ -1130,4 +1130,4 @@ The implementation is complete when:
 - the unused legacy data-plane FFI has been removed;
 - all focused, Docker, race, ABI, and embedded-WASM tests pass;
 - artifact provenance identifies the exact final EasyTier commit;
-- no Mihomo-specific code exists in either repository.
+- no consumer-specific code exists in either repository.

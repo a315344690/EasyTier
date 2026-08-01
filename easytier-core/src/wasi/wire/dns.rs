@@ -157,14 +157,14 @@ mod tests {
             SocketContext {
                 ip_version: IpVersion::V6,
                 socket_mark: Some(0x01020304),
-                netns: Some(NetNamespace::new("mihomo")),
+                netns: Some(NetNamespace::new("netns0")),
             },
         );
         let encoded = encode_query(&query).unwrap();
 
         let mut expected = vec![DNS_WIRE_VERSION, 6, 1, 1, 2, 3, 4, 1];
         expected.extend_from_slice(&6_u32.to_be_bytes());
-        expected.extend_from_slice(b"mihomo");
+        expected.extend_from_slice(b"netns0");
         expected.extend_from_slice(&12_u32.to_be_bytes());
         expected.extend_from_slice(b"peer.example");
         assert_eq!(encoded, expected);

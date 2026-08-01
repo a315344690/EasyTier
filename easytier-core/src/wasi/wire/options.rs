@@ -214,7 +214,7 @@ mod tests {
             bind: TcpBindOptions::default()
                 .with_local_addr(Some("[2001:db8::1]:22026".parse().unwrap()))
                 .with_socket_mark(Some(0x01020304))
-                .with_bind_device(Some("mihomo0".to_owned()))
+                .with_bind_device(Some("device0".to_owned()))
                 .with_reuse_addr(true)
                 .with_reuse_port(true)
                 .with_only_v6(true),
@@ -227,7 +227,7 @@ mod tests {
         assert_eq!(&encoded[66..70], &[2, 1, 1, 3]);
         assert_eq!(encoded[70], 1);
         assert_eq!(&encoded[71..75], &7_u32.to_be_bytes());
-        assert_eq!(&encoded[75..], b"mihomo0");
+        assert_eq!(&encoded[75..], b"device0");
     }
 
     #[test]

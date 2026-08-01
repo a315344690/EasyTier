@@ -44,7 +44,7 @@ pub fn gen_default_flags() -> Flags {
         dev_name: "".to_string(),
         enable_encryption: true,
         enable_ipv6: true,
-        mtu: 1280,
+        mtu: 1380,
         latency_first: false,
         enable_exit_node: false,
         proxy_forward_by_system: false,
@@ -83,8 +83,8 @@ pub fn gen_default_flags() -> Flags {
         disable_relay_data: false,
         enable_udp_broadcast_relay: false,
         socket_mark: None,
-        default_route: false,
         fakehttp_hosts: vec![],
+        default_route: false,
     }
 }
 
@@ -178,8 +178,8 @@ define_flags_diff! {
         disable_relay_data,
         enable_udp_broadcast_relay,
         socket_mark,
-        default_route,
         fakehttp_hosts,
+        default_route,
     ],
     u64s: [foreign_relay_bps_limit, instance_recv_bps_limit],
     enums: [data_compress_algo]
