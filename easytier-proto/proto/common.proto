@@ -93,6 +93,8 @@ message FlagsInConfig {
   // LAN routes, and throw routes for private/multicast bypassing.
   bool default_route = 45;
 
+  uint32 loss_penalty_weight = 48;
+
   reserved 46;
 
   reserved 47;

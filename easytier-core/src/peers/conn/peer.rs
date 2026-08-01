@@ -131,6 +131,7 @@ impl Peer {
 
         let conns_copy = conns.clone();
         let default_conn_copy = default_conn.clone();
+        let context_for_score = context.clone();
         let default_conn_clear_task = AbortOnDropHandle::new(tokio::spawn(async move {
             loop {
                 crate::foundation::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -138,17 +139,20 @@ impl Peer {
                     continue;
                 }
 
+                let weight = context_for_score.flags().loss_penalty_weight as u64;
                 let mut best_score = u64::MAX;
                 let mut best_conn = None;
+                let mut best_loss = 0u32;
                 for conn in conns_copy.iter() {
                     let latency_us = conn.value().get_latency_us();
                     let loss = conn.value().get_loss_rate_percent() as u64;
                     if latency_us == 0 || loss >= 100 {
                         continue;
                     }
-                    let score = latency_us * 100 / (100 - loss);
+                    let score = crate::peers::util::loss_adjusted_cost(latency_us, loss, weight);
                     if score < best_score {
                         best_score = score;
+                        best_loss = loss as u32;
                         best_conn = Some(conn.value().clone());
                     }
                 }
@@ -160,10 +164,12 @@ impl Peer {
                         continue;
                     }
                     let latency_us = current_conn.get_latency_us();
-                    let loss = current_conn.get_loss_rate_percent() as u64;
-                    if latency_us > 0 && loss < 100 {
-                        let current_score = latency_us * 100 / (100 - loss);
-                        if current_score * 5 <= best_score * 6 {
+                    let loss = current_conn.get_loss_rate_percent();
+                    if latency_us > 0 && (loss as u64) < 100 {
+                        let current_score = crate::peers::util::loss_adjusted_cost(latency_us, loss as u64, weight);
+                        let score_ok = current_score * 9 <= best_score * 10;
+                        let loss_ok = loss <= best_loss.saturating_add(1);
+                        if score_ok && loss_ok {
                             continue;
                         }
                     }
@@ -246,13 +252,13 @@ impl Peer {
         Ok(())
     }
 
-    fn calc_conn_score(conn: &PeerConn) -> Option<u64> {
+    fn calc_conn_score(conn: &PeerConn, loss_penalty_weight: u32) -> Option<u64> {
         let latency_us = conn.get_latency_us();
         let loss = conn.get_loss_rate_percent() as u64;
         if latency_us == 0 || loss >= 100 {
             return None;
         }
-        Some(latency_us * 100 / (100 - loss))
+        Some(super::super::util::loss_adjusted_cost(latency_us, loss, loss_penalty_weight as u64))
     }
 
     fn select_conn(&self) -> Option<ArcPeerConn> {
@@ -261,10 +267,11 @@ impl Peer {
             return Some(conn);
         }
 
+        let weight = self.context.flags().loss_penalty_weight;
         let mut best_score = u64::MAX;
         let mut selected = None;
         for conn in self.conns.iter() {
-            if let Some(score) = Self::calc_conn_score(conn.value()) {
+            if let Some(score) = Self::calc_conn_score(conn.value(), weight) {
                 if score < best_score {
                     best_score = score;
                     selected = Some(conn.value().clone());
@@ -333,13 +340,17 @@ impl Peer {
     }
 
     pub fn get_loss_rate_percent(&self) -> Option<u32> {
-        let conn = self.default_conn.load_full()?;
-        let loss = conn.get_loss_rate_percent();
-        if loss >= 100 {
-            None
-        } else {
-            Some(loss)
+        if let Some(conn) = self.default_conn.load_full() {
+            let loss = conn.get_loss_rate_percent();
+            if loss < 100 {
+                return Some(loss);
+            }
         }
+        self.conns
+            .iter()
+            .map(|entry| entry.value().get_loss_rate_percent())
+            .filter(|&loss| loss < 100)
+            .min()
     }
 
     pub fn has_live_conns(&self) -> bool {

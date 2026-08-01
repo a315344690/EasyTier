@@ -129,6 +129,9 @@ core_clap:
   latency_first:
     en: "latency first mode, will try to relay traffic with lowest latency path, default is using shortest path"
     zh-CN: "延迟优先模式，将尝试使用最低延迟路径转发流量，默认使用最短路径"
+  loss_penalty_weight:
+    en: "loss penalty weight for route cost (0=disabled, 5=moderate, 10=aggressive). cost = latency * 100 / (100 - loss% * weight)"
+    zh-CN: "路由代价的丢包惩罚权重 (0=禁用, 5=适中, 10=激进)。代价 = 延迟 * 100 / (100 - 丢包率% * 权重)"
   exit_nodes:
     en: "exit nodes to forward all traffic to, a virtual ipv4 address, priority is determined by the order of the list"
     zh-CN: "转发所有流量的出口节点，虚拟IPv4地址，优先级由列表顺序决定"

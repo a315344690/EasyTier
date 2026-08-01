@@ -1021,8 +1021,6 @@ impl PeerManagerCore {
         let peer_packet_process_pipeline = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let nic_packet_process_pipeline = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let exit_nodes = Arc::new(RwLock::new(exit_nodes));
-        let exit_node_selector =
-            super::exit_node_selector::ExitNodeSelector::new(exit_nodes.clone(), peers.clone());
         let relay_peer_map = super::relay_peer_map::new_relay_peer_map(
             peers.clone(),
             Some(foreign_network_client.clone()),
@@ -1041,6 +1039,12 @@ impl PeerManagerCore {
             recent_traffic.clone(),
         );
         let route = route_algo_inst.route_arc();
+        let exit_node_selector = super::exit_node_selector::ExitNodeSelector::new(
+            my_peer_id,
+            exit_nodes.clone(),
+            peers.clone(),
+            route.clone(),
+        );
         let outbound_packet_router = PeerOutboundPacketRouter::new(
             my_peer_id,
             context.clone(),
@@ -1500,6 +1504,13 @@ impl PeerManagerCore {
     pub async fn update_exit_nodes(&self, exit_nodes: Vec<IpAddr>) {
         *self.exit_nodes.write().await = exit_nodes;
         self.exit_node_selector.reset();
+    }
+
+    pub(crate) fn set_exit_node_global_peer_map(
+        &self,
+        map: Arc<std::sync::RwLock<crate::proto::peer_rpc::GlobalPeerMap>>,
+    ) {
+        self.exit_node_selector.set_global_peer_map(map);
     }
 
     pub(crate) fn reload_acl(&self, acl: Option<&crate::proto::acl::Acl>) {
@@ -2452,8 +2463,8 @@ impl PeerOutboundPacketRouter {
             .context
             .is_ip_in_same_network(&std::net::IpAddr::V4(*ipv4_addr))
         {
-            if let Some(active) = self.exit_node_selector.get_active_v4() {
-                dst_peers.push(active.peer_id);
+            if let Some(peer_id) = self.exit_node_selector.get_active_v4_peer_id() {
+                dst_peers.push(peer_id);
                 is_exit_node = true;
             } else {
                 for exit_node in self.exit_nodes.read().await.iter() {
@@ -2497,8 +2508,8 @@ impl PeerOutboundPacketRouter {
             dst_peers.push(peer_id);
         } else if !ipv6_addr.is_unicast_link_local() {
             // NOTE: never route link local address to exit node.
-            if let Some(active) = self.exit_node_selector.get_active_v6() {
-                dst_peers.push(active.peer_id);
+            if let Some(peer_id) = self.exit_node_selector.get_active_v6_peer_id() {
+                dst_peers.push(peer_id);
                 is_exit_node = true;
             } else {
                 for exit_node in self.exit_nodes.read().await.iter() {

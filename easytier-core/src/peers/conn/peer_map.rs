@@ -451,11 +451,11 @@ pub(crate) async fn direct_peer_info(peer_maps: &[Arc<PeerMap>]) -> PeerInfoForG
                 break;
             }
         }
-        let Some(min_lat) = conns
+        let Some((min_lat, loss_rate)) = conns
             .into_iter()
             .flatten()
-            .map(|conn| conn.stats.as_ref().unwrap().latency_us)
-            .min()
+            .filter_map(|conn| Some((conn.stats.as_ref()?.latency_us, conn.loss_rate)))
+            .min_by_key(|(lat, _)| *lat)
         else {
             continue;
         };
@@ -464,6 +464,7 @@ pub(crate) async fn direct_peer_info(peer_maps: &[Arc<PeerMap>]) -> PeerInfoForG
             peer,
             DirectConnectedPeerInfo {
                 latency_ms: std::cmp::max(1, (min_lat as u32 / 1000) as i32),
+                loss_rate_percent: (loss_rate * 100.0).clamp(0.0, 100.0) as u32,
             },
         );
     }

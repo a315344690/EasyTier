@@ -532,8 +532,9 @@ impl ForeignNetworkEntry {
             .await
             .unwrap();
 
+        let loss_weight = self.parent_context.flags().loss_penalty_weight;
         route
-            .set_route_cost_fn(self.peer_center.get_cost_calculator())
+            .set_route_cost_fn(self.peer_center.get_cost_calculator(loss_weight))
             .await;
 
         self.peer_map.add_route(route).await;

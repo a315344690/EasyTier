@@ -85,6 +85,7 @@ pub fn gen_default_flags() -> Flags {
         socket_mark: None,
         fakehttp_hosts: vec![],
         default_route: false,
+        loss_penalty_weight: 7,
     }
 }
 
@@ -180,6 +181,7 @@ define_flags_diff! {
         socket_mark,
         fakehttp_hosts,
         default_route,
+        loss_penalty_weight,
     ],
     u64s: [foreign_relay_bps_limit, instance_recv_bps_limit],
     enums: [data_compress_algo]

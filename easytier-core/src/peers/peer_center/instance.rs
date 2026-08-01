@@ -216,6 +216,10 @@ impl PeerCenterInstance {
         }
     }
 
+    pub fn global_peer_map(&self) -> Arc<RwLock<GlobalPeerMap>> {
+        self.global_peer_map.clone()
+    }
+
     pub fn global_peer_map_snapshot(&self) -> GetGlobalPeerMapResponse {
         GetGlobalPeerMapResponse {
             global_peer_map: self.global_peer_map.read().unwrap().map.clone(),
@@ -365,7 +369,7 @@ impl PeerCenterInstance {
         }
     }
 
-    pub fn get_cost_calculator(&self) -> RouteCostCalculator {
+    pub fn get_cost_calculator(&self, loss_penalty_weight: u32) -> RouteCostCalculator {
         struct RouteCostCalculatorImpl {
             global_peer_map: Arc<RwLock<GlobalPeerMap>>,
 
@@ -373,6 +377,7 @@ impl PeerCenterInstance {
 
             last_update_time: AtomicCell<Instant>,
             global_peer_map_update_time: Arc<AtomicCell<Instant>>,
+            loss_penalty_weight: u32,
         }
 
         impl RouteCostCalculatorImpl {
@@ -381,7 +386,14 @@ impl PeerCenterInstance {
                     .map
                     .get(&src)
                     .and_then(|src_peer_info| src_peer_info.direct_peers.get(&dst))
-                    .map(|info| info.latency_ms)
+                    .map(|info| {
+                        let cost = crate::peers::util::loss_adjusted_cost(
+                            info.latency_ms.max(0) as u64,
+                            info.loss_rate_percent as u64,
+                            self.loss_penalty_weight as u64,
+                        );
+                        cost.min(i32::MAX as u64 / 2) as i32
+                    })
             }
         }
 
@@ -415,6 +427,7 @@ impl PeerCenterInstance {
                 self.global_peer_map_update_time.load() - Duration::from_secs(1),
             ),
             global_peer_map_update_time: self.global_peer_map_update_time.clone(),
+            loss_penalty_weight,
         })
     }
 }

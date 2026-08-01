@@ -112,17 +112,18 @@ impl From<Vec<crate::api::instance::PeerInfo>> for PeerInfoForGlobalMap {
     fn from(peers: Vec<crate::api::instance::PeerInfo>) -> Self {
         let mut peer_map = BTreeMap::new();
         for peer in peers {
-            let Some(min_lat) = peer
+            let Some((min_lat, loss_rate)) = peer
                 .conns
                 .iter()
-                .map(|conn| conn.stats.as_ref().unwrap().latency_us)
-                .min()
+                .filter_map(|conn| Some((conn.stats.as_ref()?.latency_us, conn.loss_rate)))
+                .min_by_key(|(lat, _)| *lat)
             else {
                 continue;
             };
 
             let dp_info = DirectConnectedPeerInfo {
                 latency_ms: std::cmp::max(1, (min_lat as u32 / 1000) as i32),
+                loss_rate_percent: (loss_rate * 100.0).clamp(0.0, 100.0) as u32,
             };
 
             peer_map.insert(peer.peer_id, dp_info);

@@ -356,6 +356,13 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_LOSS_PENALTY_WEIGHT",
+        help = t!("core_clap.loss_penalty_weight").to_string(),
+    )]
+    loss_penalty_weight: Option<u32>,
+
+    #[arg(
+        long,
         env = "ET_EXIT_NODES",
         value_delimiter = ',',
         help = t!("core_clap.exit_nodes").to_string(),
@@ -1110,6 +1117,7 @@ impl NetworkOptions {
             f.enable_ipv6 = !v;
         }
         f.latency_first = self.latency_first.unwrap_or(f.latency_first);
+        f.loss_penalty_weight = self.loss_penalty_weight.unwrap_or(f.loss_penalty_weight);
         if let Some(dev_name) = &self.dev_name {
             f.dev_name = dev_name.clone()
         }

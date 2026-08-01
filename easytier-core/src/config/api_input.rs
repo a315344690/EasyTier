@@ -429,6 +429,10 @@ impl NetworkConfigExt for NetworkConfig {
             flags.disable_relay_data = disable_relay_data;
         }
 
+        if let Some(loss_penalty_weight) = self.loss_penalty_weight {
+            flags.loss_penalty_weight = loss_penalty_weight;
+        }
+
         if let Some(enable_udp_broadcast_relay) = self.enable_udp_broadcast_relay {
             flags.enable_udp_broadcast_relay = enable_udp_broadcast_relay;
         }
@@ -617,6 +621,7 @@ impl NetworkConfigExt for NetworkConfig {
         result.disable_udp_hole_punching = Some(flags.disable_udp_hole_punching);
         result.disable_upnp = Some(flags.disable_upnp);
         result.disable_relay_data = Some(flags.disable_relay_data);
+        result.loss_penalty_weight = Some(flags.loss_penalty_weight);
         result.enable_udp_broadcast_relay = Some(flags.enable_udp_broadcast_relay);
         result.disable_sym_hole_punching = Some(flags.disable_sym_hole_punching);
         result.enable_magic_dns = Some(flags.accept_dns);

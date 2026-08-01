@@ -173,7 +173,7 @@ mod tests {
         let mut peers = PeerInfoForGlobalMap::default();
         peers
             .direct_peers
-            .insert(100, DirectConnectedPeerInfo { latency_ms: 3 });
+            .insert(100, DirectConnectedPeerInfo { latency_ms: 3, loss_rate_percent: 0 });
 
         server
             .report_peers(
@@ -205,7 +205,7 @@ mod tests {
         let mut peers = PeerInfoForGlobalMap::default();
         peers
             .direct_peers
-            .insert(101, DirectConnectedPeerInfo { latency_ms: 5 });
+            .insert(101, DirectConnectedPeerInfo { latency_ms: 5, loss_rate_percent: 0 });
 
         server_a
             .report_peers(

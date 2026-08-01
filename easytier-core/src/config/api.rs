@@ -137,6 +137,7 @@ pub fn network_config_from_toml(config: &TomlConfig) -> NetworkConfig {
     result.disable_udp_hole_punching = Some(flags.disable_udp_hole_punching);
     result.disable_upnp = Some(flags.disable_upnp);
     result.disable_relay_data = Some(flags.disable_relay_data);
+    result.loss_penalty_weight = Some(flags.loss_penalty_weight);
     result.enable_udp_broadcast_relay = Some(flags.enable_udp_broadcast_relay);
     result.disable_sym_hole_punching = Some(flags.disable_sym_hole_punching);
     result.enable_magic_dns = Some(flags.accept_dns);

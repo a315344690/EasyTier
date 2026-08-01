@@ -97,10 +97,13 @@ where
     async fn start_components(&self) -> anyhow::Result<()> {
         #[cfg(feature = "public-ipv6-provider")]
         self.public_ipv6_provider.validate_before_start().await?;
+        let loss_weight = self.runtime_config.snapshot().peer.flags.loss_penalty_weight;
         self.peer_manager
             .get_route()
-            .set_route_cost_fn(self.peer_center.get_cost_calculator())
+            .set_route_cost_fn(self.peer_center.get_cost_calculator(loss_weight))
             .await;
+        self.peer_manager
+            .set_exit_node_global_peer_map(self.peer_center.global_peer_map());
 
         self.start_listener().await?;
         let packet_receiver = self

@@ -4,12 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
+use parking_lot::RwLock as SyncRwLock;
 use quanta::Instant;
 use tokio::sync::RwLock;
 
 use crate::config::PeerId;
+use crate::proto::peer_rpc::GlobalPeerMap;
 
 use super::conn::peer_map::PeerMap;
+use super::route::ArcRoute;
 
 const LOSS_THRESHOLD_PERCENT: u32 = 2;
 const RETURN_THRESHOLD_PERCENT: u32 = 1;
@@ -19,60 +22,146 @@ const CASCADE_LOSS_THRESHOLD: u32 = 5;
 pub(crate) const EVAL_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_SAMPLES_AFTER_SWITCH: Duration = Duration::from_secs(3);
 const CONSECUTIVE_CONFIRM: u32 = 2;
+const MAX_RELAY_HOPS: usize = 3;
+
+type SharedGlobalPeerMap = Arc<std::sync::RwLock<GlobalPeerMap>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveExitNode {
     pub ip: IpAddr,
     pub peer_id: PeerId,
-    #[allow(dead_code)]
-    pub selected_at: Instant,
+}
+
+#[derive(Clone, PartialEq, Default)]
+struct PathFingerprint {
+    is_relay: bool,
+    conn_id: super::conn::peer_conn::PeerConnId,
+    gateway_peer_id: PeerId,
 }
 
 struct ExitNodeCandidate {
     ip: IpAddr,
     peer_id: PeerId,
-    loss: u32,
-    #[allow(dead_code)]
-    config_index: usize,
+    loss: Option<u32>,
+    path_cost: Option<i32>,
+    fingerprint: PathFingerprint,
+}
+
+impl ExitNodeCandidate {
+    fn quality_score(&self) -> u64 {
+        if let Some(loss) = self.loss {
+            (loss as u64) * 100
+        } else if let Some(cost) = self.path_cost {
+            cost.max(0) as u64
+        } else {
+            u64::MAX
+        }
+    }
+
+    fn is_over_threshold(&self) -> bool {
+        if let Some(loss) = self.loss {
+            loss > LOSS_THRESHOLD_PERCENT
+        } else {
+            false
+        }
+    }
+
+    fn is_good(&self) -> bool {
+        if let Some(loss) = self.loss {
+            loss <= LOSS_THRESHOLD_PERCENT
+        } else {
+            self.path_cost.is_some()
+        }
+    }
+
+    fn is_return_candidate(&self, current_loss: Option<u32>) -> bool {
+        if let Some(loss) = self.loss {
+            loss <= RETURN_THRESHOLD_PERCENT
+                && current_loss.map_or(true, |cl| loss <= cl.saturating_add(1))
+        } else {
+            false
+        }
+    }
+}
+
+struct PerVersionCounters {
+    consecutive_over_threshold: AtomicU32,
+    preferred_return_count: AtomicU32,
+    last_fingerprint: SyncRwLock<PathFingerprint>,
+}
+
+impl Default for PerVersionCounters {
+    fn default() -> Self {
+        Self {
+            consecutive_over_threshold: AtomicU32::new(0),
+            preferred_return_count: AtomicU32::new(0),
+            last_fingerprint: SyncRwLock::new(PathFingerprint::default()),
+        }
+    }
+}
+
+impl PerVersionCounters {
+    fn reset(&self) {
+        self.consecutive_over_threshold.store(0, Ordering::Relaxed);
+        self.preferred_return_count.store(0, Ordering::Relaxed);
+        *self.last_fingerprint.write() = PathFingerprint::default();
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct ExitNodeSelector {
+    my_peer_id: PeerId,
     exit_nodes: Arc<RwLock<Vec<IpAddr>>>,
     active_v4: Arc<ArcSwapOption<ActiveExitNode>>,
     active_v6: Arc<ArcSwapOption<ActiveExitNode>>,
     peers: Arc<PeerMap>,
-    last_switch_at: Arc<RwLock<Option<Instant>>>,
-    consecutive_over_threshold: Arc<AtomicU32>,
-    preferred_return_count: Arc<AtomicU32>,
+    route: ArcRoute,
+    global_peer_map: Arc<ArcSwapOption<SharedGlobalPeerMap>>,
+    last_switch_at: Arc<SyncRwLock<Option<Instant>>>,
+    counters_v4: Arc<PerVersionCounters>,
+    counters_v6: Arc<PerVersionCounters>,
 }
 
 impl ExitNodeSelector {
-    pub(crate) fn new(exit_nodes: Arc<RwLock<Vec<IpAddr>>>, peers: Arc<PeerMap>) -> Self {
+    pub(crate) fn new(
+        my_peer_id: PeerId,
+        exit_nodes: Arc<RwLock<Vec<IpAddr>>>,
+        peers: Arc<PeerMap>,
+        route: ArcRoute,
+    ) -> Self {
         Self {
+            my_peer_id,
             exit_nodes,
             active_v4: Arc::new(ArcSwapOption::empty()),
             active_v6: Arc::new(ArcSwapOption::empty()),
             peers,
-            last_switch_at: Arc::new(RwLock::new(None)),
-            consecutive_over_threshold: Arc::new(AtomicU32::new(0)),
-            preferred_return_count: Arc::new(AtomicU32::new(0)),
+            route,
+            global_peer_map: Arc::new(ArcSwapOption::empty()),
+            last_switch_at: Arc::new(SyncRwLock::new(None)),
+            counters_v4: Arc::new(PerVersionCounters::default()),
+            counters_v6: Arc::new(PerVersionCounters::default()),
         }
     }
 
-    pub(crate) fn get_active_v4(&self) -> Option<Arc<ActiveExitNode>> {
-        self.active_v4.load_full()
+    pub(crate) fn set_global_peer_map(&self, map: SharedGlobalPeerMap) {
+        self.global_peer_map.store(Some(Arc::new(map)));
     }
 
-    pub(crate) fn get_active_v6(&self) -> Option<Arc<ActiveExitNode>> {
-        self.active_v6.load_full()
+    pub(crate) fn get_active_v4_peer_id(&self) -> Option<PeerId> {
+        let guard = self.active_v4.load();
+        guard.as_ref().map(|a| a.peer_id)
+    }
+
+    pub(crate) fn get_active_v6_peer_id(&self) -> Option<PeerId> {
+        let guard = self.active_v6.load();
+        guard.as_ref().map(|a| a.peer_id)
     }
 
     pub(crate) fn reset(&self) {
         self.active_v4.store(None);
         self.active_v6.store(None);
-        self.consecutive_over_threshold.store(0, Ordering::Relaxed);
-        self.preferred_return_count.store(0, Ordering::Relaxed);
+        self.counters_v4.reset();
+        self.counters_v6.reset();
     }
 
     pub(crate) async fn evaluate(&self) {
@@ -90,16 +179,14 @@ impl ExitNodeSelector {
         }
 
         let now = Instant::now();
-        if !self.cooldown_elapsed(now).await {
+        if !self.cooldown_elapsed(now) {
             return;
         }
 
         let (candidates_v4, candidates_v6) = self.resolve_candidates(&nodes).await;
 
-        self.evaluate_candidates(&candidates_v4, &self.active_v4, now)
-            .await;
-        self.evaluate_candidates(&candidates_v6, &self.active_v6, now)
-            .await;
+        self.evaluate_candidates(&candidates_v4, &self.active_v4, &self.counters_v4, now);
+        self.evaluate_candidates(&candidates_v6, &self.active_v6, &self.counters_v6, now);
     }
 
     async fn set_single_node(&self, nodes: &[IpAddr]) {
@@ -107,22 +194,16 @@ impl ExitNodeSelector {
         match ip {
             IpAddr::V4(addr) => {
                 if let Some(peer_id) = self.peers.get_peer_id_by_ipv4(&addr).await {
-                    self.active_v4.store(Some(Arc::new(ActiveExitNode {
-                        ip,
-                        peer_id,
-                        selected_at: Instant::now(),
-                    })));
+                    self.active_v4
+                        .store(Some(Arc::new(ActiveExitNode { ip, peer_id })));
                 } else {
                     self.active_v4.store(None);
                 }
             }
             IpAddr::V6(addr) => {
                 if let Some(peer_id) = self.peers.get_peer_id_by_ipv6(&addr).await {
-                    self.active_v6.store(Some(Arc::new(ActiveExitNode {
-                        ip,
-                        peer_id,
-                        selected_at: Instant::now(),
-                    })));
+                    self.active_v6
+                        .store(Some(Arc::new(ActiveExitNode { ip, peer_id })));
                 } else {
                     self.active_v6.store(None);
                 }
@@ -130,8 +211,8 @@ impl ExitNodeSelector {
         }
     }
 
-    async fn cooldown_elapsed(&self, now: Instant) -> bool {
-        let last = *self.last_switch_at.read().await;
+    fn cooldown_elapsed(&self, now: Instant) -> bool {
+        let last = *self.last_switch_at.read();
         let Some(last) = last else {
             return true;
         };
@@ -141,7 +222,7 @@ impl ExitNodeSelector {
             return false;
         }
 
-        let current_loss = self.get_current_active_loss().await;
+        let current_loss = self.get_current_active_loss();
         let cooldown = if current_loss > CASCADE_LOSS_THRESHOLD {
             CASCADE_COOLDOWN
         } else {
@@ -151,18 +232,58 @@ impl ExitNodeSelector {
         elapsed >= cooldown
     }
 
-    async fn get_current_active_loss(&self) -> u32 {
-        if let Some(active) = self.active_v4.load_full() {
-            if let Some(loss) = self.peers.get_peer_loss_rate(active.peer_id) {
+    fn get_current_active_loss(&self) -> u32 {
+        if let Some(peer_id) = self.get_active_v4_peer_id() {
+            if let Some(loss) = self.peers.get_peer_loss_rate(peer_id) {
                 return loss;
             }
         }
-        if let Some(active) = self.active_v6.load_full() {
-            if let Some(loss) = self.peers.get_peer_loss_rate(active.peer_id) {
+        if let Some(peer_id) = self.get_active_v6_peer_id() {
+            if let Some(loss) = self.peers.get_peer_loss_rate(peer_id) {
                 return loss;
             }
         }
         0
+    }
+
+    fn compute_path_loss(
+        &self,
+        dst_peer_id: PeerId,
+        first_hop: PeerId,
+        gpm: &GlobalPeerMap,
+    ) -> Option<u32> {
+        let mut current = self.my_peer_id;
+        let mut delivery_rate: f64 = 1.0;
+
+        for _ in 0..MAX_RELAY_HOPS {
+            if current == dst_peer_id {
+                break;
+            }
+
+            let current_info = gpm.map.get(&current)?;
+            let next_hop = if current == self.my_peer_id {
+                first_hop
+            } else if current_info.direct_peers.contains_key(&dst_peer_id) {
+                dst_peer_id
+            } else {
+                // Find common neighbor between current and dst
+                let dst_info = gpm.map.get(&dst_peer_id)?;
+                *current_info
+                    .direct_peers
+                    .keys()
+                    .find(|p| dst_info.direct_peers.contains_key(p))?
+            };
+
+            let loss_percent = current_info.direct_peers.get(&next_hop)?.loss_rate_percent;
+            delivery_rate *= 1.0 - (loss_percent as f64 / 100.0);
+            current = next_hop;
+        }
+
+        if current != dst_peer_id {
+            return None;
+        }
+
+        Some(((1.0 - delivery_rate) * 100.0) as u32)
     }
 
     async fn resolve_candidates(
@@ -172,44 +293,91 @@ impl ExitNodeSelector {
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
 
-        for (idx, ip) in nodes.iter().enumerate() {
+        let routes = self.route.list_routes().await;
+
+        // Clone GlobalPeerMap snapshot to avoid holding RwLockReadGuard across await.
+        let gpm_snapshot: Option<GlobalPeerMap> = {
+            let guard = self.global_peer_map.load();
+            guard
+                .as_ref()
+                .and_then(|g| g.read().ok().map(|r| r.clone()))
+        };
+
+        // Resolve all peer_ids first (async), then compute quality (sync).
+        let mut resolved = Vec::new();
+        for ip in nodes.iter() {
+            let peer_id = match ip {
+                IpAddr::V4(addr) => self.peers.get_peer_id_by_ipv4(addr).await,
+                IpAddr::V6(addr) => self.peers.get_peer_id_by_ipv6(addr).await,
+            };
+            if let Some(peer_id) = peer_id {
+                resolved.push((*ip, peer_id));
+            }
+        }
+
+        for (ip, peer_id) in resolved {
+            let route = routes.iter().find(|r| r.peer_id == peer_id);
+            let has_direct = self.peers.has_peer(peer_id);
+
+            let (loss, fingerprint) = if has_direct {
+                let direct_loss = self.peers.get_peer_loss_rate(peer_id);
+                let conn_id = self
+                    .peers
+                    .get_peer_default_conn_id(peer_id)
+                    .await
+                    .unwrap_or_default();
+                let fp = PathFingerprint {
+                    is_relay: false,
+                    conn_id,
+                    gateway_peer_id: 0,
+                };
+                (direct_loss, fp)
+            } else {
+                let first_hop = route.map(|r| {
+                    r.next_hop_peer_id_latency_first
+                        .unwrap_or(r.next_hop_peer_id)
+                });
+                let relay_loss = first_hop.and_then(|fh| {
+                    gpm_snapshot
+                        .as_ref()
+                        .and_then(|gpm| self.compute_path_loss(peer_id, fh, gpm))
+                });
+                let fp = PathFingerprint {
+                    is_relay: true,
+                    conn_id: Default::default(),
+                    gateway_peer_id: first_hop.unwrap_or(0),
+                };
+                (relay_loss, fp)
+            };
+
+            let path_cost = route.and_then(|r| r.path_latency_latency_first);
+
+            if loss.is_none() && path_cost.is_none() {
+                continue;
+            }
+
+            let candidate = ExitNodeCandidate {
+                ip,
+                peer_id,
+                loss,
+                path_cost,
+                fingerprint,
+            };
+
             match ip {
-                IpAddr::V4(addr) => {
-                    if let Some(peer_id) = self.peers.get_peer_id_by_ipv4(addr).await {
-                        let loss = self.peers.get_peer_loss_rate(peer_id);
-                        if let Some(loss) = loss {
-                            v4.push(ExitNodeCandidate {
-                                ip: *ip,
-                                peer_id,
-                                loss,
-                                config_index: idx,
-                            });
-                        }
-                    }
-                }
-                IpAddr::V6(addr) => {
-                    if let Some(peer_id) = self.peers.get_peer_id_by_ipv6(addr).await {
-                        let loss = self.peers.get_peer_loss_rate(peer_id);
-                        if let Some(loss) = loss {
-                            v6.push(ExitNodeCandidate {
-                                ip: *ip,
-                                peer_id,
-                                loss,
-                                config_index: idx,
-                            });
-                        }
-                    }
-                }
+                IpAddr::V4(_) => v4.push(candidate),
+                IpAddr::V6(_) => v6.push(candidate),
             }
         }
 
         (v4, v6)
     }
 
-    async fn evaluate_candidates(
+    fn evaluate_candidates(
         &self,
         candidates: &[ExitNodeCandidate],
         active_slot: &ArcSwapOption<ActiveExitNode>,
+        counters: &PerVersionCounters,
         now: Instant,
     ) {
         if candidates.is_empty() {
@@ -217,52 +385,74 @@ impl ExitNodeSelector {
             return;
         }
 
-        let current = active_slot.load_full();
-        match current {
-            Some(ref current_active) => {
-                let current_loss =
-                    Self::find_loss_in_candidates(current_active.peer_id, candidates);
+        let current = active_slot.load();
+        match current.as_ref() {
+            Some(current_active) => {
+                let current_candidate = candidates
+                    .iter()
+                    .find(|c| c.peer_id == current_active.peer_id);
 
-                match current_loss {
+                match current_candidate {
                     None => {
-                        self.switch_to_best(candidates, None, active_slot, now)
-                            .await;
+                        self.switch_to_best(candidates, None, active_slot, now);
                     }
-                    Some(loss) if loss <= LOSS_THRESHOLD_PERCENT => {
-                        self.consecutive_over_threshold.store(0, Ordering::Relaxed);
-                        self.check_preferred_return(candidates, current_active, loss, active_slot, now)
-                            .await;
-                    }
-                    Some(_loss) => {
-                        let count =
-                            self.consecutive_over_threshold.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count < CONSECUTIVE_CONFIRM {
-                            return;
+                    Some(current) => {
+                        // Detect connection-level switch (first-layer repair)
+                        let last_fp = counters.last_fingerprint.read().clone();
+                        if current.fingerprint != last_fp {
+                            counters
+                                .consecutive_over_threshold
+                                .store(0, Ordering::Relaxed);
+                            *counters.last_fingerprint.write() = current.fingerprint.clone();
                         }
-                        self.consecutive_over_threshold.store(0, Ordering::Relaxed);
-                        self.switch_to_best(
-                            candidates,
-                            Some(current_active.peer_id),
-                            active_slot,
-                            now,
-                        )
-                        .await;
+
+                        if current.is_good() {
+                            counters
+                                .consecutive_over_threshold
+                                .store(0, Ordering::Relaxed);
+                            self.check_preferred_return(
+                                candidates,
+                                current_active,
+                                current,
+                                active_slot,
+                                counters,
+                                now,
+                            );
+                        } else if current.is_over_threshold() {
+                            let count = counters
+                                .consecutive_over_threshold
+                                .fetch_add(1, Ordering::Relaxed)
+                                + 1;
+                            if count < CONSECUTIVE_CONFIRM {
+                                return;
+                            }
+                            counters
+                                .consecutive_over_threshold
+                                .store(0, Ordering::Relaxed);
+                            self.switch_to_best(
+                                candidates,
+                                Some(current_active.peer_id),
+                                active_slot,
+                                now,
+                            );
+                        }
+                        // else: relay-only with path_cost only, keep current
                     }
                 }
             }
             None => {
-                self.switch_to_best(candidates, None, active_slot, now)
-                    .await;
+                self.switch_to_best(candidates, None, active_slot, now);
             }
         }
     }
 
-    async fn check_preferred_return(
+    fn check_preferred_return(
         &self,
         candidates: &[ExitNodeCandidate],
         current_active: &ActiveExitNode,
-        current_loss: u32,
+        current: &ExitNodeCandidate,
         active_slot: &ArcSwapOption<ActiveExitNode>,
+        counters: &PerVersionCounters,
         now: Instant,
     ) {
         let current_idx = candidates
@@ -274,23 +464,23 @@ impl ExitNodeSelector {
         };
 
         for candidate in candidates.iter().take(current_idx) {
-            if candidate.loss <= RETURN_THRESHOLD_PERCENT
-                && candidate.loss <= current_loss.saturating_add(1)
-            {
-                let count = self.preferred_return_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if candidate.is_return_candidate(current.loss) {
+                let count = counters
+                    .preferred_return_count
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
                 if count >= CONSECUTIVE_CONFIRM {
-                    self.preferred_return_count.store(0, Ordering::Relaxed);
-                    self.do_switch(candidate, active_slot, now, "preferred node recovered")
-                        .await;
+                    counters.preferred_return_count.store(0, Ordering::Relaxed);
+                    self.do_switch(candidate, active_slot, now, "preferred node recovered");
                 }
                 return;
             }
         }
 
-        self.preferred_return_count.store(0, Ordering::Relaxed);
+        counters.preferred_return_count.store(0, Ordering::Relaxed);
     }
 
-    async fn switch_to_best(
+    fn switch_to_best(
         &self,
         candidates: &[ExitNodeCandidate],
         exclude_peer: Option<PeerId>,
@@ -301,9 +491,8 @@ impl ExitNodeSelector {
             if Some(candidate.peer_id) == exclude_peer {
                 continue;
             }
-            if candidate.loss <= LOSS_THRESHOLD_PERCENT {
-                self.do_switch(candidate, active_slot, now, "quality threshold exceeded")
-                    .await;
+            if candidate.is_good() {
+                self.do_switch(candidate, active_slot, now, "quality threshold exceeded");
                 return;
             }
         }
@@ -311,33 +500,39 @@ impl ExitNodeSelector {
         let best = candidates
             .iter()
             .filter(|c| Some(c.peer_id) != exclude_peer)
-            .min_by_key(|c| c.loss)
-            .or_else(|| candidates.iter().min_by_key(|c| c.loss));
+            .min_by_key(|c| c.quality_score())
+            .or_else(|| candidates.iter().min_by_key(|c| c.quality_score()));
 
         if let Some(best) = best {
-            self.do_switch(best, active_slot, now, "all nodes degraded, selecting lowest loss")
-                .await;
+            self.do_switch(
+                best,
+                active_slot,
+                now,
+                "all nodes degraded, selecting best available",
+            );
         }
     }
 
-    async fn do_switch(
+    fn do_switch(
         &self,
         candidate: &ExitNodeCandidate,
         active_slot: &ArcSwapOption<ActiveExitNode>,
         now: Instant,
         reason: &str,
     ) {
-        let old = active_slot.load_full();
-        let old_info = old
-            .as_ref()
-            .map(|a| (a.ip, self.peers.get_peer_loss_rate(a.peer_id).unwrap_or(0)));
+        let old = active_slot.load();
+        let old_info = old.as_ref().map(|a| {
+            (
+                a.ip,
+                self.peers.get_peer_loss_rate(a.peer_id).unwrap_or(0),
+            )
+        });
 
         active_slot.store(Some(Arc::new(ActiveExitNode {
             ip: candidate.ip,
             peer_id: candidate.peer_id,
-            selected_at: now,
         })));
-        *self.last_switch_at.write().await = Some(now);
+        *self.last_switch_at.write() = Some(now);
 
         match old_info {
             Some((old_ip, old_loss)) => {
@@ -345,7 +540,8 @@ impl ExitNodeSelector {
                     from = %old_ip,
                     to = %candidate.ip,
                     from_loss_percent = old_loss,
-                    to_loss_percent = candidate.loss,
+                    to_loss_percent = ?candidate.loss,
+                    to_path_cost = ?candidate.path_cost,
                     reason = %reason,
                     "exit node quality switch"
                 );
@@ -353,17 +549,11 @@ impl ExitNodeSelector {
             None => {
                 tracing::info!(
                     to = %candidate.ip,
-                    to_loss_percent = candidate.loss,
+                    to_loss_percent = ?candidate.loss,
+                    to_path_cost = ?candidate.path_cost,
                     "exit node initial selection"
                 );
             }
         }
-    }
-
-    fn find_loss_in_candidates(peer_id: PeerId, candidates: &[ExitNodeCandidate]) -> Option<u32> {
-        candidates
-            .iter()
-            .find(|c| c.peer_id == peer_id)
-            .map(|c| c.loss)
     }
 }
