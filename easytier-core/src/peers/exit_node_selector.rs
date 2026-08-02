@@ -15,7 +15,6 @@ use super::conn::peer_map::PeerMap;
 use super::route::ArcRoute;
 
 const LOSS_THRESHOLD_PERCENT: u32 = 2;
-const RETURN_THRESHOLD_PERCENT: u32 = 1;
 const SWITCH_COOLDOWN: Duration = Duration::from_secs(10);
 const CASCADE_COOLDOWN: Duration = Duration::from_secs(5);
 const CASCADE_LOSS_THRESHOLD: u32 = 5;
@@ -23,6 +22,7 @@ pub(crate) const EVAL_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_SAMPLES_AFTER_SWITCH: Duration = Duration::from_secs(3);
 const CONSECUTIVE_CONFIRM: u32 = 2;
 const MAX_RELAY_HOPS: usize = 3;
+const CONN_SWITCH_GRACE: Duration = Duration::from_secs(12);
 
 type SharedGlobalPeerMap = Arc<std::sync::RwLock<GlobalPeerMap>>;
 
@@ -76,8 +76,8 @@ impl ExitNodeCandidate {
 
     fn is_return_candidate(&self, current_loss: Option<u32>) -> bool {
         if let Some(loss) = self.loss {
-            loss <= RETURN_THRESHOLD_PERCENT
-                && current_loss.map_or(true, |cl| loss <= cl.saturating_add(1))
+            loss <= LOSS_THRESHOLD_PERCENT
+                && current_loss.map_or(true, |cl| loss < cl || cl > LOSS_THRESHOLD_PERCENT)
         } else {
             false
         }
@@ -88,6 +88,8 @@ struct PerVersionCounters {
     consecutive_over_threshold: AtomicU32,
     preferred_return_count: AtomicU32,
     last_fingerprint: SyncRwLock<PathFingerprint>,
+    last_relay_path_change: SyncRwLock<Option<Instant>>,
+    grace_reset_count: AtomicU32,
 }
 
 impl Default for PerVersionCounters {
@@ -96,15 +98,21 @@ impl Default for PerVersionCounters {
             consecutive_over_threshold: AtomicU32::new(0),
             preferred_return_count: AtomicU32::new(0),
             last_fingerprint: SyncRwLock::new(PathFingerprint::default()),
+            last_relay_path_change: SyncRwLock::new(None),
+            grace_reset_count: AtomicU32::new(0),
         }
     }
 }
+
+const MAX_GRACE_RESETS: u32 = 2;
 
 impl PerVersionCounters {
     fn reset(&self) {
         self.consecutive_over_threshold.store(0, Ordering::Relaxed);
         self.preferred_return_count.store(0, Ordering::Relaxed);
         *self.last_fingerprint.write() = PathFingerprint::default();
+        *self.last_relay_path_change.write() = None;
+        self.grace_reset_count.store(0, Ordering::Relaxed);
     }
 }
 
@@ -397,19 +405,51 @@ impl ExitNodeSelector {
                         self.switch_to_best(candidates, None, active_slot, now);
                     }
                     Some(current) => {
-                        // Detect connection-level switch (first-layer repair)
+                        // Detect connection-level path change (first-layer
+                        // repair). For relay paths conn_id is always nil so we
+                        // track gateway_peer_id; for direct paths we track
+                        // conn_id and ignore transient nil values.
                         let last_fp = counters.last_fingerprint.read().clone();
-                        if current.fingerprint != last_fp {
-                            counters
-                                .consecutive_over_threshold
-                                .store(0, Ordering::Relaxed);
+                        let fingerprint_changed = current.fingerprint != last_fp;
+
+                        let is_valid_fingerprint = current.fingerprint.is_relay
+                            || !current.fingerprint.conn_id.is_nil();
+
+                        if fingerprint_changed && is_valid_fingerprint {
+                            // Not the first evaluation: a real path change.
+                            let is_real_change = if current.fingerprint.is_relay {
+                                last_fp.gateway_peer_id != 0
+                            } else {
+                                true
+                            };
+
+                            if is_real_change {
+                                counters
+                                    .consecutive_over_threshold
+                                    .store(0, Ordering::Relaxed);
+                                if current.fingerprint.is_relay {
+                                    let resets =
+                                        counters.grace_reset_count.fetch_add(1, Ordering::Relaxed);
+                                    if resets < MAX_GRACE_RESETS {
+                                        *counters.last_relay_path_change.write() = Some(now);
+                                    }
+                                }
+                            }
+
                             *counters.last_fingerprint.write() = current.fingerprint.clone();
                         }
+
+                        let in_grace = counters
+                            .last_relay_path_change
+                            .read()
+                            .map_or(false, |t| now.duration_since(t) < CONN_SWITCH_GRACE);
 
                         if current.is_good() {
                             counters
                                 .consecutive_over_threshold
                                 .store(0, Ordering::Relaxed);
+                            *counters.last_relay_path_change.write() = None;
+                            counters.grace_reset_count.store(0, Ordering::Relaxed);
                             self.check_preferred_return(
                                 candidates,
                                 current_active,
@@ -419,6 +459,17 @@ impl ExitNodeSelector {
                                 now,
                             );
                         } else if current.is_over_threshold() {
+                            let current_loss = current.loss.unwrap_or(0);
+                            if in_grace && current_loss <= CASCADE_LOSS_THRESHOLD {
+                                let has_good_direct_alt = candidates.iter().any(|c| {
+                                    c.peer_id != current_active.peer_id
+                                        && c.is_good()
+                                        && !c.fingerprint.is_relay
+                                });
+                                if !has_good_direct_alt {
+                                    return;
+                                }
+                            }
                             let count = counters
                                 .consecutive_over_threshold
                                 .fetch_add(1, Ordering::Relaxed)
@@ -436,7 +487,6 @@ impl ExitNodeSelector {
                                 now,
                             );
                         }
-                        // else: relay-only with path_cost only, keep current
                     }
                 }
             }
@@ -497,6 +547,13 @@ impl ExitNodeSelector {
             }
         }
 
+        let current_score = exclude_peer.and_then(|ep| {
+            candidates
+                .iter()
+                .find(|c| c.peer_id == ep)
+                .map(|c| c.quality_score())
+        });
+
         let best = candidates
             .iter()
             .filter(|c| Some(c.peer_id) != exclude_peer)
@@ -504,6 +561,9 @@ impl ExitNodeSelector {
             .or_else(|| candidates.iter().min_by_key(|c| c.quality_score()));
 
         if let Some(best) = best {
+            if current_score.is_some_and(|cs| best.quality_score() >= cs) {
+                return;
+            }
             self.do_switch(
                 best,
                 active_slot,
