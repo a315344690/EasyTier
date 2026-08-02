@@ -314,7 +314,14 @@ pub fn build_gso_frame(
             v4.set_destination(*remote.ip());
             v4.set_total_length(total_len.try_into().unwrap());
             v4.set_flags(ipv4::Ipv4Flags::DontFragment);
-            // IPv4 header checksum left zero — the kernel recomputes per GSO segment.
+
+            // IPv4 header checksum: compute it in userspace. With gso_type=GSO_NONE
+            // the kernel does NOT recompute the IP header checksum, and AF_PACKET
+            // bypasses the IP layer entirely. Intermediate devices (NAT, firewalls)
+            // will drop packets with checksum 0.
+            let mut ipck = Checksum::new();
+            ipck.add(v4.packet());
+            v4.set_checksum(ipck.finish());
 
             // TCP checksum: pseudo-header partial sum only. The kernel's checksum
             // offload will sum the entire TCP segment (header + payload) starting
