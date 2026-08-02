@@ -44,7 +44,10 @@ pub fn gen_default_flags() -> Flags {
         dev_name: "".to_string(),
         enable_encryption: true,
         enable_ipv6: true,
-        mtu: 1380,
+        // FakeTCP IPv4 constraint: MTU 1280 -> max 1338B TCP payload after padding+encryption
+        // -> IPv4 packet = 20+32+1338 = 1390 < PATH_MTU(1400). Raising this value causes
+        // FakeTCP IPv4 packets to exceed the path MTU (DF flag set), breaking connections.
+        mtu: 1280,
         latency_first: false,
         enable_exit_node: false,
         proxy_forward_by_system: false,

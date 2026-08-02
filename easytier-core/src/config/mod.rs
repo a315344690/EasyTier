@@ -782,7 +782,7 @@ mod tests {
             routes: None,
             peer_policy: None,
             traffic: Some(pb::TrafficConfig {
-                mtu: Some(1380),
+                mtu: Some(toml::gen_default_flags().mtu as i32),
                 instance_recv_bps_limit: Some(100),
                 foreign_relay_bps_limit: None,
             }),
@@ -792,7 +792,7 @@ mod tests {
         assert_eq!(config.node.peer_id, Some(7));
         assert_eq!(config.node.hostname.as_deref(), Some("node-a"));
         assert!(config.peer_policy.p2p_enabled);
-        assert_eq!(config.traffic.mtu, Some(1380));
+        assert_eq!(config.traffic.mtu, Some(toml::gen_default_flags().mtu as u16));
     }
 
     #[test]
