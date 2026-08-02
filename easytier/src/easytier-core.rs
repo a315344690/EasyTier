@@ -23,7 +23,7 @@ pub static malloc_conf: &[u8] = b"retain:false\0";
 
 rust_i18n::i18n!("locales", fallback = "en");
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> std::process::ExitCode {
     core::main().await
 }
