@@ -42,11 +42,12 @@ use easytier::{
             instance::{
                 AclManageRpc, AclManageRpcClientFactory, Connector, ConnectorManageRpc,
                 ConnectorManageRpcClientFactory, CredentialManageRpc,
-                CredentialManageRpcClientFactory, DumpRouteRequest, ForeignNetworkEntryPb,
-                GenerateCredentialRequest, GetAclStatsRequest, GetPrometheusStatsRequest,
-                GetStatsRequest, GetVpnPortalInfoRequest, GetWhitelistRequest,
-                GetWhitelistResponse, InstanceIdentifier, ListConnectorRequest,
-                ListCredentialsRequest, ListCredentialsResponse, ListForeignNetworkRequest,
+                CredentialManageRpcClientFactory, DumpRouteRequest, ExitNodeInfo,
+                ForeignNetworkEntryPb, GenerateCredentialRequest, GetAclStatsRequest,
+                GetExitNodeStatusRequest, GetPrometheusStatsRequest, GetStatsRequest,
+                GetVpnPortalInfoRequest, GetWhitelistRequest, GetWhitelistResponse,
+                InstanceIdentifier, ListConnectorRequest, ListCredentialsRequest,
+                ListCredentialsResponse, ListForeignNetworkRequest,
                 ListGlobalForeignNetworkRequest, ListMappedListenerRequest, ListPeerRequest,
                 ListPeerResponse, ListPortForwardRequest, ListPortForwardResponse,
                 ListPublicIpv6InfoRequest, ListPublicIpv6InfoResponse, ListRouteRequest,
@@ -151,6 +152,8 @@ enum SubCommand {
     Logger(LoggerArgs),
     #[command(about = "manage temporary credentials")]
     Credential(CredentialArgs),
+    #[command(name = "exit-node", about = "show exit node status")]
+    ExitNode(ExitNodeArgs),
     #[command(about = t!("core_clap.generate_completions").to_string())]
     GenAutocomplete { shell: ShellType },
 }
@@ -206,6 +209,18 @@ enum PeerSubCommand {
     },
     /// List global foreign networks from the peer center
     ListGlobalForeign,
+}
+
+#[derive(Args, Debug)]
+struct ExitNodeArgs {
+    #[command(subcommand)]
+    sub_command: Option<ExitNodeSubCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum ExitNodeSubCommand {
+    /// List exit node status
+    List,
 }
 
 #[derive(Args, Debug)]
@@ -766,6 +781,114 @@ fn build_peer_items(data: &PeerListData) -> Vec<PeerTableItem> {
         }
     });
     items
+}
+
+const EXIT_NODE_OPTIONAL_COLS: &[&str] = &["next_hop", "tunnel"];
+const EXIT_NODE_DROP_COLS: &[&str] = &["next_hop", "tunnel", "rate(rx/tx)", "loss", "lat(ms)"];
+
+#[derive(tabled::Tabled, serde::Serialize)]
+struct ExitNodeTableItem {
+    #[tabled(rename = "ipv4")]
+    ipv4: String,
+    hostname: String,
+    #[tabled(rename = "active")]
+    active: String,
+    cost: String,
+    #[tabled(rename = "lat(ms)")]
+    lat_ms: String,
+    #[tabled(rename = "loss")]
+    loss_rate: String,
+    #[tabled(rename = "tunnel")]
+    tunnel_proto: String,
+    #[tabled(rename = "next_hop")]
+    next_hop: String,
+    #[tabled(rename = "rate(rx/tx)")]
+    rate: String,
+    #[tabled(skip)]
+    rx_bytes: u64,
+    #[tabled(skip)]
+    tx_bytes: u64,
+    #[tabled(skip)]
+    peer_id: u32,
+}
+
+fn format_duration_short(ms: u64) -> String {
+    if ms == 0 {
+        return "-".to_string();
+    }
+    let secs = ms / 1000;
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        format!("{}h{}m", h, m)
+    }
+}
+
+fn build_exit_node_items(data: &ExitNodeListData) -> Vec<ExitNodeTableItem> {
+    let mut items: Vec<ExitNodeTableItem> = data
+        .exit_nodes
+        .iter()
+        .map(|n| {
+            let cost_str = if n.cost < 0 {
+                "offline".to_string()
+            } else {
+                cost_to_str(n.cost)
+            };
+            let loss_str = if n.loss_rate < 0.0 {
+                "-".to_string()
+            } else {
+                format!("{:.1}%", n.loss_rate)
+            };
+            let lat_str = if n.cost < 0 || (n.latency_ms == 0.0 && !n.active) {
+                "-".to_string()
+            } else {
+                format!("{:.2}", n.latency_ms)
+            };
+            ExitNodeTableItem {
+                ipv4: n.ipv4_addr.clone(),
+                hostname: if n.hostname.is_empty() {
+                    "-".to_string()
+                } else {
+                    n.hostname.clone()
+                },
+                active: format_duration_short(n.active_since_ms),
+                cost: cost_str,
+                lat_ms: lat_str,
+                loss_rate: loss_str,
+                tunnel_proto: if n.tunnel_proto.is_empty() {
+                    "-".to_string()
+                } else {
+                    n.tunnel_proto.clone()
+                },
+                next_hop: if n.next_hop.is_empty() {
+                    "-".to_string()
+                } else {
+                    n.next_hop.clone()
+                },
+                rate: "-".to_string(),
+                rx_bytes: n.rx_bytes,
+                tx_bytes: n.tx_bytes,
+                peer_id: n.peer_id,
+            }
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        let a_active = a.active != "-";
+        let b_active = b.active != "-";
+        b_active
+            .cmp(&a_active)
+            .then_with(|| a.ipv4.cmp(&b.ipv4))
+    });
+    items
+}
+
+#[derive(serde::Serialize)]
+struct ExitNodeListData {
+    exit_nodes: Vec<ExitNodeInfo>,
 }
 
 #[derive(serde::Serialize)]
@@ -1658,6 +1781,175 @@ impl<'a> CommandHandler<'a> {
 
             // Drop cache entries for peers of this instance that vanished this
             // frame, so the cache can't grow unbounded over a long session.
+            let seen: std::collections::HashSet<u32> =
+                fresh.iter().map(|(peer_id, _, _)| *peer_id).collect();
+            rate_cache.retain(|(k, peer_id), _| *k != key || seen.contains(peer_id));
+
+            for (peer_id, rx, tx) in fresh {
+                rate_cache.insert((key.clone(), peer_id), RateSample { rx, tx, at: now });
+            }
+        }
+        Ok(())
+    }
+
+    async fn fetch_exit_node_data(&self) -> Result<ExitNodeListData, Error> {
+        let client = self.get_peer_manager_client().await?;
+        let response = client
+            .get_exit_node_status(
+                BaseController::default(),
+                GetExitNodeStatusRequest {
+                    instance: Some(self.instance_selector.clone()),
+                },
+            )
+            .await
+            .with_context(|| "failed to get exit node status")?;
+        Ok(ExitNodeListData {
+            exit_nodes: response.exit_nodes,
+        })
+    }
+
+    async fn handle_exit_node_list(&self) -> Result<(), Error> {
+        if self.verbose || *self.output_format == OutputFormat::Json {
+            return self.render_exit_node_list_once().await;
+        }
+
+        let mut rate_cache = RateCache::new();
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+
+        loop {
+            let fetched = tokio::select! {
+                _ = &mut ctrl_c => None,
+                r = async {
+                    ticker.tick().await;
+                    self.collect_instance_results(|handler| {
+                        Box::pin(handler.fetch_exit_node_data())
+                    })
+                    .await
+                } => Some(r),
+            };
+
+            let Some(fetched) = fetched else {
+                println!();
+                break;
+            };
+
+            match fetched {
+                Ok(results) => {
+                    print!("\x1b[2J\x1b[3J\x1b[H");
+                    self.render_exit_node_frame(&results, &mut rate_cache)?;
+                }
+                Err(e) => {
+                    print!("\x1b[2J\x1b[3J\x1b[H");
+                    println!("failed to fetch exit node status: {e:#}; retrying...");
+                }
+            }
+            std::io::stdout().flush().ok();
+        }
+        Ok(())
+    }
+
+    async fn render_exit_node_list_once(&self) -> Result<(), Error> {
+        let results = self
+            .collect_instance_results(|handler| Box::pin(handler.fetch_exit_node_data()))
+            .await?;
+
+        if self.verbose {
+            return self.print_json_results(
+                results
+                    .into_iter()
+                    .map(|result| result.map(|data| data.exit_nodes))
+                    .collect(),
+            );
+        }
+        if *self.output_format == OutputFormat::Json {
+            return self.print_json_results(
+                results
+                    .into_iter()
+                    .map(|result| result.map(|data| build_exit_node_items(&data)))
+                    .collect(),
+            );
+        }
+
+        self.print_results(&results, |data| {
+            if data.exit_nodes.is_empty() {
+                println!("No exit nodes configured. Use --exit-nodes to configure exit nodes.");
+                return Ok(());
+            }
+            let items = build_exit_node_items(data);
+            print_output(
+                &items,
+                self.output_format,
+                EXIT_NODE_OPTIONAL_COLS,
+                EXIT_NODE_DROP_COLS,
+                self.no_trunc,
+            )
+        })
+    }
+
+    fn render_exit_node_frame(
+        &self,
+        results: &[InstanceResult<ExitNodeListData>],
+        rate_cache: &mut RateCache,
+    ) -> Result<(), Error> {
+        let now = Instant::now();
+        let multi = results.len() > 1;
+
+        for (idx, result) in results.iter().enumerate() {
+            if multi {
+                if idx > 0 {
+                    println!();
+                }
+                if let Some(target) = result.target.as_ref() {
+                    self.print_target_header(target);
+                }
+            }
+
+            let key = rate_instance_key(&result.target);
+            let data = &result.value;
+
+            if data.exit_nodes.is_empty() {
+                println!("No exit nodes configured. Use --exit-nodes to configure exit nodes.");
+                continue;
+            }
+
+            let mut rate_map: HashMap<u32, String> = HashMap::new();
+            let mut fresh: Vec<(u32, u64, u64)> = Vec::with_capacity(data.exit_nodes.len());
+            for n in &data.exit_nodes {
+                if n.peer_id == 0 {
+                    continue;
+                }
+                let rx = n.rx_bytes;
+                let tx = n.tx_bytes;
+                if let Some(prev) = rate_cache.get(&(key.clone(), n.peer_id)) {
+                    let dt = now.duration_since(prev.at).as_secs_f64();
+                    if dt > 0.0 {
+                        let drx = rx.saturating_sub(prev.rx) as f64 / dt;
+                        let dtx = tx.saturating_sub(prev.tx) as f64 / dt;
+                        rate_map.insert(n.peer_id, format_rate_pair(drx, dtx));
+                    }
+                }
+                fresh.push((n.peer_id, rx, tx));
+            }
+
+            let mut items = build_exit_node_items(data);
+            for item in items.iter_mut() {
+                if let Some(rate) = rate_map.get(&item.peer_id) {
+                    item.rate = rate.clone();
+                }
+            }
+
+            print_output(
+                &items,
+                self.output_format,
+                EXIT_NODE_OPTIONAL_COLS,
+                EXIT_NODE_DROP_COLS,
+                self.no_trunc,
+            )?;
+
             let seen: std::collections::HashSet<u32> =
                 fresh.iter().map(|(peer_id, _, _)| *peer_id).collect();
             rate_cache.retain(|(k, peer_id), _| *k != key || seen.contains(peer_id));
@@ -3406,6 +3698,11 @@ async fn main() -> Result<(), Error> {
             }
             CredentialSubCommand::List => {
                 handler.handle_credential_list().await?;
+            }
+        },
+        SubCommand::ExitNode(exit_node_args) => match &exit_node_args.sub_command {
+            Some(ExitNodeSubCommand::List) | None => {
+                handler.handle_exit_node_list().await?;
             }
         },
         SubCommand::GenAutocomplete { shell } => {

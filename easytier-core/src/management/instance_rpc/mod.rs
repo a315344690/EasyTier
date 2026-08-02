@@ -3,7 +3,8 @@ use std::sync::Arc;
 use easytier_proto::{
     api::instance::{
         Connector, ConnectorManageRpc, ConnectorStatus, DumpRouteRequest, DumpRouteResponse,
-        ForeignNetworkEntryPb, GetForeignNetworkSummaryRequest, GetForeignNetworkSummaryResponse,
+        ExitNodeInfo, ForeignNetworkEntryPb, GetExitNodeStatusRequest, GetExitNodeStatusResponse,
+        GetForeignNetworkSummaryRequest, GetForeignNetworkSummaryResponse,
         ListConnectorRequest, ListConnectorResponse, ListForeignNetworkRequest,
         ListForeignNetworkResponse, ListGlobalForeignNetworkRequest,
         ListGlobalForeignNetworkResponse, ListPeerRequest, ListPeerResponse,
@@ -301,6 +302,36 @@ where
                 public_ipv6_addr: snapshot.public_ipv6_addr.map(Into::into),
                 ipv6_public_addr_prefix: snapshot.ipv6_public_addr_prefix.map(Into::into),
             }),
+        })
+    }
+
+    async fn get_exit_node_status(
+        &self,
+        _: BaseController,
+        request: GetExitNodeStatusRequest,
+    ) -> rpc_types::error::Result<GetExitNodeStatusResponse> {
+        let entries = self
+            .instance(request.instance.as_ref())?
+            .exit_node_status()
+            .await;
+        Ok(GetExitNodeStatusResponse {
+            exit_nodes: entries
+                .into_iter()
+                .map(|e| ExitNodeInfo {
+                    ipv4_addr: e.ip.to_string(),
+                    hostname: e.hostname,
+                    active: e.active,
+                    active_since_ms: e.active_duration_ms,
+                    cost: e.cost,
+                    latency_ms: e.latency_ms,
+                    loss_rate: e.loss_rate,
+                    tunnel_proto: e.tunnel_proto,
+                    next_hop: e.next_hop,
+                    rx_bytes: e.rx_bytes,
+                    tx_bytes: e.tx_bytes,
+                    peer_id: e.peer_id,
+                })
+                .collect(),
         })
     }
 }

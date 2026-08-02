@@ -32,6 +32,13 @@ pub(crate) struct ActiveExitNode {
     pub peer_id: PeerId,
 }
 
+pub(crate) struct ExitNodeSelectorStatus {
+    pub active_v4: Option<ActiveExitNode>,
+    pub active_v6: Option<ActiveExitNode>,
+    pub exit_nodes: Vec<IpAddr>,
+    pub active_duration_ms: u64,
+}
+
 #[derive(Clone, PartialEq, Default)]
 struct PathFingerprint {
     is_relay: bool,
@@ -165,6 +172,27 @@ impl ExitNodeSelector {
         guard.as_ref().map(|a| a.peer_id)
     }
 
+    pub(crate) async fn get_status(&self) -> ExitNodeSelectorStatus {
+        let active_v4 = self.active_v4.load_full().map(|a| (*a).clone());
+        let active_v6 = self.active_v6.load_full().map(|a| (*a).clone());
+        let exit_nodes = self.exit_nodes.read().await.clone();
+        let active_duration_ms = self
+            .last_switch_at
+            .read()
+            .map(|t| Instant::now().duration_since(t).as_millis() as u64)
+            .unwrap_or(0);
+        ExitNodeSelectorStatus {
+            active_v4,
+            active_v6,
+            exit_nodes,
+            active_duration_ms,
+        }
+    }
+
+    pub(crate) fn get_global_peer_map(&self) -> Option<Arc<SharedGlobalPeerMap>> {
+        self.global_peer_map.load_full()
+    }
+
     pub(crate) fn reset(&self) {
         self.active_v4.store(None);
         self.active_v6.store(None);
@@ -199,23 +227,30 @@ impl ExitNodeSelector {
 
     async fn set_single_node(&self, nodes: &[IpAddr]) {
         let ip = nodes[0];
-        match ip {
+        let stored = match ip {
             IpAddr::V4(addr) => {
                 if let Some(peer_id) = self.peers.get_peer_id_by_ipv4(&addr).await {
                     self.active_v4
                         .store(Some(Arc::new(ActiveExitNode { ip, peer_id })));
+                    true
                 } else {
                     self.active_v4.store(None);
+                    false
                 }
             }
             IpAddr::V6(addr) => {
                 if let Some(peer_id) = self.peers.get_peer_id_by_ipv6(&addr).await {
                     self.active_v6
                         .store(Some(Arc::new(ActiveExitNode { ip, peer_id })));
+                    true
                 } else {
                     self.active_v6.store(None);
+                    false
                 }
             }
+        };
+        if stored && self.last_switch_at.read().is_none() {
+            *self.last_switch_at.write() = Some(Instant::now());
         }
     }
 
@@ -254,7 +289,7 @@ impl ExitNodeSelector {
         0
     }
 
-    fn compute_path_loss(
+    pub(crate) fn compute_path_loss(
         &self,
         dst_peer_id: PeerId,
         first_hop: PeerId,

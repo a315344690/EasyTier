@@ -205,6 +205,12 @@ where
         self.peer_manager.update_exit_nodes(exit_nodes).await;
     }
 
+    pub async fn exit_node_status(
+        &self,
+    ) -> Vec<crate::peers::peer_manager::ExitNodeStatusEntry> {
+        self.peer_manager.exit_node_status().await
+    }
+
     pub async fn refresh_acl_groups(&self) {
         self.peer_manager.get_route().refresh_acl_groups().await;
     }

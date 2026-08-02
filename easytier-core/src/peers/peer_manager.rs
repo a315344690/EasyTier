@@ -87,6 +87,36 @@ pub struct PeerSnapshot {
     pub conns: Vec<PeerConnInfo>,
 }
 
+fn sum_conn_bytes(conns: Option<&Vec<PeerConnInfo>>) -> (u64, u64) {
+    conns
+        .map(|cs| {
+            cs.iter().fold((0u64, 0u64), |(rx, tx), c| {
+                let s = c.stats.as_ref();
+                (
+                    rx + s.map(|s| s.rx_bytes).unwrap_or(0),
+                    tx + s.map(|s| s.tx_bytes).unwrap_or(0),
+                )
+            })
+        })
+        .unwrap_or((0, 0))
+}
+
+#[derive(Debug, Clone)]
+pub struct ExitNodeStatusEntry {
+    pub ip: IpAddr,
+    pub hostname: String,
+    pub active: bool,
+    pub active_duration_ms: u64,
+    pub cost: i32,
+    pub latency_ms: f32,
+    pub loss_rate: f32,
+    pub tunnel_proto: String,
+    pub next_hop: String,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub peer_id: PeerId,
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeSnapshot {
     pub peer_id: PeerId,
@@ -1504,6 +1534,134 @@ impl PeerManagerCore {
     pub async fn update_exit_nodes(&self, exit_nodes: Vec<IpAddr>) {
         *self.exit_nodes.write().await = exit_nodes;
         self.exit_node_selector.reset();
+    }
+
+    pub async fn exit_node_status(&self) -> Vec<ExitNodeStatusEntry> {
+        let status = self.exit_node_selector.get_status().await;
+        let routes = self.route.list_routes().await;
+
+        let gpm_snapshot: Option<crate::proto::peer_rpc::GlobalPeerMap> = {
+            let guard = self.exit_node_selector.get_global_peer_map();
+            guard.and_then(|g| g.read().ok().map(|r| r.clone()))
+        };
+
+        let active_v4_peer_id = status.active_v4.as_ref().map(|a| a.peer_id);
+        let active_v6_peer_id = status.active_v6.as_ref().map(|a| a.peer_id);
+
+        let mut entries = Vec::new();
+        for ip in &status.exit_nodes {
+            let peer_id = match ip {
+                IpAddr::V4(addr) => self.peers.get_peer_id_by_ipv4(addr).await,
+                IpAddr::V6(addr) => self.peers.get_peer_id_by_ipv6(addr).await,
+            };
+
+            let is_active = peer_id.map_or(false, |pid| {
+                Some(pid) == active_v4_peer_id || Some(pid) == active_v6_peer_id
+            });
+
+            let Some(peer_id) = peer_id else {
+                entries.push(ExitNodeStatusEntry {
+                    ip: *ip,
+                    hostname: String::new(),
+                    active: false,
+                    active_duration_ms: 0,
+                    cost: -1,
+                    latency_ms: 0.0,
+                    loss_rate: -1.0,
+                    tunnel_proto: String::new(),
+                    next_hop: String::new(),
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    peer_id: 0,
+                });
+                continue;
+            };
+
+            let route = routes.iter().find(|r| r.peer_id == peer_id);
+            let has_direct = self.peers.has_peer(peer_id);
+
+            let (latency_ms, loss_rate, tunnel_proto, next_hop, cost, rx_bytes, tx_bytes) =
+                if has_direct {
+                    let conns = self.peers.list_peer_conns(peer_id).await;
+                    let default_conn_id = self.peers.get_peer_default_conn_id(peer_id).await;
+                    let conn = conns.as_ref().and_then(|cs| {
+                        default_conn_id
+                            .as_ref()
+                            .and_then(|dcid| cs.iter().find(|c| c.conn_id == dcid.to_string()))
+                            .or_else(|| cs.first())
+                    });
+
+                    let lat = conn
+                        .and_then(|c| c.stats.as_ref())
+                        .map(|s| s.latency_us as f32 / 1000.0)
+                        .unwrap_or(0.0);
+                    let loss = conn.map(|c| c.loss_rate * 100.0).unwrap_or(-1.0);
+                    let tunnel = conn
+                        .and_then(|c| c.tunnel.as_ref())
+                        .map(|t| t.tunnel_type.clone())
+                        .unwrap_or_default();
+                    let cost_val = route.map(|r| r.cost).unwrap_or(1);
+                    let (rx, tx) = sum_conn_bytes(conns.as_ref());
+                    (lat, loss, tunnel, String::new(), cost_val, rx, tx)
+                } else {
+                    let first_hop = route.map(|r| {
+                        r.next_hop_peer_id_latency_first.unwrap_or(r.next_hop_peer_id)
+                    });
+                    let relay_loss = first_hop.and_then(|fh| {
+                        gpm_snapshot.as_ref().and_then(|gpm| {
+                            self.exit_node_selector.compute_path_loss(peer_id, fh, gpm)
+                        })
+                    });
+                    let lat = route
+                        .and_then(|r| r.path_latency_latency_first.or(Some(r.path_latency)))
+                        .unwrap_or(0) as f32;
+                    let loss = relay_loss.map(|l| l as f32).unwrap_or(-1.0);
+
+                    let next_hop_id = first_hop.unwrap_or(0);
+                    let next_hop_hostname = routes
+                        .iter()
+                        .find(|r| r.peer_id == next_hop_id)
+                        .map(|r| r.hostname.clone())
+                        .unwrap_or_default();
+
+                    let (tunnel, rx, tx) = if let Some(fh) = first_hop {
+                        let fh_conns = self.peers.list_peer_conns(fh).await;
+                        let tun = fh_conns
+                            .as_ref()
+                            .and_then(|cs| cs.first())
+                            .and_then(|c| c.tunnel.as_ref())
+                            .map(|t| t.tunnel_type.clone())
+                            .unwrap_or_default();
+                        let (r, t) = sum_conn_bytes(fh_conns.as_ref());
+                        (tun, r, t)
+                    } else {
+                        (String::new(), 0, 0)
+                    };
+
+                    let cost_val = route.map(|r| r.cost).unwrap_or(0);
+                    (lat, loss, tunnel, next_hop_hostname, cost_val, rx, tx)
+                };
+
+            entries.push(ExitNodeStatusEntry {
+                ip: *ip,
+                hostname: route.map(|r| r.hostname.clone()).unwrap_or_default(),
+                active: is_active,
+                active_duration_ms: if is_active {
+                    status.active_duration_ms
+                } else {
+                    0
+                },
+                cost,
+                latency_ms,
+                loss_rate,
+                tunnel_proto,
+                next_hop,
+                rx_bytes,
+                tx_bytes,
+                peer_id,
+            });
+        }
+        entries
     }
 
     pub(crate) fn set_exit_node_global_peer_map(

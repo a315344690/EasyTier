@@ -184,6 +184,25 @@ message GetForeignNetworkSummaryResponse {
   peer_rpc.RouteForeignNetworkSummary summary = 1;
 }
 
+message ExitNodeInfo {
+  string ipv4_addr = 1;
+  string hostname = 2;
+  bool active = 3;
+  uint64 active_since_ms = 4;
+  int32 cost = 5;
+  float latency_ms = 6;
+  float loss_rate = 7;
+  string tunnel_proto = 8;
+  string next_hop = 9;
+  uint64 rx_bytes = 10;
+  uint64 tx_bytes = 11;
+  uint32 peer_id = 12;
+}
+
+message GetExitNodeStatusRequest { InstanceIdentifier instance = 1; }
+
+message GetExitNodeStatusResponse { repeated ExitNodeInfo exit_nodes = 1; }
+
 service PeerManageRpc {
   rpc ListPeer(ListPeerRequest) returns (ListPeerResponse);
   rpc ListPublicIpv6Info(ListPublicIpv6InfoRequest)
@@ -197,6 +216,8 @@ service PeerManageRpc {
   rpc ShowNodeInfo(ShowNodeInfoRequest) returns (ShowNodeInfoResponse);
   rpc GetForeignNetworkSummary(GetForeignNetworkSummaryRequest)
       returns (GetForeignNetworkSummaryResponse);
+  rpc GetExitNodeStatus(GetExitNodeStatusRequest)
+      returns (GetExitNodeStatusResponse);
 }
 
 enum ConnectorStatus {
