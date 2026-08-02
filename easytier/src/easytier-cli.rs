@@ -635,8 +635,8 @@ struct PeerTableItem {
     version: String,
 }
 
-impl From<PeerRoutePair> for PeerTableItem {
-    fn from(p: PeerRoutePair) -> Self {
+impl PeerTableItem {
+    fn from_pair(p: PeerRoutePair, relay_via: Option<&str>) -> Self {
         let route = p.route.clone().unwrap_or_default();
         let lat_ms = if route.cost == 1 {
             p.get_latency_ms().unwrap_or(0.0)
@@ -658,7 +658,10 @@ impl From<PeerRoutePair> for PeerTableItem {
             rx_bytes: format_size(p.get_rx_bytes().unwrap_or(0), humansize::DECIMAL),
             tx_bytes: format_size(p.get_tx_bytes().unwrap_or(0), humansize::DECIMAL),
             tunnel_proto: p.get_conn_protos().unwrap_or_default().join(","),
-            active_proto: p.get_default_conn_proto().unwrap_or_default(),
+            active_proto: match relay_via {
+                Some(hostname) => hostname.to_string(),
+                None => p.get_default_conn_proto().unwrap_or_default(),
+            },
             nat_type: p.get_udp_nat_type(),
             id: route.peer_id.to_string(),
             version: if route.version.is_empty() {
@@ -697,13 +700,37 @@ impl From<NodeInfo> for PeerTableItem {
     }
 }
 
+fn is_latency_first(config: &str) -> bool {
+    config.contains("latency_first = true")
+}
+
 /// Build the sorted peer rows for one instance: local node first, then public
 /// servers, then by IPv4 / hostname. The `rate` column is left as a placeholder
 /// (`-`) here and backfilled by the watch renderer.
 fn build_peer_items(data: &PeerListData) -> Vec<PeerTableItem> {
+    let latency_first = is_latency_first(&data.node_info.config);
     let mut items = Vec::with_capacity(data.peer_routes.len() + 1);
     items.push(PeerTableItem::from(data.node_info.clone()));
-    items.extend(data.peer_routes.iter().cloned().map(Into::into));
+
+    for pair in data.peer_routes.iter() {
+        let relay_via = if latency_first {
+            let route = pair.route.clone().unwrap_or_default();
+            let next_hop = route.next_hop_peer_id_latency_first.unwrap_or(route.peer_id);
+            if next_hop != route.peer_id {
+                data.peer_routes
+                    .iter()
+                    .find(|r| r.route.as_ref().map(|rt| rt.peer_id) == Some(next_hop))
+                    .and_then(|r| r.route.as_ref())
+                    .map(|r| r.hostname.as_str())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        items.push(PeerTableItem::from_pair(pair.clone(), relay_via));
+    }
+
     items.sort_by(|a, b| {
         use std::net::{IpAddr, Ipv4Addr};
 
