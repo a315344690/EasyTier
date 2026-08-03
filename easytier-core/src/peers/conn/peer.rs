@@ -139,39 +139,27 @@ impl Peer {
                     continue;
                 }
 
-                let weight = context_for_score.flags().loss_penalty_weight as u64;
-                let mut best_score = u64::MAX;
-                let mut best_conn = None;
-                let mut best_loss = 0u32;
-                for conn in conns_copy.iter() {
-                    let latency_us = conn.value().get_latency_us();
-                    let loss = conn.value().get_loss_rate_percent() as u64;
-                    if latency_us == 0 || loss >= 100 {
-                        continue;
-                    }
-                    let score = crate::peers::util::loss_adjusted_cost(latency_us, loss, weight);
-                    if score < best_score {
-                        best_score = score;
-                        best_loss = loss as u32;
-                        best_conn = Some(conn.value().clone());
-                    }
-                }
-                let Some(ref best_conn) = best_conn else { continue };
+                let weight = context_for_score.flags().loss_penalty_weight;
+                let Some((best_score, best_loss)) =
+                    Peer::find_best_conn(&conns_copy, weight)
+                else {
+                    continue;
+                };
 
                 let current = default_conn_copy.load_full();
                 if let Some(ref current_conn) = current {
-                    if Arc::ptr_eq(current_conn, best_conn) {
+                    if Peer::calc_conn_score(current_conn, weight)
+                        .is_some_and(|s| s == best_score)
+                    {
                         continue;
                     }
-                    let latency_us = current_conn.get_latency_us();
-                    let loss = current_conn.get_loss_rate_percent();
-                    if latency_us > 0 && (loss as u64) < 100 {
-                        let current_score = crate::peers::util::loss_adjusted_cost(latency_us, loss as u64, weight);
-                        let score_ok = current_score * 9 <= best_score * 10;
-                        let loss_ok = loss <= best_loss.saturating_add(1);
-                        if score_ok && loss_ok {
-                            continue;
-                        }
+                    if Peer::is_current_conn_acceptable(
+                        current_conn,
+                        best_score,
+                        best_loss,
+                        weight,
+                    ) {
+                        continue;
                     }
                 }
 
@@ -259,6 +247,38 @@ impl Peer {
             return None;
         }
         Some(super::super::util::loss_adjusted_cost(latency_us, loss, loss_penalty_weight as u64))
+    }
+
+    fn find_best_conn(conns: &DashMap<PeerConnId, ArcPeerConn>, weight: u32) -> Option<(u64, u32)> {
+        let mut best_score = u64::MAX;
+        let mut best_loss = 0u32;
+        for conn in conns.iter() {
+            if let Some(score) = Self::calc_conn_score(conn.value(), weight) {
+                if score < best_score {
+                    best_score = score;
+                    best_loss = conn.value().get_loss_rate_percent();
+                }
+            }
+        }
+        if best_score == u64::MAX {
+            None
+        } else {
+            Some((best_score, best_loss))
+        }
+    }
+
+    fn is_current_conn_acceptable(
+        current: &PeerConn,
+        best_score: u64,
+        best_loss: u32,
+        weight: u32,
+    ) -> bool {
+        let Some(current_score) = Self::calc_conn_score(current, weight) else {
+            return false;
+        };
+        let score_ok = current_score * 9 <= best_score * 10;
+        let loss_ok = current.get_loss_rate_percent() <= best_loss.saturating_add(1);
+        score_ok && loss_ok
     }
 
     fn select_conn(&self) -> Option<ArcPeerConn> {
@@ -353,6 +373,20 @@ impl Peer {
             .min()
     }
 
+    pub fn is_conn_converged(&self) -> bool {
+        if self.conns.len() <= 1 {
+            return true;
+        }
+        let weight = self.context.flags().loss_penalty_weight;
+        let Some((best_score, best_loss)) = Self::find_best_conn(&self.conns, weight) else {
+            return true;
+        };
+        let Some(current) = self.default_conn.load_full() else {
+            return false;
+        };
+        Self::is_current_conn_acceptable(&current, best_score, best_loss, weight)
+    }
+
     pub fn has_live_conns(&self) -> bool {
         self.conns.iter().any(|entry| !entry.value().is_closed())
     }
@@ -398,5 +432,36 @@ impl Drop for Peer {
         });
         self.shutdown_notifier.notify_one();
         tracing::info!("peer {} drop", self.peer_node_id);
+    }
+}
+
+#[cfg(test)]
+impl Peer {
+    pub(crate) fn set_conn_stats_for_test(
+        &self,
+        conn_idx: usize,
+        latency_us: u32,
+        loss_percent: u32,
+    ) {
+        for (i, entry) in self.conns.iter().enumerate() {
+            if i == conn_idx {
+                entry.value().set_latency_for_test(latency_us);
+                entry.value().set_loss_rate_for_test(loss_percent);
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn force_default_conn_to_index(&self, conn_idx: usize) {
+        for (i, entry) in self.conns.iter().enumerate() {
+            if i == conn_idx {
+                self.default_conn.store(Some(entry.value().clone()));
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn clear_default_conn(&self) {
+        self.default_conn.store(None);
     }
 }

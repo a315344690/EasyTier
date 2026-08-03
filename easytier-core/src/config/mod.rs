@@ -782,7 +782,7 @@ mod tests {
             routes: None,
             peer_policy: None,
             traffic: Some(pb::TrafficConfig {
-                mtu: Some(toml::gen_default_flags().mtu as i32),
+                mtu: Some(toml::gen_default_flags().mtu),
                 instance_recv_bps_limit: Some(100),
                 foreign_relay_bps_limit: None,
             }),

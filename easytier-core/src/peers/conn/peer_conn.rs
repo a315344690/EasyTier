@@ -1501,3 +1501,21 @@ impl Drop for PeerConn {
         self.close_event_notifier.notify_close();
     }
 }
+
+#[cfg(test)]
+impl PeerConn {
+    pub(crate) fn set_loss_rate_for_test(&self, loss_percent: u32) {
+        self.loss_rate_stats.store(loss_percent, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_latency_for_test(&self, latency_us: u32) {
+        self.latency_stats.record_latency(latency_us);
+    }
+
+    pub(crate) fn set_info_for_test(&mut self, peer_id: PeerId) {
+        use crate::proto::peer_rpc::HandshakeRequest;
+        let mut info = HandshakeRequest::default();
+        info.my_peer_id = peer_id;
+        self.info = Some(info);
+    }
+}

@@ -143,6 +143,12 @@ impl PeerMap {
         self.get_peer_by_id(peer_id)?.get_loss_rate_percent()
     }
 
+    pub fn is_peer_conn_converged(&self, peer_id: PeerId) -> bool {
+        self.get_peer_by_id(peer_id)
+            .map(|p| p.is_conn_converged())
+            .unwrap_or(true)
+    }
+
     pub fn has_peer(&self, peer_id: PeerId) -> bool {
         peer_id == self.my_peer_id || self.peer_map.contains_key(&peer_id)
     }

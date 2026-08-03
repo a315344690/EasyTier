@@ -23,6 +23,7 @@ const MIN_SAMPLES_AFTER_SWITCH: Duration = Duration::from_secs(3);
 const CONSECUTIVE_CONFIRM: u32 = 2;
 const MAX_RELAY_HOPS: usize = 3;
 const CONN_SWITCH_GRACE: Duration = Duration::from_secs(12);
+const MAX_CONVERGENCE_SUPPRESS: u32 = 2;
 
 type SharedGlobalPeerMap = Arc<std::sync::RwLock<GlobalPeerMap>>;
 
@@ -94,6 +95,7 @@ impl ExitNodeCandidate {
 struct PerVersionCounters {
     consecutive_over_threshold: AtomicU32,
     preferred_return_count: AtomicU32,
+    convergence_suppress_count: AtomicU32,
     last_fingerprint: SyncRwLock<PathFingerprint>,
     last_relay_path_change: SyncRwLock<Option<Instant>>,
     grace_reset_count: AtomicU32,
@@ -104,6 +106,7 @@ impl Default for PerVersionCounters {
         Self {
             consecutive_over_threshold: AtomicU32::new(0),
             preferred_return_count: AtomicU32::new(0),
+            convergence_suppress_count: AtomicU32::new(0),
             last_fingerprint: SyncRwLock::new(PathFingerprint::default()),
             last_relay_path_change: SyncRwLock::new(None),
             grace_reset_count: AtomicU32::new(0),
@@ -117,6 +120,7 @@ impl PerVersionCounters {
     fn reset(&self) {
         self.consecutive_over_threshold.store(0, Ordering::Relaxed);
         self.preferred_return_count.store(0, Ordering::Relaxed);
+        self.convergence_suppress_count.store(0, Ordering::Relaxed);
         *self.last_fingerprint.write() = PathFingerprint::default();
         *self.last_relay_path_change.write() = None;
         self.grace_reset_count.store(0, Ordering::Relaxed);
@@ -483,6 +487,9 @@ impl ExitNodeSelector {
                             counters
                                 .consecutive_over_threshold
                                 .store(0, Ordering::Relaxed);
+                            counters
+                                .convergence_suppress_count
+                                .store(0, Ordering::Relaxed);
                             *counters.last_relay_path_change.write() = None;
                             counters.grace_reset_count.store(0, Ordering::Relaxed);
                             self.check_preferred_return(
@@ -495,6 +502,23 @@ impl ExitNodeSelector {
                             );
                         } else if current.is_over_threshold() {
                             let current_loss = current.loss.unwrap_or(0);
+                            if !current.fingerprint.is_relay
+                                && !self
+                                    .peers
+                                    .is_peer_conn_converged(current_active.peer_id)
+                            {
+                                let count = counters
+                                    .convergence_suppress_count
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    + 1;
+                                if count <= MAX_CONVERGENCE_SUPPRESS {
+                                    return;
+                                }
+                            } else {
+                                counters
+                                    .convergence_suppress_count
+                                    .store(0, Ordering::Relaxed);
+                            }
                             if in_grace && current_loss <= CASCADE_LOSS_THRESHOLD {
                                 let has_good_direct_alt = candidates.iter().any(|c| {
                                     c.peer_id != current_active.peer_id
@@ -608,6 +632,16 @@ impl ExitNodeSelector {
         }
     }
 
+    #[cfg(test)]
+    fn test_evaluate_candidates(
+        &self,
+        candidates: &[ExitNodeCandidate],
+        active_slot: &ArcSwapOption<ActiveExitNode>,
+        counters: &PerVersionCounters,
+    ) {
+        self.evaluate_candidates(candidates, active_slot, counters, Instant::now());
+    }
+
     fn do_switch(
         &self,
         candidate: &ExitNodeCandidate,
@@ -650,5 +684,349 @@ impl ExitNodeSelector {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::net::Ipv4Addr;
+
+    use cidr::{Ipv4Cidr, Ipv6Cidr};
+
+    use crate::peers::conn::peer_conn::PeerConn;
+    use crate::peers::conn::peer_session::PeerSessionStore;
+    use crate::peers::route::{Route, RouteInterfaceBox};
+    use crate::peers::test_support::NoopPeerContext;
+    use crate::proto::core_peer::peer::Route as CoreRoute;
+    use crate::proto::peer_rpc::RoutePeerInfo;
+    use crate::tunnel::ring::create_ring_tunnel_pair;
+
+    struct TestRoute;
+
+    #[async_trait::async_trait]
+    impl Route for TestRoute {
+        async fn open(&self, _interface: RouteInterfaceBox) -> Result<u8, ()> {
+            Ok(0)
+        }
+        async fn close(&self) {}
+        async fn get_next_hop(&self, _peer_id: PeerId) -> Option<PeerId> {
+            None
+        }
+        async fn list_routes(&self) -> Vec<CoreRoute> {
+            Vec::new()
+        }
+        async fn list_proxy_cidrs(&self) -> BTreeSet<Ipv4Cidr> {
+            BTreeSet::new()
+        }
+        async fn list_proxy_cidrs_v6(&self) -> BTreeSet<Ipv6Cidr> {
+            BTreeSet::new()
+        }
+        async fn get_peer_info(&self, _peer_id: PeerId) -> Option<RoutePeerInfo> {
+            None
+        }
+        async fn get_peer_info_last_update_time(&self) -> Instant {
+            Instant::now()
+        }
+        fn get_peer_groups(&self, _peer_id: PeerId) -> Arc<Vec<String>> {
+            Arc::new(Vec::new())
+        }
+    }
+
+    fn make_selector(my_peer_id: PeerId) -> (ExitNodeSelector, Arc<PeerMap>) {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let context: crate::peers::context::ArcPeerContext =
+            Arc::new(NoopPeerContext::default());
+        let peers = Arc::new(PeerMap::new(tx, context, my_peer_id));
+        let route: ArcRoute = Arc::new(TestRoute);
+        let exit_nodes = Arc::new(RwLock::new(Vec::new()));
+        let selector = ExitNodeSelector::new(my_peer_id, exit_nodes, peers.clone(), route);
+        (selector, peers)
+    }
+
+    async fn add_peer_conn_to_map(peers: &PeerMap, peer_id: PeerId) {
+        let context: crate::peers::context::ArcPeerContext =
+            Arc::new(NoopPeerContext::default());
+        let (tunnel, _other) = create_ring_tunnel_pair();
+        let session_store = Arc::new(PeerSessionStore::new());
+        let mut conn = PeerConn::new(1, context, tunnel, session_store);
+        conn.set_info_for_test(peer_id);
+        peers.add_new_peer_conn(conn).await.unwrap();
+    }
+
+    fn make_candidate(
+        peer_id: PeerId,
+        loss: Option<u32>,
+        is_relay: bool,
+    ) -> ExitNodeCandidate {
+        ExitNodeCandidate {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, peer_id as u8)),
+            peer_id,
+            loss,
+            path_cost: Some(100),
+            fingerprint: PathFingerprint {
+                is_relay,
+                conn_id: Default::default(),
+                gateway_peer_id: if is_relay { 99 } else { 0 },
+            },
+        }
+    }
+
+    // Scenario 1: Single connection, loss > threshold, converged → should switch
+    #[tokio::test]
+    async fn converged_peer_over_threshold_allows_switch() {
+        let (selector, peers) = make_selector(1);
+
+        // Add a peer with one connection
+        add_peer_conn_to_map(&peers, 10).await;
+
+        // Set connection stats: 100us latency, 5% loss
+        let peer = peers.get_peer_by_id(10).unwrap();
+        peer.set_conn_stats_for_test(0, 100, 5);
+        peer.force_default_conn_to_index(0);
+
+        // Peer is converged (single conn) and loss > 2%
+        assert!(peer.is_conn_converged());
+
+        let active_slot = ArcSwapOption::new(Some(Arc::new(ActiveExitNode {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            peer_id: 10,
+        })));
+        let counters = PerVersionCounters::default();
+
+        let candidates = vec![
+            make_candidate(10, Some(5), false),
+            make_candidate(20, Some(0), false),
+        ];
+
+        // First evaluation: count = 1, not yet switching (CONSECUTIVE_CONFIRM = 2)
+        selector.test_evaluate_candidates(&candidates, &active_slot, &counters);
+        assert_eq!(active_slot.load().as_ref().unwrap().peer_id, 10);
+
+        // Second evaluation: count = 2, now switches
+        selector.test_evaluate_candidates(&candidates, &active_slot, &counters);
+        assert_eq!(active_slot.load().as_ref().unwrap().peer_id, 20);
+    }
+
+    // Scenario 2: Peer has better connection not promoted → should suppress switch
+    #[tokio::test]
+    async fn unconverged_peer_suppresses_switch() {
+        let (selector, peers) = make_selector(1);
+
+        // Add peer with two connections
+        add_peer_conn_to_map(&peers, 10).await;
+        add_peer_conn_to_map(&peers, 10).await;
+
+        let peer = peers.get_peer_by_id(10).unwrap();
+        // Connection 0: 100us, 5% loss (bad, set as default)
+        peer.set_conn_stats_for_test(0, 100, 5);
+        // Connection 1: 50us, 0% loss (much better, not default)
+        peer.set_conn_stats_for_test(1, 50, 0);
+        peer.force_default_conn_to_index(0);
+
+        // Peer is NOT converged: default has score=240, best has score=50
+        assert!(!peer.is_conn_converged());
+
+        let active_slot = ArcSwapOption::new(Some(Arc::new(ActiveExitNode {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            peer_id: 10,
+        })));
+        let counters = PerVersionCounters::default();
+
+        let candidates = vec![
+            make_candidate(10, Some(5), false),
+            make_candidate(20, Some(0), false),
+        ];
+
+        // Evaluations should be suppressed (up to MAX_CONVERGENCE_SUPPRESS = 2)
+        selector.test_evaluate_candidates(&candidates, &active_slot, &counters);
+        assert_eq!(active_slot.load().as_ref().unwrap().peer_id, 10);
+        assert_eq!(counters.convergence_suppress_count.load(Ordering::Relaxed), 1);
+
+        selector.test_evaluate_candidates(&candidates, &active_slot, &counters);
+        assert_eq!(active_slot.load().as_ref().unwrap().peer_id, 10);
+        assert_eq!(counters.convergence_suppress_count.load(Ordering::Relaxed), 2);
+
+        // Third evaluation: exceeds MAX_CONVERGENCE_SUPPRESS, falls through
+        // to consecutive_over_threshold counting
+        selector.test_evaluate_candidates(&candidates, &active_slot, &counters);
+        // Now consecutive_over_threshold = 1, still not switching
+        assert_eq!(active_slot.load().as_ref().unwrap().peer_id, 10);
+
+        // Fourth evaluation: consecutive_over_threshold = 2, switches
+        selector.test_evaluate_candidates(&candidates, &active_slot, &counters);
+        assert_eq!(active_slot.load().as_ref().unwrap().peer_id, 20);
+    }
+
+    // Scenario 3: After conn convergence, loss drops below threshold → no switch
+    #[tokio::test]
+    async fn convergence_then_good_loss_prevents_switch() {
+        let (selector, peers) = make_selector(1);
+
+        add_peer_conn_to_map(&peers, 10).await;
+        add_peer_conn_to_map(&peers, 10).await;
+
+        let peer = peers.get_peer_by_id(10).unwrap();
+        // Initially unconverged: default is bad, alt is good
+        peer.set_conn_stats_for_test(0, 100, 5);
+        peer.set_conn_stats_for_test(1, 50, 0);
+        peer.force_default_conn_to_index(0);
+
+        let active_slot = ArcSwapOption::new(Some(Arc::new(ActiveExitNode {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            peer_id: 10,
+        })));
+        let counters = PerVersionCounters::default();
+
+        let candidates = vec![
+            make_candidate(10, Some(5), false),
+            make_candidate(20, Some(0), false),
+        ];
+
+        // First eval: suppressed due to unconverged
+        selector.test_evaluate_candidates(&candidates, &active_slot, &counters);
+        assert_eq!(active_slot.load().as_ref().unwrap().peer_id, 10);
+
+        // Simulate default_conn_clear_task promoting conn 1
+        peer.force_default_conn_to_index(1);
+
+        // Now the candidate's loss should reflect the new default (0%)
+        // We update the candidate's loss to match
+        let candidates_good = vec![
+            make_candidate(10, Some(0), false),
+            make_candidate(20, Some(0), false),
+        ];
+
+        // Evaluate with good loss → is_good() → resets counters, no switch
+        selector.test_evaluate_candidates(&candidates_good, &active_slot, &counters);
+        assert_eq!(active_slot.load().as_ref().unwrap().peer_id, 10);
+        assert_eq!(counters.convergence_suppress_count.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.consecutive_over_threshold.load(Ordering::Relaxed), 0);
+    }
+
+    // Scenario 4: Relay node → convergence check not applied
+    #[tokio::test]
+    async fn relay_node_bypasses_convergence_check() {
+        let (selector, _peers) = make_selector(1);
+
+        let active_slot = ArcSwapOption::new(Some(Arc::new(ActiveExitNode {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            peer_id: 10,
+        })));
+        let counters = PerVersionCounters::default();
+
+        // Relay candidate with loss > threshold
+        let candidates = vec![
+            make_candidate(10, Some(5), true), // relay
+            make_candidate(20, Some(0), false),
+        ];
+
+        // For relay nodes, convergence check is skipped
+        // Goes straight to consecutive_over_threshold counting
+        selector.test_evaluate_candidates(&candidates, &active_slot, &counters);
+        assert_eq!(counters.convergence_suppress_count.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.consecutive_over_threshold.load(Ordering::Relaxed), 1);
+
+        selector.test_evaluate_candidates(&candidates, &active_slot, &counters);
+        // Should switch after 2 consecutive
+        assert_eq!(active_slot.load().as_ref().unwrap().peer_id, 20);
+    }
+
+    // Scenario 5: Peer within threshold (loss <= 2%) → no switch regardless
+    #[tokio::test]
+    async fn good_loss_never_triggers_switch() {
+        let (selector, peers) = make_selector(1);
+
+        add_peer_conn_to_map(&peers, 10).await;
+        let peer = peers.get_peer_by_id(10).unwrap();
+        peer.set_conn_stats_for_test(0, 100, 2);
+        peer.force_default_conn_to_index(0);
+
+        let active_slot = ArcSwapOption::new(Some(Arc::new(ActiveExitNode {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            peer_id: 10,
+        })));
+        let counters = PerVersionCounters::default();
+
+        let candidates = vec![
+            make_candidate(10, Some(2), false), // at threshold
+            make_candidate(20, Some(0), false),
+        ];
+
+        // Loss = 2% → is_good() = true (loss <= LOSS_THRESHOLD_PERCENT)
+        for _ in 0..10 {
+            selector.test_evaluate_candidates(&candidates, &active_slot, &counters);
+        }
+        // Should never switch
+        assert_eq!(active_slot.load().as_ref().unwrap().peer_id, 10);
+    }
+
+    // Scenario 6: is_conn_converged — default is optimal
+    #[tokio::test]
+    async fn is_conn_converged_when_default_is_best() {
+        let (_, peers) = make_selector(1);
+        add_peer_conn_to_map(&peers, 10).await;
+        add_peer_conn_to_map(&peers, 10).await;
+
+        let peer = peers.get_peer_by_id(10).unwrap();
+        // conn0: low latency, some loss → best by score
+        peer.set_conn_stats_for_test(0, 100, 2);
+        // conn1: higher latency, no loss → worse score
+        peer.set_conn_stats_for_test(1, 300, 0);
+        peer.force_default_conn_to_index(0);
+        // best is conn0 (score=170), default is conn0, same pointer → converged
+        assert!(peer.is_conn_converged());
+    }
+
+    // Scenario 7: is_conn_converged — default is suboptimal
+    #[tokio::test]
+    async fn is_conn_converged_when_default_is_suboptimal() {
+        let (_, peers) = make_selector(1);
+        add_peer_conn_to_map(&peers, 20).await;
+        add_peer_conn_to_map(&peers, 20).await;
+
+        let peer = peers.get_peer_by_id(20).unwrap();
+        // conn0: excellent (50us, 0%) → score = 50
+        peer.set_conn_stats_for_test(0, 50, 0);
+        // conn1: poor (200us, 5%) → score = 200*(100+140)/100 = 480
+        peer.set_conn_stats_for_test(1, 200, 5);
+        // Set default to the bad connection
+        peer.force_default_conn_to_index(1);
+        // current_score=480, best_score=50
+        // score_ok: 480*9=4320 <= 50*10=500 → false
+        assert!(!peer.is_conn_converged());
+    }
+
+    // Scenario 8: is_conn_converged — no default → not converged
+    #[tokio::test]
+    async fn is_conn_converged_no_default() {
+        let (_, peers) = make_selector(1);
+        add_peer_conn_to_map(&peers, 30).await;
+        add_peer_conn_to_map(&peers, 30).await;
+
+        let peer = peers.get_peer_by_id(30).unwrap();
+        peer.set_conn_stats_for_test(0, 100, 0);
+        peer.set_conn_stats_for_test(1, 100, 0);
+        peer.clear_default_conn();
+        assert!(!peer.is_conn_converged());
+    }
+
+    // Scenario 9: is_conn_converged — scores within 10% tolerance
+    #[tokio::test]
+    async fn is_conn_converged_within_hysteresis() {
+        let (_, peers) = make_selector(1);
+        add_peer_conn_to_map(&peers, 40).await;
+        add_peer_conn_to_map(&peers, 40).await;
+
+        let peer = peers.get_peer_by_id(40).unwrap();
+        // Both have 0% loss, latency differs by ~5%
+        peer.set_conn_stats_for_test(0, 100, 0); // score = 100
+        peer.set_conn_stats_for_test(1, 105, 0); // score = 105
+        peer.force_default_conn_to_index(1);
+        // current_score=105, best_score=100
+        // score_ok: 105*9=945 <= 100*10=1000 → true
+        // loss_ok: 0 <= 0+1 → true
+        assert!(peer.is_conn_converged());
     }
 }
