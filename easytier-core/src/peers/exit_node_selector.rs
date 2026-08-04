@@ -14,10 +14,10 @@ use crate::proto::peer_rpc::GlobalPeerMap;
 use super::conn::peer_map::PeerMap;
 use super::route::ArcRoute;
 
-const LOSS_THRESHOLD_PERCENT: u32 = 2;
+const LOSS_THRESHOLD_PERCENT: u32 = 20;
 const SWITCH_COOLDOWN: Duration = Duration::from_secs(10);
 const CASCADE_COOLDOWN: Duration = Duration::from_secs(5);
-const CASCADE_LOSS_THRESHOLD: u32 = 5;
+const CASCADE_LOSS_THRESHOLD: u32 = 50;
 pub(crate) const EVAL_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_SAMPLES_AFTER_SWITCH: Duration = Duration::from_secs(3);
 const CONSECUTIVE_CONFIRM: u32 = 2;
@@ -322,7 +322,7 @@ impl ExitNodeSelector {
             };
 
             let loss_percent = current_info.direct_peers.get(&next_hop)?.loss_rate_percent;
-            delivery_rate *= 1.0 - (loss_percent as f64 / 100.0);
+            delivery_rate *= 1.0 - (loss_percent as f64 / 1000.0);
             current = next_hop;
         }
 
@@ -330,7 +330,7 @@ impl ExitNodeSelector {
             return None;
         }
 
-        Some(((1.0 - delivery_rate) * 100.0) as u32)
+        Some(((1.0 - delivery_rate) * 1000.0) as u32)
     }
 
     async fn resolve_candidates(
@@ -783,7 +783,7 @@ mod tests {
 
         // Set connection stats: 100us latency, 5% loss
         let peer = peers.get_peer_by_id(10).unwrap();
-        peer.set_conn_stats_for_test(0, 100, 5);
+        peer.set_conn_stats_for_test(0, 100, 50);
         peer.force_default_conn_to_index(0);
 
         // Peer is converged (single conn) and loss > 2%
@@ -796,7 +796,7 @@ mod tests {
         let counters = PerVersionCounters::default();
 
         let candidates = vec![
-            make_candidate(10, Some(5), false),
+            make_candidate(10, Some(50), false),
             make_candidate(20, Some(0), false),
         ];
 
@@ -820,7 +820,7 @@ mod tests {
 
         let peer = peers.get_peer_by_id(10).unwrap();
         // Connection 0: 100us, 5% loss (bad, set as default)
-        peer.set_conn_stats_for_test(0, 100, 5);
+        peer.set_conn_stats_for_test(0, 100, 50);
         // Connection 1: 50us, 0% loss (much better, not default)
         peer.set_conn_stats_for_test(1, 50, 0);
         peer.force_default_conn_to_index(0);
@@ -835,7 +835,7 @@ mod tests {
         let counters = PerVersionCounters::default();
 
         let candidates = vec![
-            make_candidate(10, Some(5), false),
+            make_candidate(10, Some(50), false),
             make_candidate(20, Some(0), false),
         ];
 
@@ -869,7 +869,7 @@ mod tests {
 
         let peer = peers.get_peer_by_id(10).unwrap();
         // Initially unconverged: default is bad, alt is good
-        peer.set_conn_stats_for_test(0, 100, 5);
+        peer.set_conn_stats_for_test(0, 100, 50);
         peer.set_conn_stats_for_test(1, 50, 0);
         peer.force_default_conn_to_index(0);
 
@@ -880,7 +880,7 @@ mod tests {
         let counters = PerVersionCounters::default();
 
         let candidates = vec![
-            make_candidate(10, Some(5), false),
+            make_candidate(10, Some(50), false),
             make_candidate(20, Some(0), false),
         ];
 
@@ -918,7 +918,7 @@ mod tests {
 
         // Relay candidate with loss > threshold
         let candidates = vec![
-            make_candidate(10, Some(5), true), // relay
+            make_candidate(10, Some(50), true), // relay
             make_candidate(20, Some(0), false),
         ];
 
@@ -940,7 +940,7 @@ mod tests {
 
         add_peer_conn_to_map(&peers, 10).await;
         let peer = peers.get_peer_by_id(10).unwrap();
-        peer.set_conn_stats_for_test(0, 100, 2);
+        peer.set_conn_stats_for_test(0, 100, 20);
         peer.force_default_conn_to_index(0);
 
         let active_slot = ArcSwapOption::new(Some(Arc::new(ActiveExitNode {
@@ -950,7 +950,7 @@ mod tests {
         let counters = PerVersionCounters::default();
 
         let candidates = vec![
-            make_candidate(10, Some(2), false), // at threshold
+            make_candidate(10, Some(20), false), // at threshold
             make_candidate(20, Some(0), false),
         ];
 
@@ -971,7 +971,7 @@ mod tests {
 
         let peer = peers.get_peer_by_id(10).unwrap();
         // conn0: low latency, some loss → best by score
-        peer.set_conn_stats_for_test(0, 100, 2);
+        peer.set_conn_stats_for_test(0, 100, 20);
         // conn1: higher latency, no loss → worse score
         peer.set_conn_stats_for_test(1, 300, 0);
         peer.force_default_conn_to_index(0);
@@ -990,7 +990,7 @@ mod tests {
         // conn0: excellent (50us, 0%) → score = 50
         peer.set_conn_stats_for_test(0, 50, 0);
         // conn1: poor (200us, 5%) → score = 200*(100+140)/100 = 480
-        peer.set_conn_stats_for_test(1, 200, 5);
+        peer.set_conn_stats_for_test(1, 200, 50);
         // Set default to the bad connection
         peer.force_default_conn_to_index(1);
         // current_score=480, best_score=50

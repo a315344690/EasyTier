@@ -470,7 +470,7 @@ pub(crate) async fn direct_peer_info(peer_maps: &[Arc<PeerMap>]) -> PeerInfoForG
             peer,
             DirectConnectedPeerInfo {
                 latency_ms: std::cmp::max(1, (min_lat as u32 / 1000) as i32),
-                loss_rate_percent: (loss_rate * 100.0).clamp(0.0, 100.0) as u32,
+                loss_rate_percent: (loss_rate * 1000.0).clamp(0.0, 1000.0) as u32,
             },
         );
     }

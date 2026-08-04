@@ -1618,6 +1618,7 @@ impl<'a> CommandHandler<'a> {
             let items = build_peer_items(data);
             let has_exit_nodes = !data.exit_nodes.is_empty();
             let optional: &[&str] = &["hostname", "version"];
+            let hide: &[&str] = if has_exit_nodes { &[] } else { &["exit_node"] };
             let drop: Vec<&str> = if has_exit_nodes {
                 vec![
                     "version", "NAT", "tx", "rx", "loss", "lat(ms)", "rate(rx/tx)", "exit_node",
@@ -1625,11 +1626,11 @@ impl<'a> CommandHandler<'a> {
                 ]
             } else {
                 vec![
-                    "exit_node", "version", "NAT", "tx", "rx", "loss", "lat(ms)", "rate(rx/tx)",
+                    "version", "NAT", "tx", "rx", "loss", "lat(ms)", "rate(rx/tx)",
                     "tunnel", "active",
                 ]
             };
-            print_output(&items, self.output_format, optional, &drop, self.no_trunc)
+            print_output_with_hide(&items, self.output_format, optional, &drop, hide, self.no_trunc)
         })
     }
 
@@ -1691,6 +1692,7 @@ impl<'a> CommandHandler<'a> {
 
             let has_exit_nodes = !data.exit_nodes.is_empty();
             let optional: &[&str] = &["hostname", "version"];
+            let hide: &[&str] = if has_exit_nodes { &[] } else { &["exit_node"] };
             let drop: Vec<&str> = if has_exit_nodes {
                 vec![
                     "version", "NAT", "tx", "rx", "loss", "lat(ms)", "rate(rx/tx)", "exit_node",
@@ -1698,11 +1700,11 @@ impl<'a> CommandHandler<'a> {
                 ]
             } else {
                 vec![
-                    "exit_node", "version", "NAT", "tx", "rx", "loss", "lat(ms)", "rate(rx/tx)",
+                    "version", "NAT", "tx", "rx", "loss", "lat(ms)", "rate(rx/tx)",
                     "tunnel", "active",
                 ]
             };
-            print_output(&items, self.output_format, optional, &drop, self.no_trunc)?;
+            print_output_with_hide(&items, self.output_format, optional, &drop, hide, self.no_trunc)?;
 
             // Drop cache entries for peers of this instance that vanished this
             // frame, so the cache can't grow unbounded over a long session.
@@ -2921,10 +2923,32 @@ fn print_output<T>(
 where
     T: tabled::Tabled + serde::Serialize,
 {
+    print_output_with_hide(items, format, optional_columns, drop_columns, &[], no_trunc)
+}
+
+fn print_output_with_hide<T>(
+    items: &[T],
+    format: &OutputFormat,
+    optional_columns: &[&str],
+    drop_columns: &[&str],
+    hide_columns: &[&str],
+    no_trunc: bool,
+) -> Result<(), Error>
+where
+    T: tabled::Tabled + serde::Serialize,
+{
     match format {
         OutputFormat::Table => {
             let mut table = tabled::Table::new(items);
             table.with(Style::markdown());
+            if !hide_columns.is_empty() {
+                let headers: Vec<String> = T::headers()
+                    .iter()
+                    .map(|h| h.as_ref().to_string())
+                    .collect();
+                let hide_indices = header_indices(&headers, hide_columns);
+                apply_column_drops(&mut table, &hide_indices);
+            }
             if no_trunc {
                 println!("{}", table);
                 return Ok(());

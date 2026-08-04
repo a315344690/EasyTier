@@ -243,7 +243,7 @@ impl Peer {
     fn calc_conn_score(conn: &PeerConn, loss_penalty_weight: u32) -> Option<u64> {
         let latency_us = conn.get_latency_us();
         let loss = conn.get_loss_rate_percent() as u64;
-        if latency_us == 0 || loss >= 100 {
+        if latency_us == 0 || loss >= 1000 {
             return None;
         }
         Some(super::super::util::loss_adjusted_cost(latency_us, loss, loss_penalty_weight as u64))
@@ -277,7 +277,7 @@ impl Peer {
             return false;
         };
         let score_ok = current_score * 9 <= best_score * 10;
-        let loss_ok = current.get_loss_rate_percent() <= best_loss.saturating_add(1);
+        let loss_ok = current.get_loss_rate_percent() <= best_loss.saturating_add(10);
         score_ok && loss_ok
     }
 
@@ -362,14 +362,14 @@ impl Peer {
     pub fn get_loss_rate_percent(&self) -> Option<u32> {
         if let Some(conn) = self.default_conn.load_full() {
             let loss = conn.get_loss_rate_percent();
-            if loss < 100 {
+            if loss < 1000 {
                 return Some(loss);
             }
         }
         self.conns
             .iter()
             .map(|entry| entry.value().get_loss_rate_percent())
-            .filter(|&loss| loss < 100)
+            .filter(|&loss| loss < 1000)
             .min()
     }
 

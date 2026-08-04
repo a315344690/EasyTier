@@ -1615,7 +1615,7 @@ impl PeerManagerCore {
                     let lat = route
                         .and_then(|r| r.path_latency_latency_first.or(Some(r.path_latency)))
                         .unwrap_or(0) as f32;
-                    let loss = relay_loss.map(|l| l as f32).unwrap_or(-1.0);
+                    let loss = relay_loss.map(|l| l as f32 / 10.0).unwrap_or(-1.0);
 
                     let next_hop_id = first_hop.unwrap_or(0);
                     let next_hop_hostname = routes

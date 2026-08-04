@@ -1452,7 +1452,7 @@ impl PeerConn {
             features: info.features.clone(),
             tunnel: self.tunnel_info.clone(),
             stats: Some(self.get_stats()),
-            loss_rate: (f64::from(self.loss_rate_stats.load(Ordering::Relaxed)) / 100.0) as f32,
+            loss_rate: (f64::from(self.loss_rate_stats.load(Ordering::Relaxed)) / 1000.0) as f32,
             is_client: self.is_client.unwrap_or_default(),
             network_name: info.network_name.clone(),
             is_closed: self.close_event_notifier.is_closed(),
