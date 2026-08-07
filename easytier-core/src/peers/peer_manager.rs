@@ -1538,7 +1538,7 @@ impl PeerManagerCore {
 
     pub async fn update_exit_nodes(&self, exit_nodes: Vec<IpAddr>) {
         *self.exit_nodes.write().await = exit_nodes;
-        self.exit_node_selector.reset();
+        self.exit_node_selector.re_evaluate_on_list_change().await;
     }
 
     pub async fn exit_node_status(&self) -> Vec<ExitNodeStatusEntry> {
@@ -2627,9 +2627,14 @@ impl PeerOutboundPacketRouter {
             .is_ip_in_same_network(&std::net::IpAddr::V4(*ipv4_addr))
         {
             if let Some(peer_id) = self.exit_node_selector.get_active_v4_peer_id() {
-                dst_peers.push(peer_id);
-                is_exit_node = true;
-            } else {
+                if self.peers.has_peer(peer_id) {
+                    dst_peers.push(peer_id);
+                    is_exit_node = true;
+                } else {
+                    self.exit_node_selector.invalidate_v4();
+                }
+            }
+            if dst_peers.is_empty() {
                 for exit_node in self.exit_nodes.read().await.iter() {
                     let IpAddr::V4(exit_node) = exit_node else {
                         continue;
@@ -2672,9 +2677,14 @@ impl PeerOutboundPacketRouter {
         } else if !ipv6_addr.is_unicast_link_local() {
             // NOTE: never route link local address to exit node.
             if let Some(peer_id) = self.exit_node_selector.get_active_v6_peer_id() {
-                dst_peers.push(peer_id);
-                is_exit_node = true;
-            } else {
+                if self.peers.has_peer(peer_id) {
+                    dst_peers.push(peer_id);
+                    is_exit_node = true;
+                } else {
+                    self.exit_node_selector.invalidate_v6();
+                }
+            }
+            if dst_peers.is_empty() {
                 for exit_node in self.exit_nodes.read().await.iter() {
                     let IpAddr::V6(exit_node) = exit_node else {
                         continue;
@@ -3390,17 +3400,26 @@ pub(crate) async fn send_msg_internal(
         None
     };
     let send_result = if let Some(gateway) = latency_first_gateway
-        && (peers.has_peer(gateway) || foreign_network_client.has_next_hop(gateway))
+        && (peers
+            .get_peer_by_id(gateway)
+            .is_some_and(|p| p.has_live_conns())
+            || foreign_network_client.has_next_hop(gateway))
     {
         relay_peer_map.send_msg(msg, dst_peer_id, policy).await
-    } else if let Some(peer) = peers.get_peer_by_id(dst_peer_id) {
+    } else if let Some(peer) = peers.get_peer_by_id(dst_peer_id)
+        && peer.has_live_conns()
+    {
         peer.send_msg(msg).await
     } else if peers.is_self(dst_peer_id) {
         peers.send_msg_directly(msg, dst_peer_id).await
     } else if foreign_network_client.has_next_hop(dst_peer_id) {
         foreign_network_client.send_msg(msg, dst_peer_id).await
     } else if let Some(gateway) = peers.get_gateway_peer_id(dst_peer_id, policy.clone()).await {
-        if peers.has_peer(gateway) || foreign_network_client.has_next_hop(gateway) {
+        if peers
+            .get_peer_by_id(gateway)
+            .is_some_and(|p| p.has_live_conns())
+            || foreign_network_client.has_next_hop(gateway)
+        {
             relay_peer_map.send_msg(msg, dst_peer_id, policy).await
         } else {
             tracing::warn!(

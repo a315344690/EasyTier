@@ -1616,22 +1616,26 @@ impl<'a> CommandHandler<'a> {
 
         self.print_results(&results, |data| {
             let items = build_peer_items(data);
-            let has_exit_nodes = !data.exit_nodes.is_empty();
-            let optional: &[&str] = &["hostname", "version"];
-            let hide: &[&str] = if has_exit_nodes { &[] } else { &["exit_node"] };
-            let drop: Vec<&str> = if has_exit_nodes {
-                vec![
-                    "version", "NAT", "tx", "rx", "loss", "lat(ms)", "rate(rx/tx)", "exit_node",
-                    "tunnel", "active",
-                ]
-            } else {
-                vec![
-                    "version", "NAT", "tx", "rx", "loss", "lat(ms)", "rate(rx/tx)",
-                    "tunnel", "active",
-                ]
-            };
-            print_output_with_hide(&items, self.output_format, optional, &drop, hide, self.no_trunc)
+            self.print_peer_table(&items, data)
         })
+    }
+
+    fn print_peer_table(&self, items: &[PeerTableItem], data: &PeerListData) -> Result<(), Error> {
+        let has_exit_nodes = !data.exit_nodes.is_empty();
+        let optional: &[&str] = &["hostname", "version"];
+        let hide: &[&str] = if has_exit_nodes { &[] } else { &["exit_node"] };
+        let drop: Vec<&str> = if has_exit_nodes {
+            vec![
+                "version", "NAT", "tx", "rx", "loss", "lat(ms)", "rate(rx/tx)", "exit_node",
+                "tunnel", "active",
+            ]
+        } else {
+            vec![
+                "version", "NAT", "tx", "rx", "loss", "lat(ms)", "rate(rx/tx)",
+                "tunnel", "active",
+            ]
+        };
+        print_output_with_hide(items, self.output_format, optional, &drop, hide, self.no_trunc)
     }
 
     /// Render one watch frame: compute per-peer rates from the previous snapshot,
@@ -1690,21 +1694,7 @@ impl<'a> CommandHandler<'a> {
                 }
             }
 
-            let has_exit_nodes = !data.exit_nodes.is_empty();
-            let optional: &[&str] = &["hostname", "version"];
-            let hide: &[&str] = if has_exit_nodes { &[] } else { &["exit_node"] };
-            let drop: Vec<&str> = if has_exit_nodes {
-                vec![
-                    "version", "NAT", "tx", "rx", "loss", "lat(ms)", "rate(rx/tx)", "exit_node",
-                    "tunnel", "active",
-                ]
-            } else {
-                vec![
-                    "version", "NAT", "tx", "rx", "loss", "lat(ms)", "rate(rx/tx)",
-                    "tunnel", "active",
-                ]
-            };
-            print_output_with_hide(&items, self.output_format, optional, &drop, hide, self.no_trunc)?;
+            self.print_peer_table(&items, data)?;
 
             // Drop cache entries for peers of this instance that vanished this
             // frame, so the cache can't grow unbounded over a long session.
@@ -2941,29 +2931,44 @@ where
         OutputFormat::Table => {
             let mut table = tabled::Table::new(items);
             table.with(Style::markdown());
-            if !hide_columns.is_empty() {
-                let headers: Vec<String> = T::headers()
-                    .iter()
-                    .map(|h| h.as_ref().to_string())
-                    .collect();
-                let hide_indices = header_indices(&headers, hide_columns);
-                apply_column_drops(&mut table, &hide_indices);
-            }
+
+            let headers: Vec<String> = T::headers()
+                .iter()
+                .map(|h| h.as_ref().to_string())
+                .collect();
+            let hide_indices = header_indices(&headers, hide_columns);
+
             if no_trunc {
+                apply_column_drops(&mut table, &hide_indices);
                 println!("{}", table);
                 return Ok(());
             }
-            let headers = T::headers()
-                .iter()
-                .map(|header| header.as_ref().to_string())
-                .collect::<Vec<_>>();
-            let col_widths = compute_column_widths(items);
+
+            let mut col_widths = compute_column_widths(items);
             let terminal_width = terminal_table_width();
             let drop_indices = header_indices(&headers, drop_columns);
             let optional_indices = header_indices(&headers, optional_columns);
-            let (active, drop_indices, total_width) =
+
+            for &idx in &hide_indices {
+                if idx < col_widths.len() {
+                    col_widths[idx] = 0;
+                }
+            }
+
+            let (mut active, mut to_drop, _) =
                 select_columns_to_drop(terminal_width, &drop_indices, &col_widths);
-            apply_column_drops(&mut table, &drop_indices);
+
+            for &idx in &hide_indices {
+                if idx < active.len() && active[idx] {
+                    active[idx] = false;
+                    to_drop.push(idx);
+                }
+            }
+
+            let total_width = table_total_width(&col_widths, &active);
+
+            apply_column_drops(&mut table, &to_drop);
+
             apply_optional_column_truncation(
                 &mut table,
                 terminal_width,
@@ -2973,6 +2978,7 @@ where
                 &active,
                 total_width,
             );
+
             println!("{}", table);
         }
         OutputFormat::Json => {

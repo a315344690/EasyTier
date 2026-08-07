@@ -23,7 +23,6 @@ const THROW_CIDRS: &[&str] = &[
 ];
 
 struct ActiveState {
-    original_ip_forward: String,
     original_src_valid_mark: String,
 }
 
@@ -64,10 +63,7 @@ impl DefaultRouteManager {
 
         self.cleanup_stale().await?;
 
-        let original_ip_forward = read_sysctl("net.ipv4.ip_forward");
         let original_src_valid_mark = read_sysctl("net.ipv4.conf.all.src_valid_mark");
-
-        run_shell_cmd("sysctl -w net.ipv4.ip_forward=1").await?;
         run_shell_cmd("sysctl -w net.ipv4.conf.all.src_valid_mark=1").await?;
 
         run_shell_cmd(&format!(
@@ -121,7 +117,6 @@ impl DefaultRouteManager {
         .await?;
 
         self.state = Some(ActiveState {
-            original_ip_forward,
             original_src_valid_mark,
         });
 
@@ -155,11 +150,6 @@ impl DefaultRouteManager {
         let _ = run_shell_cmd(&format!("ip route flush table {VPN_TABLE}")).await;
 
         let _ = run_shell_cmd(&format!(
-            "sysctl -w net.ipv4.ip_forward={}",
-            state.original_ip_forward
-        ))
-        .await;
-        let _ = run_shell_cmd(&format!(
             "sysctl -w net.ipv4.conf.all.src_valid_mark={}",
             state.original_src_valid_mark
         ))
@@ -184,10 +174,6 @@ impl Drop for DefaultRouteManager {
                 ));
             }
             script.push_str(&format!("ip route flush table {VPN_TABLE} 2>/dev/null;"));
-            script.push_str(&format!(
-                "sysctl -w net.ipv4.ip_forward={} 2>/dev/null;",
-                state.original_ip_forward
-            ));
             script.push_str(&format!(
                 "sysctl -w net.ipv4.conf.all.src_valid_mark={} 2>/dev/null;",
                 state.original_src_valid_mark

@@ -98,7 +98,12 @@ impl RelayRouteTransport for PeerMapRelayRouteTransport {
                 "next hop not found in route for peer {dst_peer_id:?}"
             ))));
         };
-        if self.peer_map.has_peer(next_hop) {
+        if self.peer_map.has_peer(next_hop)
+            && self
+                .peer_map
+                .get_peer_by_id(next_hop)
+                .is_some_and(|p| p.has_live_conns())
+        {
             self.peer_map.send_msg_directly(msg, next_hop).await
         } else if let Some(foreign_network_client) = &self.foreign_network_client {
             foreign_network_client.send_msg(msg, next_hop).await

@@ -1309,7 +1309,7 @@ socket_mark = 66
         assert!(stun_servers.is_none());
 
         // Test setting custom stun servers
-        let custom_servers = vec!["txt:stun.easytier.cn".to_string()];
+        let custom_servers = vec!["stun.l.google.com:19302".to_string()];
         config.set_stun_servers(Some(custom_servers.clone()));
 
         let retrieved_servers = config.get_stun_servers();
@@ -1323,7 +1323,7 @@ instance_name = "test"
 stun_servers = [
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
-    "txt:stun.easytier.cn"
+    "stun.miwifi.com"
 ]"#;
 
         let config = TomlConfigLoader::new_from_str(config_str).unwrap();
@@ -1332,7 +1332,7 @@ stun_servers = [
         assert_eq!(stun_servers.len(), 3);
         assert_eq!(stun_servers[0], "stun.l.google.com:19302");
         assert_eq!(stun_servers[1], "stun1.l.google.com:19302");
-        assert_eq!(stun_servers[2], "txt:stun.easytier.cn");
+        assert_eq!(stun_servers[2], "stun.miwifi.com");
     }
 
     #[cfg(feature = "config-write")]

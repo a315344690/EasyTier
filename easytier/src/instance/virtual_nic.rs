@@ -958,29 +958,9 @@ impl NicCtx {
     ) {
         tracing::debug!(?added, ?removed, "applying proxy_cidrs route changes");
 
-        // Remove routes
-        for cidr in removed {
-            if !cur_proxy_cidrs.contains(&cidr) {
-                continue;
-            }
-            let _g = net_ns.guard();
-            let ret = ifcfg
-                .remove_ipv4_route(ifname, cidr.first_address(), cidr.network_length())
-                .await;
-
-            if ret.is_err() {
-                tracing::trace!(
-                    cidr = ?cidr,
-                    err = ?ret,
-                    "remove route failed.",
-                );
-            }
-            cur_proxy_cidrs.remove(&cidr);
-        }
-
-        // Add routes
-        for cidr in added {
-            if cur_proxy_cidrs.contains(&cidr) {
+        // Add routes first to avoid forwarding gaps during CIDR transitions.
+        for cidr in &added {
+            if cur_proxy_cidrs.contains(cidr) {
                 continue;
             }
             let _g = net_ns.guard();
@@ -995,7 +975,26 @@ impl NicCtx {
                     "add route failed.",
                 );
             }
-            cur_proxy_cidrs.insert(cidr);
+            cur_proxy_cidrs.insert(*cidr);
+        }
+
+        for cidr in &removed {
+            if !cur_proxy_cidrs.contains(cidr) {
+                continue;
+            }
+            let _g = net_ns.guard();
+            let ret = ifcfg
+                .remove_ipv4_route(ifname, cidr.first_address(), cidr.network_length())
+                .await;
+
+            if ret.is_err() {
+                tracing::trace!(
+                    cidr = ?cidr,
+                    err = ?ret,
+                    "remove route failed.",
+                );
+            }
+            cur_proxy_cidrs.remove(cidr);
         }
     }
 

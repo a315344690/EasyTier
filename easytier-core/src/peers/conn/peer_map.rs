@@ -198,7 +198,11 @@ impl PeerMap {
         }
 
         if self.has_peer(dst_peer_id) && matches!(policy, NextHopPolicy::LeastHop) {
-            return Some(dst_peer_id);
+            if let Some(peer) = self.get_peer_by_id(dst_peer_id) {
+                if peer.has_live_conns() {
+                    return Some(dst_peer_id);
+                }
+            }
         }
 
         // get route info

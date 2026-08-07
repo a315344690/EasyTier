@@ -197,11 +197,27 @@ impl ExitNodeSelector {
         self.global_peer_map.load_full()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn reset(&self) {
         self.active_v4.store(None);
         self.active_v6.store(None);
         self.counters_v4.reset();
         self.counters_v6.reset();
+    }
+
+    pub(crate) fn invalidate_v4(&self) {
+        self.active_v4.store(None);
+    }
+
+    pub(crate) fn invalidate_v6(&self) {
+        self.active_v6.store(None);
+    }
+
+    pub(crate) async fn re_evaluate_on_list_change(&self) {
+        self.counters_v4.reset();
+        self.counters_v6.reset();
+        *self.last_switch_at.write() = None;
+        self.evaluate().await;
     }
 
     pub(crate) async fn evaluate(&self) {
