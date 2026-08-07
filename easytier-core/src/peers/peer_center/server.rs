@@ -228,7 +228,7 @@ mod tests {
         let mut peers = PeerInfoForGlobalMap::default();
         peers
             .direct_peers
-            .insert(100, DirectConnectedPeerInfo { latency_ms: 3 });
+            .insert(100, DirectConnectedPeerInfo { latency_ms: 3, loss_rate_percent: 0 });
         server
             .report_peers(
                 BaseController::default(),
@@ -285,7 +285,7 @@ mod tests {
         let mut peers = PeerInfoForGlobalMap::default();
         peers
             .direct_peers
-            .insert(100, DirectConnectedPeerInfo { latency_ms: 3 });
+            .insert(100, DirectConnectedPeerInfo { latency_ms: 3, loss_rate_percent: 0 });
         server
             .report_peers(
                 BaseController::default(),
@@ -307,7 +307,7 @@ mod tests {
         let mut peers = PeerInfoForGlobalMap::default();
         peers
             .direct_peers
-            .insert(100, DirectConnectedPeerInfo { latency_ms: 30 });
+            .insert(100, DirectConnectedPeerInfo { latency_ms: 30, loss_rate_percent: 0 });
         server
             .report_peers(
                 BaseController::default(),
@@ -340,7 +340,7 @@ mod tests {
         let mut peers = PeerInfoForGlobalMap::default();
         peers
             .direct_peers
-            .insert(100, DirectConnectedPeerInfo { latency_ms: 3 });
+            .insert(100, DirectConnectedPeerInfo { latency_ms: 3, loss_rate_percent: 0 });
         server
             .report_peers(
                 BaseController::default(),

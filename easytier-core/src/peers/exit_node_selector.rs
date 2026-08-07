@@ -85,7 +85,7 @@ impl ExitNodeCandidate {
     fn is_return_candidate(&self, current_loss: Option<u32>) -> bool {
         if let Some(loss) = self.loss {
             loss <= LOSS_THRESHOLD_PERCENT
-                && current_loss.map_or(true, |cl| loss < cl || cl > LOSS_THRESHOLD_PERCENT)
+                && current_loss.map_or(true, |cl| loss <= cl || cl > LOSS_THRESHOLD_PERCENT)
         } else {
             false
         }
@@ -1028,7 +1028,34 @@ mod tests {
         assert!(!peer.is_conn_converged());
     }
 
-    // Scenario 9: is_conn_converged — scores within 10% tolerance
+    // Scenario 9: Equal loss — higher-priority node should trigger preferred return
+    #[tokio::test]
+    async fn preferred_return_on_equal_loss() {
+        let (selector, peers) = make_selector(1);
+        add_peer_conn_to_map(&peers, 10).await;
+        add_peer_conn_to_map(&peers, 20).await;
+
+        let active_slot = ArcSwapOption::new(Some(Arc::new(ActiveExitNode {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 20)),
+            peer_id: 20,
+        })));
+        let counters = PerVersionCounters::default();
+
+        let candidates = vec![
+            make_candidate(10, Some(5), false),
+            make_candidate(20, Some(5), false),
+        ];
+
+        // First confirmation
+        selector.test_evaluate_candidates(&candidates, &active_slot, &counters);
+        assert_eq!(active_slot.load().as_ref().unwrap().peer_id, 20);
+
+        // Second confirmation → switches back to higher-priority node
+        selector.test_evaluate_candidates(&candidates, &active_slot, &counters);
+        assert_eq!(active_slot.load().as_ref().unwrap().peer_id, 10);
+    }
+
+    // Scenario 10: is_conn_converged — scores within 10% tolerance
     #[tokio::test]
     async fn is_conn_converged_within_hysteresis() {
         let (_, peers) = make_selector(1);
